@@ -1,0 +1,20 @@
+param([string]$ToolsRoot = 'E:\photocraft-build')
+$env:RUSTUP_HOME = "$ToolsRoot\rustup"
+$env:CARGO_HOME = "$ToolsRoot\cargo"
+$env:CARGO_TARGET_DIR = "$ToolsRoot\target"
+$env:RUSTUP_TOOLCHAIN = '1.95.0-x86_64-pc-windows-gnullvm'
+$env:TEMP = "$ToolsRoot\temp"
+$env:TMP = "$ToolsRoot\temp"
+New-Item -ItemType Directory -Force $env:TEMP | Out-Null
+$env:ANDROID_HOME = "$ToolsRoot\sdk"
+$env:ANDROID_NDK_HOME = "$ToolsRoot\sdk\ndk\28.2.13676358"
+$env:JAVA_HOME = 'D:\java\jdk-21.0.11'
+$env:PATH = "$ToolsRoot\cargo\bin;$ToolsRoot\llvm-mingw\bin;$env:JAVA_HOME\bin;$env:ANDROID_HOME\platform-tools;$env:PATH"
+$ndkBin = "$env:ANDROID_NDK_HOME\toolchains\llvm\prebuilt\windows-x86_64\bin"
+$env:CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER = "$ndkBin\aarch64-linux-android28-clang.cmd"
+$env:CC_aarch64_linux_android = "$ndkBin\aarch64-linux-android28-clang.cmd"
+$env:AR_aarch64_linux_android = "$ndkBin\llvm-ar.exe"
+$env:CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER = "$ndkBin\x86_64-linux-android28-clang.cmd"
+$env:CC_x86_64_linux_android = "$ndkBin\x86_64-linux-android28-clang.cmd"
+$env:AR_x86_64_linux_android = "$ndkBin\llvm-ar.exe"
+$env:CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER = "$ToolsRoot\llvm-mingw\bin\clang.exe"

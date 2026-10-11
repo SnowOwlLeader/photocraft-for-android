@@ -1,0 +1,36 @@
+[package]
+name = "photocraft-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "photocraft_android"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+photocraft-ui-egui.workspace = true
+photocraft-engine.workspace = true
+photocraft-io.workspace = true
+photocraft-format.workspace = true
+photocraft-codecs.workspace = true
+photocraft-doc.workspace = true
+photocraft-text.workspace = true
+eframe = { workspace = true, features = ["android-native-activity", "wgpu", "default_fonts"] }
+egui.workspace = true
+serde_json.workspace = true
+log.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15"
+android-activity = { version = "0.6", features = ["native-activity"] }
+jni = "0.21"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
