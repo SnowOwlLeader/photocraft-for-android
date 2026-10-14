@@ -171,6 +171,27 @@ fn bad_targa_bits_are_refused_before_writing() {
     }
 }
 
+/// Preferences › File Handling › Image Previews decides whether a PSD gets Photoshop's
+/// thumbnail resource (1036): Always and Ask When Saving write it, Never doesn't.
+#[test]
+fn image_previews_preference_controls_the_psd_thumbnail() {
+    use crate::prefs::Ask;
+    let dir = tmp("previews");
+    let mut s = session(300, 200, 16);
+    let has_thumbnail = |path: &str| {
+        let file = photocraft_psd::PsdFile::from_bytes(&std::fs::read(path).unwrap()).unwrap();
+        file.resources.iter().any(|r| r.id == photocraft_psd::resources::ids::THUMBNAIL)
+    };
+    for (ask, expect) in [(Ask::Always, true), (Ask::Never, false), (Ask::Ask, true)] {
+        s.edit_prefs(|p| p.file_handling.image_previews = ask);
+        let out = join(&dir, &format!("{ask:?}.psd"));
+        s.execute("file.saveACopy", json!({"path": out})).unwrap();
+        assert_eq!(has_thumbnail(&out), expect, "{ask:?}");
+        let png = join(&dir, &format!("{ask:?}.png"));
+        s.execute("file.saveACopy", json!({"path": png})).unwrap();
+    }
+}
+
 #[test]
 fn open_as_forces_the_decoder() {
     let dir = tmp("openas");
@@ -214,6 +235,28 @@ fn place_embedded_centres_fits_and_embeds() {
         assert!(s.undo() && s.undo());
         assert_eq!(doc(&s).layers.len(), 1);
     }
+}
+
+/// Preferences ▸ General ▸ Always Create Smart Objects When Placing: unchecked, an embedded place
+/// lands as a plain pixel layer; a linked place is always a smart object and `"smartObject"` wins.
+#[test]
+fn always_create_smart_objects_preference_places_a_pixel_layer() {
+    let dir = tmp("place-smart-pref");
+    let big = png(&dir, "big.png", 200, 100, "#ff0000");
+    let mut s = session(100, 100, 8);
+    s.execute("prefs.set", json!({"path": "general.alwaysCreateSmartObjectsWhenPlacing", "value": false})).unwrap();
+    let r = s.execute("file.placeEmbedded", json!({"path": big})).unwrap();
+    assert_eq!(r["smartObject"], json!(false));
+    let d = s.active().unwrap();
+    let l = d.doc.layer(d.active_layer.unwrap()).unwrap();
+    assert!(matches!(l.content, LayerContent::Raster(_)), "a pixel layer");
+    // Fitted to the canvas width, centred vertically, exactly like the smart-object place.
+    assert!(composite(&s, 50, 50)[0] > 0.99 && composite(&s, 50, 50)[2] < 0.01);
+    assert!(composite(&s, 50, 10)[1] > 0.99, "white background above");
+    // An explicit "smartObject": true overrides, and Place Linked with the preference off still
+    // creates a linked smart object.
+    assert_eq!(s.execute("file.placeEmbedded", json!({"path": big, "smartObject": true})).unwrap()["smartObject"], json!(true));
+    assert_eq!(s.execute("file.placeLinked", json!({"path": big})).unwrap()["smartObject"], json!(true));
 }
 
 /// Preferences ▸ General ▸ Resize Image During Place: off, a larger image keeps its natural size
@@ -508,6 +551,118 @@ fn flatten_all_layer_effects_and_masks() {
         // Each script is a single history step.
         assert!(s.undo());
         assert!(doc(&s).layer(id).unwrap().mask.is_some());
+    }
+}
+
+/// Flatten All Layer Effects must bake the effect visuals without destroying the layer's masks:
+/// an enabled raster mask and a vector mask on one layer, a disabled raster mask on another
+/// (#3804). The command is a visual no-op; the masks (pixels and state) survive, including a
+/// `.pcraft` round trip.
+#[test]
+fn flatten_all_layer_effects_keeps_masks() {
+    for depth in [8, 16, 32] {
+        let mut s = session(40, 40, depth);
+        // Layer 1: a red square with a green colour overlay, an enabled raster mask revealing
+        // x < 20 and a vector mask revealing x 15..30.
+        s.execute("layer.new.layer", json!({})).unwrap();
+        s.execute("select.rect", json!({"x": 10, "y": 10, "width": 20, "height": 20})).unwrap();
+        s.execute("edit.fill", json!({"color": "#ff0000"})).unwrap();
+        s.execute("select.deselect", json!({})).unwrap();
+        let id1 = s.active().unwrap().active_layer.unwrap();
+        s.edit("fx", |doc, _| {
+            let l = doc.layer_mut(id1).unwrap();
+            l.effects.enabled = true;
+            l.effects.items.push(photocraft_doc::Effect::ColorOverlay {
+                common: photocraft_doc::effects::FxCommon::new(photocraft_color::BlendMode::Normal, 1.0),
+                color: photocraft_color::Color::rgb(0.0, 1.0, 0.0),
+            });
+            l.vector_mask = Some(photocraft_doc::VectorMask::new(photocraft_doc::Path::new(vec![photocraft_doc::Subpath::polygon(&[
+                (15.0, 15.0),
+                (30.0, 15.0),
+                (30.0, 30.0),
+                (15.0, 30.0),
+            ])])));
+            Ok(())
+        })
+        .unwrap();
+        s.execute("select.rect", json!({"x": 0, "y": 0, "width": 20, "height": 40})).unwrap();
+        s.execute("layer.layerMask.revealSelection", json!({})).unwrap();
+        s.execute("select.deselect", json!({})).unwrap();
+        // Layer 2: a red square at the bottom-right with the same overlay and a *disabled* mask.
+        s.execute("layer.new.layer", json!({})).unwrap();
+        s.execute("select.rect", json!({"x": 30, "y": 30, "width": 8, "height": 8})).unwrap();
+        s.execute("edit.fill", json!({"color": "#ff0000"})).unwrap();
+        s.execute("select.deselect", json!({})).unwrap();
+        let id2 = s.active().unwrap().active_layer.unwrap();
+        s.edit("fx", |doc, _| {
+            let l = doc.layer_mut(id2).unwrap();
+            l.effects.enabled = true;
+            l.effects.items.push(photocraft_doc::Effect::ColorOverlay {
+                common: photocraft_doc::effects::FxCommon::new(photocraft_color::BlendMode::Normal, 1.0),
+                color: photocraft_color::Color::rgb(0.0, 1.0, 0.0),
+            });
+            Ok(())
+        })
+        .unwrap();
+        s.execute("select.rect", json!({"x": 34, "y": 34, "width": 2, "height": 2})).unwrap();
+        s.execute("layer.layerMask.revealSelection", json!({})).unwrap();
+        s.execute("select.deselect", json!({})).unwrap();
+        s.edit("disable", |doc, _| {
+            if let Some(m) = doc.layer_mut(id2).and_then(|l| l.mask.as_mut()) {
+                m.enabled = false;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let m1 = doc(&s).layer(id1).unwrap().mask.clone();
+        let v1 = doc(&s).layer(id1).unwrap().vector_mask.clone();
+        let m2 = doc(&s).layer(id2).unwrap().mask.clone();
+        assert_eq!(m1.as_ref().map(|m| m.enabled), Some(true), "layer 1 raster mask is enabled");
+        assert!(v1.as_ref().is_some_and(|v| v.enabled), "layer 1 vector mask is enabled");
+        assert_eq!(m2.as_ref().map(|m| m.enabled), Some(false), "layer 2 raster mask is disabled");
+        let before = [
+            composite(&s, 17, 15), // layer 1: inside both masks
+            composite(&s, 22, 15), // layer 1: raster mask hides
+            composite(&s, 12, 15), // layer 1: vector mask hides
+            composite(&s, 34, 34), // layer 2: the disabled mask does not hide
+        ];
+        assert!(before[0][1] > 0.99 && before[0][0] < 0.01, "overlay renders green: {:?}", before[0]);
+        // The white background shows where a mask hides the layer.
+        assert!(before[1][0] > 0.99 && before[1][1] > 0.99, "the raster mask hides: {:?}", before[1]);
+        assert!(before[2][0] > 0.99 && before[2][1] > 0.99, "the vector mask hides: {:?}", before[2]);
+        assert!(before[3][1] > 0.99, "the disabled mask does not hide");
+        let r = s.execute("file.scripts.flattenAllLayerEffects", json!({})).unwrap();
+        assert_eq!(r["flattened"], 2);
+        {
+            let d = doc(&s);
+            assert_eq!(d.layer(id1).unwrap().mask, m1, "layer 1 raster mask survives");
+            assert_eq!(d.layer(id1).unwrap().vector_mask, v1, "layer 1 vector mask survives");
+            assert_eq!(d.layer(id2).unwrap().mask, m2, "the disabled mask survives");
+        }
+        let after = [composite(&s, 17, 15), composite(&s, 22, 15), composite(&s, 12, 15), composite(&s, 34, 34)];
+        for (a, b) in after.iter().zip(&before) {
+            for k in 0..4 {
+                assert!((a[k] - b[k]).abs() < 0.01, "flattening is a visual no-op: {after:?} vs {before:?}");
+            }
+        }
+        // One history step: undo restores the effects, redo re-flattens, and the masks stay.
+        assert!(s.undo());
+        assert!(!doc(&s).layer(id1).unwrap().effects.items.is_empty());
+        assert_eq!(doc(&s).layer(id1).unwrap().mask, m1);
+        assert!(s.redo());
+        assert_eq!(doc(&s).layer(id1).unwrap().mask, m1);
+        assert_eq!(doc(&s).layer(id1).unwrap().vector_mask, v1);
+        assert_eq!(doc(&s).layer(id2).unwrap().mask, m2);
+        // The masks survive a `.pcraft` save and reopen.
+        let dir = tmp("flatten-effects-masks");
+        let path = join(&dir, "masks.pcraft");
+        save_doc(doc(&s), &path, None).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let mut s2 = Session::new();
+        open_bytes_as(&mut s2, "masks.pcraft", &bytes, None, None).unwrap();
+        let layers: Vec<_> = doc(&s2).walk().into_iter().map(|(_, _, l)| l).collect();
+        assert!(layers.iter().any(|l| l.mask == m1 && l.vector_mask == v1), "the raster and vector masks survive .pcraft");
+        assert!(layers.iter().any(|l| l.mask == m2), "the disabled mask survives .pcraft");
     }
 }
 

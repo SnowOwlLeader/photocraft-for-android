@@ -820,4 +820,89 @@ mod tests {
             }
         }
     }
+
+    /// #1919: with Delete Cropped Pixels off, a second crop's handle dragged out toward the hidden
+    /// pixels snaps exactly onto their edge (a layer edge), however far from the handle's centre
+    /// the press grabbed it, in both modes, with and without Auto Center Preview: the committed
+    /// crop has no transparent strip.
+    #[test]
+    fn a_recrop_handle_snaps_exactly_to_the_hidden_pixels_edge() {
+        // The image 200 × 100 cropped to [40, 20, 140, 70]: its pixels stay at [-40, -20, 160, 80].
+        let hidden = [-40.0, -20.0, 160.0, 80.0];
+        for classic in [false, true] {
+            for auto in [true, false] {
+                for (hx, hy) in [(1i8, 0i8), (0, -1), (-1, -1), (1, 1)] {
+                    // A corner also with the image's 2:1 ratio held, which both hidden corners keep.
+                    for (grab, ratio) in [(-4.0f32, false), (0.0, false), (4.0, false), (-4.0, true), (4.0, true)] {
+                        if ratio && (hx == 0 || hy == 0) {
+                            continue;
+                        }
+                        let what = format!("Classic Mode {classic}, Auto Center {auto}, handle ({hx}, {hy}), grabbed {grab} px off, ratio {ratio}");
+                        let mut app = app();
+                        app.ui.tool_options.crop_delete = false;
+                        app.ui.tool_options.crop_shield.classic_mode = classic;
+                        app.ui.tool_options.crop_shield.auto_center_preview = auto;
+                        crate::crop_ui::ensure_frame(&mut app);
+                        app.ui.crop_rect = Some([40.0, 20.0, 140.0, 70.0]);
+                        app.crop.default_frame = false;
+                        crate::canvas::commit_crop(&mut app);
+                        let v = &mut app.ui.views[0];
+                        (v.zoom, v.center, v.fit_pending, v.rotation) = (1.0, [50.0, 25.0], false, 0.0);
+                        app.ui.extras.snap = true;
+                        crate::crop_ui::ensure_frame(&mut app);
+                        assert_eq!(app.ui.crop_rect, Some([0.0, 0.0, 100.0, 50.0]));
+                        if ratio {
+                            app.ui.tool_options.crop_ratio = "original".into();
+                        }
+                        let grab = vec2(f32::from(hx), f32::from(hy)) * grab;
+                        let from = xf(&app).to_screen(50.0 + f32::from(hx) * 50.0, 25.0 + f32::from(hy) * 25.0) + grab;
+                        // Toward the hidden corner (or edge), a screen pixel at a time on the longer axis.
+                        let gap = vec2(f32::from(hx) * if hx < 0 { 40.0 } else { 60.0 }, f32::from(hy) * if hy < 0 { 20.0 } else { 30.0 });
+                        let dir = gap / gap.x.abs().max(gap.y.abs());
+                        let d = xf(&app).to_doc(from);
+                        tool_event(&mut app, ToolEvent::Down { x: d[0], y: d[1], pressure: 1.0 }, NONE);
+                        // Drag outward a screen pixel at a time; let go once the moving edges show
+                        // the snap to the hidden pixels' edges (as the user would).
+                        let snapped = |app: &PhotocraftApp| {
+                            let on = |vertical: bool, pos: f64| {
+                                app.prefs_rt
+                                    .snap_lines
+                                    .iter()
+                                    .any(|l| l.vertical == vertical && l.pos == pos && l.kind == photocraft_engine::snap::SnapKind::LayerEdge)
+                            };
+                            (hx == 0 || on(true, if hx < 0 { hidden[0] } else { hidden[2] }))
+                                && (hy == 0 || on(false, if hy < 0 { hidden[1] } else { hidden[3] }))
+                        };
+                        let mut end = None;
+                        for i in 1..=80 {
+                            let d = xf(&app).to_doc(from + dir * i as f32);
+                            tool_event(&mut app, ToolEvent::Move { x: d[0], y: d[1], pressure: 1.0 }, NONE);
+                            if snapped(&app) {
+                                end = Some(from + dir * i as f32);
+                                break;
+                            }
+                        }
+                        let end = end.unwrap_or_else(|| panic!("{what}: never snapped to the hidden edge"));
+                        // Released where it stopped, read through the view as it is now.
+                        let end = xf(&app).to_doc(end);
+                        tool_event(&mut app, ToolEvent::Up { x: end[0], y: end[1] }, NONE);
+                        let pick = |h: i8, lo: f64, hi: f64, a: f64, b: f64| match h {
+                            -1 => [a, hi],
+                            1 => [lo, b],
+                            _ => [lo, hi],
+                        };
+                        let [x0, x1] = pick(hx, 0.0, 100.0, hidden[0], hidden[2]);
+                        let [y0, y1] = pick(hy, 0.0, 50.0, hidden[1], hidden[3]);
+                        assert_eq!(app.ui.crop_rect, Some([x0, y0, x1, y1]), "{what}: the frame lands exactly on the hidden edge");
+                        crate::canvas::commit_crop(&mut app);
+                        let st = app.session.active().unwrap();
+                        assert_eq!((st.doc.size.width, st.doc.size.height), ((x1 - x0) as u32, (y1 - y0) as u32), "{what}");
+                        let layer = st.doc.walk().into_iter().map(|(_, _, l)| l.id).next().unwrap();
+                        let r = photocraft_engine::snap::layer_rect(&st.doc, layer).unwrap();
+                        assert_eq!(r, [hidden[0] - x0, hidden[1] - y0, hidden[2] - x0, hidden[3] - y0], "{what}: no transparent strip");
+                    }
+                }
+            }
+        }
+    }
 }

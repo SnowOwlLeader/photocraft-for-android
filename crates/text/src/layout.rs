@@ -253,11 +253,16 @@ impl TextLayout {
 
     /// Byte offset of the caret nearest to a line-space point.
     pub fn hit_test_line(&self, x: f32, y: f32) -> usize {
-        let Some((li, line)) = self.closest_line(y) else {
+        let Some((li, _)) = self.closest_line(y) else {
             return 0;
         };
+        self.hit_test_x_on_line(li, x)
+    }
+
+    fn hit_test_x_on_line(&self, line_index: usize, x: f32) -> usize {
+        let Some(line) = self.lines.get(line_index) else { return 0 };
         let mut best = (f32::MAX, line.range.end);
-        for c in self.clusters.iter().filter(|c| c.line == li) {
+        for c in self.clusters.iter().filter(|c| c.line == line_index) {
             let mid = c.x + c.advance / 2.0;
             let (before, after) = if c.rtl { (c.range.end, c.range.start) } else { (c.range.start, c.range.end) };
             let (dist, off) = if x < mid { ((x - c.x).abs(), before) } else { ((x - c.x - c.advance).abs(), after) };
@@ -370,17 +375,18 @@ pub fn word_boundary(text: &str, idx: usize, forward: bool) -> usize {
 pub fn line_step(layout: &TextLayout, text: &str, idx: usize, x: f32, dir: i32) -> usize {
     let n = text.chars().count();
     let idx = idx.min(n);
-    let (_, top, bottom) = layout.caret(byte_index(text, idx));
-    let h = (bottom - top).max(1.0);
-    let y = if dir < 0 { top - h * 0.5 } else { bottom + h * 0.5 };
-    let Some(bounds) = layout.line_bounds() else { return idx };
-    if y < bounds[1] {
-        return 0;
+    if layout.lines.is_empty() {
+        return idx;
     }
-    if y > bounds[3] {
-        return n;
-    }
-    char_index(text, layout.hit_test_line(x, y))
+    let current_line = line_index(layout, byte_index(text, idx));
+    let target_line = if dir < 0 {
+        let Some(target) = current_line.checked_sub(1) else { return 0 };
+        target
+    } else {
+        let Some(target) = current_line.checked_add(1).filter(|target| *target < layout.lines.len()) else { return n };
+        target
+    };
+    char_index(text, layout.hit_test_x_on_line(target_line, x))
 }
 
 /// Line start (`end` false) or end for the line containing `idx`, as a character index.
@@ -696,7 +702,11 @@ impl Layouter {
                     Some(b) => b + leading + pending_space,
                 };
                 pending_space = 0.0;
-                let overflow = if vertical { baseline + descent > -box_rect.0 + 0.5 } else { baseline + descent > box_rect.1 + box_rect.3 + 0.5 };
+                // Photoshop keeps a horizontal line whose baseline is inside the box and lets
+                // its descenders hang below the bottom edge (#1317: three 35 pt lines in a
+                // 91.3 pt box, the last baseline at 88). Requiring the descent to fit dropped
+                // that line.
+                let overflow = if vertical { baseline + descent > -box_rect.0 + 0.5 } else { baseline > box_rect.1 + box_rect.3 + 0.5 };
                 if is_box && overflow {
                     stop = true;
                     break;
@@ -1213,6 +1223,18 @@ fn feature_list(st: &CharStyle, small_caps: SmallCapsMode) -> Vec<String> {
     feats
 }
 
+/// The font variations for a run: the explicit axis values, plus `opsz` at the type size when the
+/// style doesn't set it (as CSS `font-optical-sizing: auto`). A font without an `opsz` axis
+/// ignores it.
+fn variation_list(st: &CharStyle) -> Vec<String> {
+    let mut vars: Vec<String> =
+        st.variations.iter().filter(|v| v.axis.len() == 4 && v.axis.is_ascii() && v.value.is_finite()).map(|v| format!("\"{}\" {}", v.axis, v.value)).collect();
+    if st.size_pt.is_finite() && !st.variations.iter().any(|v| v.axis == "opsz") {
+        vars.push(format!("\"opsz\" {}", st.size_pt.max(0.01)));
+    }
+    vars
+}
+
 fn style_props(st: &CharStyle, k: f32, fallback: &[String], idx: u32, small_caps: SmallCapsMode) -> Vec<StyleProperty<'static, RunBrush>> {
     let px = (st.size_pt * k).max(0.01);
     let mut fam: Vec<String> = Vec::new();
@@ -1227,7 +1249,7 @@ fn style_props(st: &CharStyle, k: f32, fallback: &[String], idx: u32, small_caps
     }
     fam.push("sans-serif".into());
     let feats = feature_list(st, small_caps);
-    let vars: Vec<String> = st.variations.iter().filter(|v| v.axis.len() == 4 && v.axis.is_ascii()).map(|v| format!("\"{}\" {}", v.axis, v.value)).collect();
+    let vars = variation_list(st);
     vec![
         StyleProperty::FontFamily(FontFamily::Source(Cow::Owned(fam.join(", ")))),
         StyleProperty::FontSize(px),
@@ -1331,8 +1353,17 @@ fn first_ascent(line: &parley::Line<'_, RunBrush>) -> Option<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SmallCapsMode, feature_list, small_caps_mode};
-    use photocraft_doc::text::{Caps, CharStyle};
+    use super::{SmallCapsMode, feature_list, small_caps_mode, variation_list};
+    use photocraft_doc::text::{Caps, CharStyle, FontVariation};
+
+    /// A variable font's optical size follows the type size unless the style sets `opsz` (#2985).
+    #[test]
+    fn optical_size_follows_the_type_size_unless_set() {
+        let style = CharStyle { size_pt: 36.0, variations: vec![FontVariation { axis: "wght".into(), value: 650.0 }], ..Default::default() };
+        assert_eq!(variation_list(&style), ["\"wght\" 650", "\"opsz\" 36"]);
+        let set = CharStyle { size_pt: 36.0, variations: vec![FontVariation { axis: "opsz".into(), value: 12.0 }], ..Default::default() };
+        assert_eq!(variation_list(&set), ["\"opsz\" 12"]);
+    }
 
     #[test]
     fn uses_real_small_caps_only_when_the_selected_face_supports_smcp() {

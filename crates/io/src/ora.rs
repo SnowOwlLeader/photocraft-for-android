@@ -245,7 +245,7 @@ fn flag(node: roxmltree::Node<'_, '_>, name: &str) -> bool {
 
 /// Shared node properties: name, visibility, opacity and composite operation.
 fn props(node: roxmltree::Node<'_, '_>, layer: &mut Layer, index: usize, warnings: &mut Warnings) -> Result<()> {
-    layer.name = node.attribute("name").map(str::trim).filter(|n| !n.is_empty()).map_or_else(|| format!("Layer {index}"), str::to_string);
+    layer.name = node.attribute("name").filter(|name| !name.trim().is_empty()).map_or_else(|| format!("Layer {index}"), str::to_string);
     layer.visible = node.attribute("visibility").is_none_or(|v| v.trim() != "hidden");
     layer.opacity = num(node, "opacity", 1.0)?.clamp(0.0, 1.0) as f32;
     layer.blend = composite_op(node.attribute("composite-op").map_or("svg:src-over", str::trim), &layer.name, warnings);

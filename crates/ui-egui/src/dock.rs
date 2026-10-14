@@ -5,7 +5,7 @@
 //! between two groups to resize them, double-click a tab (or use the panel menu) to collapse a
 //! group to its tab strip, drag a tab strip (outside its tabs, or a tab dragged off the strip) to
 //! move the group up or down the column, and drag a tab along its strip to reorder the group's
-//! tabs (#2272); Window › Workspace › Lock Workspace stops all three moves.
+//! tabs (#2272), or drop a tab on another group's strip to move only that tab. Window › Workspace › Lock Workspace stops all these moves.
 //!
 //! The layout is [`DockLayout`] in `UiState::dock` (serialisable, drivable with `ui.set`), saved
 //! with Window › Workspace › New Workspace…, reset by Reset Workspace, and remembered across
@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use egui::{Rect, Sense, Stroke, pos2, vec2};
+use egui::{Pos2, Rect, Sense, Stroke, pos2, vec2};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -114,7 +114,7 @@ impl Group {
     /// Tabs that lay out their own scrolling list and footer, or size themselves to the group
     /// (the Navigator's preview grows with it, as in Photoshop: #2726).
     pub fn scrolls_itself(self, tab: usize) -> bool {
-        matches!((self, tab), (Group::Layers, 0) | (Group::History, 0) | (Group::Navigator, 0))
+        matches!((self, tab), (Group::Layers, 0) | (Group::History, 0) | (Group::History, 1) | (Group::Navigator, 0))
     }
 
     pub(crate) fn tab_mut(self, tabs: &mut DockTabs) -> &mut usize {
@@ -386,7 +386,7 @@ impl DockLayout {
 pub fn reveal(app: &mut PhotocraftApp, g: Group) {
     *g.shown_mut(&mut app.ui.panels) = true;
     let selected = *g.tab_mut(&mut app.ui.dock_tabs);
-    let pro = matches!(app.ui.theme, crate::theme::ThemeKind::Pro | crate::theme::ThemeKind::ProMedium);
+    let pro = app.ui.theme.is_pro();
     app.ui.dock.show_tab(g, selected, pro);
     app.ui.dock.set_collapsed(g, false);
 }
@@ -424,10 +424,32 @@ fn rects_id() -> egui::Id {
     egui::Id::new("dock-group-rects")
 }
 
+/// The group expanded from its collapsed tab strip (see [`show`]), if any: with Preferences ▸
+/// Workspace ▸ Auto-Collapse Iconic Panels on, the first click outside it collapses it again.
+fn peek_id() -> egui::Id {
+    egui::Id::new("dock-peek")
+}
+
+fn auto_collapse_peek(app: &mut PhotocraftApp, ctx: &egui::Context) {
+    let Some(g) = ctx.data(|d| d.get_temp::<Option<Group>>(peek_id())).flatten() else { return };
+    let Some(p) = ctx.input(|i| i.pointer.any_pressed().then(|| i.pointer.press_origin()).flatten()) else {
+        return;
+    };
+    let inside = last_rects(ctx).into_iter().find(|(x, _)| *x == g).is_some_and(|(_, r)| r.contains(p));
+    if !inside {
+        app.ui.dock.set_collapsed(g, true);
+        ctx.data_mut(|d| {
+            d.insert_temp(peek_id(), None::<Group>);
+        });
+    }
+}
+
 /// A group's tab strip as drawn last frame (screen points), for tests and automation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StripRects {
     pub group: Group,
+    /// The area accepting a tab drop, excluding the group menu.
+    pub area: Rect,
     /// `(tab index, rect)` of the tabs on the strip (the others are in the chevron menu).
     pub tabs: Vec<(usize, Rect)>,
     /// The panel menu button.
@@ -449,6 +471,14 @@ fn strips_id() -> egui::Id {
 /// group's tab content.
 pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui, shown: &[Group], mut body: impl FnMut(&mut PhotocraftApp, &mut egui::Ui, Group, usize)) {
     let t = Tokens::get(ui.ctx());
+    let auto_collapse = app.session.prefs().workspace.auto_collapse_icon_panels;
+    if auto_collapse {
+        auto_collapse_peek(app, ui.ctx());
+    } else {
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(peek_id(), None::<Group>);
+        });
+    }
     let strip = if t.pro { 28.0 } else { 40.0 };
     let order: Vec<Group> = app.ui.dock.order().into_iter().filter(|g| shown.contains(g)).collect();
     let area = ui.available_rect_before_wrap();
@@ -456,6 +486,8 @@ pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui, shown: &[Group], mut bod
     let locked = app.session.prefs().workspace_locked;
     let rects = rects_after_layout(&heights, area);
     let mut actions: Vec<Action> = Vec::new();
+    let mut peek_after: Option<Group> = None;
+    let mut tab_drops: Vec<(Group, usize, Pos2)> = Vec::new();
     let mut dragging: Option<Group> = None;
     let mut strips: Vec<StripRects> = Vec::with_capacity(rects.len());
     for (i, (g, rect)) in rects.iter().copied().enumerate() {
@@ -499,6 +531,7 @@ pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui, shown: &[Group], mut bod
         }
         strips.push(StripRects {
             group: g,
+            area: Rect::from_min_max(pos2(rect.left(), resp.menu.rect.top()), pos2(resp.menu.rect.left(), resp.menu.rect.bottom())),
             tabs: resp.tabs.iter().filter_map(|(i, r)| indices.get(*i).map(|original| (*original, *r))).collect(),
             menu: resp.menu.rect,
             chevron: resp.chevron,
@@ -521,6 +554,11 @@ pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui, shown: &[Group], mut bod
         }
         if resp.strip.double_clicked() || resp.tab_double_clicked || (collapsed && resp.tab_clicked) {
             actions.push(Action::ToggleCollapse(g));
+            // A single click on a collapsed strip's tab expands the group as a peek: the next
+            // click outside closes it again, with Auto-Collapse Iconic Panels on.
+            if collapsed && resp.tab_clicked && !resp.tab_double_clicked && auto_collapse {
+                peek_after = Some(g);
+            }
         }
         // The strip uses visible indices; reorder in original ones.
         if !locked
@@ -530,15 +568,24 @@ pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui, shown: &[Group], mut bod
             actions.push(Action::MoveTab(g, tab, before.and_then(|b| indices.get(b).copied())));
         }
         // A tab dragged off its strip moves the whole group, as the strip itself does.
-        if !locked && app.ui.docking.is_none() && (resp.strip.dragged() || resp.tab_dragging_out) {
+        if !locked && app.ui.docking.is_none() && (resp.strip.dragged() || resp.tab_dragging_out.is_some()) {
             dragging = Some(g);
         }
         if !locked
             && app.ui.docking.is_none()
-            && (resp.strip.drag_stopped() || resp.tab_dropped_out)
+            && resp.strip.drag_stopped()
             && let Some(p) = ui.ctx().pointer_interact_pos().or_else(|| ui.ctx().pointer_latest_pos())
         {
             actions.push(Action::Move(g, drop_before(&order, &rects, g, p.y)));
+        }
+        if !locked
+            && app.ui.docking.is_none()
+            && let Some(shown_tab) = resp.tab_dropped_out
+            // The strip uses visible indices; the drop resolves the panel by its original one.
+            && let Some(&tab) = indices.get(shown_tab)
+            && let Some(p) = ui.ctx().pointer_interact_pos().or_else(|| ui.ctx().pointer_latest_pos())
+        {
+            tab_drops.push((g, tab, p));
         }
         if dragging == Some(g) {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -589,6 +636,23 @@ pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui, shown: &[Group], mut bod
             }
         }
     }
+    let mut panel_moves = Vec::new();
+    for (from, tab, position) in tab_drops {
+        let target = strips.iter().find(|strip| strip.group != from && strip.area.contains(position));
+        if let Some(target) = target {
+            let pro = t.pro;
+            let source = from.tabs(pro).get(tab).and_then(|label| crate::panel_docking::normalize(label));
+            let slot = crate::tab_strip::drop_slot(&target.tabs, target.area, position);
+            let before = slot.and_then(|slot| target.tabs.get(slot).map(|(index, _)| *index));
+            let anchor = before.or_else(|| target.tabs.first().map(|(index, _)| *index));
+            let destination = anchor.and_then(|index| target.group.tabs(pro).get(index).and_then(|label| crate::panel_docking::normalize(label)));
+            if let (Some(source), Some(destination)) = (source, destination) {
+                panel_moves.push((source, destination, before.is_some()));
+            }
+        } else {
+            actions.push(Action::Move(from, drop_before(&order, &rects, from, position.y)));
+        }
+    }
     // Drop indicator while a group is dragged by its tab strip.
     if let (Some(g), Some(p)) = (dragging, ui.ctx().pointer_interact_pos()) {
         let before = drop_before(&order, &rects, g, p.y);
@@ -631,6 +695,19 @@ pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui, shown: &[Group], mut bod
                     app.ui.dock.move_group(g, before);
                 }
             }
+        }
+    }
+    if let Some(g) = peek_after
+        && !app.ui.dock.is_collapsed(g)
+    {
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(peek_id(), Some(g));
+        });
+    }
+    for (panel, anchor, before) in panel_moves {
+        let params = if before { json!({"panel":panel,"anchor":anchor,"before":anchor}) } else { json!({"panel":panel,"anchor":anchor}) };
+        if let Err(error) = app.run("window.panel.move", params) {
+            app.ui.status = error;
         }
     }
 }
@@ -729,6 +806,10 @@ pub fn restore(app: &mut PhotocraftApp) {
     }
     let saved = app.session.prefs().panel_layout.clone();
     apply(app, &saved);
+    // The floating Brush Settings window is transient, not a dock panel: remembering the
+    // workspace must not leave it open on a fresh launch, especially with no document.
+    // Explicit workspace switches still use `apply` and keep their stored panel visibility.
+    app.ui.panels.brush_settings = false;
     if let Some(ws) = saved.get("workspace").and_then(Value::as_str) {
         app.ui.workspace = ws.to_string();
     }

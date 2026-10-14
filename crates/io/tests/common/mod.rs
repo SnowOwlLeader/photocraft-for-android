@@ -170,6 +170,7 @@ pub fn gen_doc(mode: ColorMode, depth: SampleType, f: Features) -> Document {
                 ],
                 space: tone_space(mode),
                 black: Vec::new(),
+                pencil: false,
             },
             Adjustment::Unsupported { psd_key: "selc".into(), raw: vec![0, 1, 0, 0] },
         ];

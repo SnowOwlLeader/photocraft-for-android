@@ -145,6 +145,43 @@ fn droplets_are_written_and_run() {
     assert!(s.execute("file.automate.createDroplet", json!({"path": path, "steps": [["bogus", {}]]})).is_err());
 }
 
+#[cfg(unix)]
+#[test]
+fn droplet_shim_passes_shell_metacharacters_as_a_literal_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tmp("droplet-shell-quote");
+    let path = format!("{dir}/Droplet's \"quote\" $HOME `printf expanded` $(touch shim-injected) \\\nline");
+    let mut session = Session::new();
+    let result = session.execute("file.automate.createDroplet", json!({"path": path, "steps": [["file.new", {}]]})).unwrap();
+    let droplet = result["path"].as_str().unwrap();
+    let shim = result["shim"].as_str().unwrap();
+
+    let cli = format!("{dir}/cli stub");
+    let capture = format!("{dir}/captured path");
+    let marker = format!("{dir}/shim-injected");
+    let input = format!("{dir}/input file");
+    std::fs::write(
+        &cli,
+        "#!/bin/sh\nif [ \"$#\" -ne 3 ] || [ \"$1\" != droplet ] || [ \"$3\" != \"$PHOTOCRAFT_EXPECTED_INPUT\" ]; then exit 90; fi\nprintf '%s' \"$2\" > \"$PHOTOCRAFT_CAPTURE\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = std::process::Command::new(shim)
+        .arg(&input)
+        .current_dir(&dir)
+        .env("PHOTOCRAFT_CLI", &cli)
+        .env("PHOTOCRAFT_CAPTURE", &capture)
+        .env("PHOTOCRAFT_EXPECTED_INPUT", &input)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "shim exited {:?}: {}", output.status, String::from_utf8_lossy(&output.stderr));
+    assert!(!std::path::Path::new(&marker).exists(), "filename command substitution ran");
+    let expected = std::fs::canonicalize(droplet).unwrap();
+    assert_eq!(std::fs::read(&capture).unwrap(), expected.to_string_lossy().as_bytes());
+}
+
 #[test]
 fn droplets_carry_the_actions_their_play_steps_call() {
     use crate::actions_cmds::Action;
@@ -303,8 +340,8 @@ fn a_failed_step_inside_a_called_action_fails_scripts_and_batch() {
     images(&dir, 1, 8, 4);
     let mut s = Session::new();
     s.execute("file.new", json!({"width": 8, "height": 6})).unwrap();
-    s.actions.list.push(Action { name: "Rotate".into(), steps: vec![("image.imageRotation.90cw".into(), json!({}))] });
-    s.actions.list.push(Action { name: "Bad".into(), steps: vec![("layer.delete".into(), json!({"layer": 999_999}))] });
+    s.actions.list.push(Action { name: "Rotate".into(), steps: vec![("image.imageRotation.90cw".into(), json!({}))], disabled: Default::default() });
+    s.actions.list.push(Action { name: "Bad".into(), steps: vec![("layer.delete".into(), json!({"layer": 999_999}))], disabled: Default::default() });
     // A script stops at the failed call and reports it.
     let r = s.execute("file.scripts.browse", json!({"steps": [["actions.play", {"action": "Bad"}], ["image.imageRotation.90cw", {}]]})).unwrap();
     assert_eq!(r["ok"], false, "{r}");
@@ -321,6 +358,6 @@ fn a_failed_step_inside_a_called_action_fails_scripts_and_batch() {
     assert!(r["errors"][0]["error"].as_str().unwrap().contains("no such layer"), "{r}");
     // An action that batches itself stops as a recursive call instead of overflowing the stack.
     let inner = json!({"steps": [["actions.play", {"action": "Loop"}]], "input": dir.clone(), "output": format!("{dir}/inner"), "format": "png"});
-    s.actions.list.push(Action { name: "Loop".into(), steps: vec![("file.automate.batch".into(), inner)] });
+    s.actions.list.push(Action { name: "Loop".into(), steps: vec![("file.automate.batch".into(), inner)], disabled: Default::default() });
     batch(&mut s, "Loop");
 }

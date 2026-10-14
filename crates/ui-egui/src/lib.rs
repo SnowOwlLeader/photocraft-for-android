@@ -22,21 +22,27 @@ pub mod adjust_ui;
 mod alt_grab;
 pub mod analysis_ui;
 pub mod anchor_tools;
+pub mod artboard_tool;
 pub mod artboard_ui;
+mod blend_keys;
 pub(crate) mod blend_preview;
 mod brand;
+pub(crate) mod brush_cursor;
 pub mod brush_panel;
 pub mod brush_picker;
 pub mod brush_preview;
 pub mod brush_resize;
 pub mod brush_sections;
 pub mod brushes_tab;
+mod cam_transform;
 mod camera_raw_detail_ui;
 mod camera_raw_preview_ui;
 mod camera_raw_scope_ui;
 pub mod camera_raw_ui;
 pub mod canvas;
+mod canvas_popup;
 pub mod canvas_tool_menu;
+pub mod cas_transform;
 pub mod channel_view;
 pub mod channels_panel;
 pub mod chrome_ui;
@@ -55,13 +61,17 @@ pub mod crop_size;
 pub mod crop_straighten;
 pub mod crop_ui;
 pub mod delete_layer_prompt;
+pub mod dialog_alt_reset;
 pub mod dialog_blend_ui;
 pub mod dialogs;
 pub mod direct_select;
+pub mod direction;
 pub mod discard_ui;
 pub mod distort_ui;
 pub mod doc_props_ui;
 pub mod dock;
+pub mod duplicate_layer_ui;
+pub mod egui_fonts;
 pub mod enable_rules;
 pub mod eraser_ui;
 pub mod export_dialog;
@@ -72,13 +82,17 @@ pub mod file_open;
 pub mod file_ui;
 pub mod fill_ui;
 pub mod filter_dialog;
+mod filter_preview_ui;
 #[cfg(not(target_arch = "wasm32"))]
 mod filter_preview_worker;
+pub mod flick_pan;
 mod font_preview;
+pub mod frame_tool;
 pub mod gallery_ui;
 pub mod gpu_canvas;
 pub mod gpu_status;
 pub mod gradient_ui;
+pub mod guide_layout_ui;
 pub mod hold_keys;
 pub mod i18n;
 mod icon_data;
@@ -88,17 +102,20 @@ pub mod kys_import;
 pub mod lasso_ui;
 pub mod layer_menu_ui;
 pub mod layer_pick_ui;
+pub mod layer_picker;
 pub mod layer_props_ui;
 mod layer_reveal;
 pub mod layer_row_ui;
 pub mod layer_style;
 mod layer_transfer;
 pub mod layer_tree_ui;
+mod layout_keys;
 pub mod links;
 pub mod liquify_ui;
 pub mod magnetic_lasso_ui;
 mod mask_props_ui;
 pub mod mask_thumbs_ui;
+pub mod mask_trash_prompt;
 pub mod menu_catalog;
 pub mod menu_nav;
 pub mod menus;
@@ -110,6 +127,8 @@ pub mod move_mods;
 pub mod move_ui;
 pub mod native_menu;
 pub mod new_doc_ui;
+pub mod new_guide_ui;
+pub mod new_layer_ui;
 pub mod notices;
 mod numeric_expression;
 mod opacity_keys;
@@ -120,7 +139,9 @@ mod panel_docking;
 pub mod panels;
 pub mod parity;
 pub mod patch_preview;
+pub(crate) mod pattern_fill_ui;
 pub mod pattern_preview;
+pub mod perspective_crop_ui;
 pub mod perspective_ui;
 pub mod pixel_grid;
 pub mod plugin_ui;
@@ -141,12 +162,14 @@ pub mod rotate_view;
 pub mod rulers;
 pub mod screen_picker;
 pub mod scrollbars;
+pub mod select_mask_view;
 pub mod served_fonts;
 pub mod shape_dialog;
 pub(crate) mod shape_fill_ui;
 pub mod shape_stroke_ui;
 pub mod shortcut_dispatch;
 pub mod shortcuts;
+mod single_line_drag;
 mod sizing;
 pub mod slice_ui;
 pub mod smart_ui;
@@ -157,10 +180,12 @@ pub mod stroke_constraint;
 pub mod stroke_trail;
 pub mod stroke_ui;
 pub mod stylus;
+pub mod swap_arrow;
 pub mod swatches_ui;
 pub mod symmetry_ui;
 mod tab_strip;
 pub mod targa_options_ui;
+pub mod text_field_menu;
 pub mod theme;
 pub mod tiff_options_ui;
 mod timeline_ui;
@@ -170,6 +195,7 @@ mod tool_cursor;
 pub mod tool_feedback;
 pub(crate) mod tool_memory;
 mod tool_reset;
+pub mod transform_fx;
 pub mod transform_tex;
 pub mod transform_tool;
 mod type_font_preview;
@@ -179,6 +205,7 @@ mod type_transform;
 mod variables_ui;
 pub mod vector_ui;
 pub mod view_cmds;
+pub mod vp_ui;
 pub mod warp_preview;
 pub mod wheel_nav;
 pub mod wide_angle_ui;
@@ -220,11 +247,14 @@ pub struct ExportSettings {
     /// Targa: bits per pixel from Targa Options or Export As (`None`: 32 with an alpha channel or
     /// transparency, else 24).
     pub tga_bits: Option<photocraft_io::TgaBits>,
+    /// PSD/PSB: embed a thumbnail (Preferences › File Handling › Image Previews; see
+    /// [`PhotocraftApp::save_settings`]).
+    pub image_previews: bool,
 }
 
 impl Default for ExportSettings {
     fn default() -> Self {
-        ExportSettings { jpeg_quality: None, webp_lossless: true, webp_quality: None, tiff_layers: true, xmp_all: true, tga_bits: None }
+        ExportSettings { jpeg_quality: None, webp_lossless: true, webp_quality: None, tiff_layers: true, xmp_all: true, tga_bits: None, image_previews: true }
     }
 }
 
@@ -271,6 +301,10 @@ pub(crate) enum SaveKind {
 pub type AutomationReadFn = Box<dyn FnMut(&str) -> Result<(String, Vec<u8>), String>>;
 /// Write bytes through the desktop control session's authorized write root.
 pub type AutomationWriteFn = Box<dyn FnMut(&str, &[u8]) -> Result<(), String>>;
+/// Load a directory-form `.pcraft` through the authorized read root, returning its display
+/// name (the file name) and the loaded document. `Ok(None)` marks a regular file: the
+/// caller falls back to the bytes path for the zip form.
+pub type AutomationOpenPcraftFn = Box<dyn FnMut(&str) -> Result<Option<(String, Document)>, String>>;
 /// Reject engine commands which still perform ambient filesystem I/O.
 pub type AutomationCommandFn = Box<dyn Fn(&str, &Value) -> Result<(), String>>;
 /// Open a URL in the system browser (native) — reliable cross-platform, unlike `ctx.open_url`.
@@ -352,6 +386,7 @@ pub struct Services {
     /// using `file_dialog` and `write` with the user's authority.
     pub automation_read: Option<AutomationReadFn>,
     pub automation_write: Option<AutomationWriteFn>,
+    pub automation_open_pcraft: Option<AutomationOpenPcraftFn>,
     pub automation_command: Option<AutomationCommandFn>,
     /// Same policy as [`Self::automation_command`], as a function pointer the engine calls for
     /// each step of `actions.play`. Installed on the session only while a control request or
@@ -451,6 +486,11 @@ pub struct PhotocraftApp {
     committed_stroke: Option<canvas::CommittedStroke>,
     /// Footprint trail of a retouching drag (see `stroke_trail`).
     trail: Option<stroke_trail::Trail>,
+    /// Remove tool strokes waiting to be applied together (Remove after each stroke off), the
+    /// document they belong to, and their tint on the canvas (`retouch_ui`).
+    pub(crate) remove_pending: Vec<Vec<[f64; 3]>>,
+    pub(crate) remove_pending_doc: Option<photocraft_doc::DocId>,
+    pub(crate) remove_trail: Option<stroke_trail::Trail>,
     /// The open menus' items, reused between frames (`menus::ItemCache`).
     pub(crate) menu_cache: Option<menus::ItemCache>,
     /// Move tool drag shown live (`move_ui`).
@@ -461,11 +501,12 @@ pub struct PhotocraftApp {
     pub(crate) blend_preview: Option<blend_preview::BlendPreview>,
     /// Patch Tool drag: the healed document at the pointer (`patch_preview`).
     pub(crate) patch_preview: Option<patch_preview::PatchPreview>,
-    pub(crate) shape_stroke_preview: Option<shape_stroke_ui::ShapeStrokePreview>,
     /// The pixels a Magnetic Lasso border follows (`magnetic_lasso_ui`).
     pub(crate) magnetic: magnetic_lasso_ui::Runtime,
     /// The next tool `Down` is a right-button drag that erases (see `paint_mouse`).
     secondary_erase: bool,
+    /// The Brush or Pencil erase key is held this frame (`hold_keys::erase_held`, #3439).
+    held_erase: bool,
     /// While a batch of recovered pointer samples is replayed, defer the live-stroke update to one
     /// call for the whole frame (see `canvas::canvas_view`).
     defer_live_stroke: bool,
@@ -533,6 +574,9 @@ pub struct PhotocraftApp {
     pub fps: f32,
     last_frame_time: f64,
     thumbs: HashMap<(photocraft_doc::LayerId, u8), (u64, egui::TextureHandle)>,
+    /// History snapshot thumbnails by (document, snapshot id): a snapshot never changes, so each
+    /// is made once (`snapshot_thumb`, #2966).
+    snapshot_thumbs: HashMap<(DocId, u64), egui::TextureHandle>,
     /// Snapshots whose live layer/mask keys were last used to prune thumbnail handles.
     thumb_documents: Vec<(DocId, std::sync::Weak<Document>)>,
     /// Content bounds cached per (key, revision): scanning a 36 MP layer every frame cost ~77 ms.
@@ -571,6 +615,8 @@ pub struct PhotocraftApp {
     /// Live Layer Style dialog preview: (key over revision + style fields, preview or validation error).
     pub(crate) style_preview: Option<(u64, Result<std::sync::Arc<Document>, String>)>,
     pub(crate) solid_fill_preview: Option<solid_fill_ui::Preview>,
+    /// Live Pattern Fill dialog preview (pattern_fill_ui).
+    pub(crate) pattern_fill_preview: Option<pattern_fill_ui::Preview>,
     /// Shape fill Color Picker preview (shape_fill_ui).
     pub(crate) shape_fill_preview: Option<shape_fill_ui::Preview>,
     /// Liquify dialog, Puppet Warp and Perspective Warp sessions (distort_ui).
@@ -605,8 +651,12 @@ pub struct PhotocraftApp {
     pub(crate) layer_box: Option<move_box::LayerBox>,
     /// Crop tool gesture in progress (see `crop_ui`).
     pub(crate) crop: crop_ui::CropState,
+    /// Perspective Crop tool gesture and clicked corners (see `perspective_crop_ui`).
+    pub(crate) pcrop: perspective_crop_ui::PerspectiveCrop,
     /// Type tool layout cache: ((doc, revision, layer), layout).
     pub(crate) type_layout: Option<((u64, u64, u64), std::sync::Arc<photocraft_text::TextLayout>)>,
+    /// Type tool: (layer, clicks in the current run) for word / line / paragraph / all selection.
+    pub(crate) type_clicks: Option<(u64, u32)>,
     pub(crate) type_transform_preview: Option<type_transform::Preview>,
     /// A font hovered in the Type tool's font picker, shown live (`type_font_preview`).
     pub(crate) type_font_preview: Option<type_font_preview::TypeFontPreview>,
@@ -666,14 +716,17 @@ impl PhotocraftApp {
             live_stroke: None,
             committed_stroke: None,
             trail: None,
+            remove_pending: Vec::new(),
+            remove_pending_doc: None,
+            remove_trail: None,
             menu_cache: None,
             move_preview: None,
             move_hover: None,
             blend_preview: None,
             patch_preview: None,
-            shape_stroke_preview: None,
             magnetic: Default::default(),
             secondary_erase: false,
+            held_erase: false,
             defer_live_stroke: false,
             press_stroke: false,
             last_stroke_end: None,
@@ -704,6 +757,7 @@ impl PhotocraftApp {
             fps: 0.0,
             last_frame_time: 0.0,
             thumbs: HashMap::new(),
+            snapshot_thumbs: HashMap::new(),
             thumb_documents: Vec::new(),
             bounds_cache: HashMap::new(),
             proxy: None,
@@ -719,11 +773,13 @@ impl PhotocraftApp {
             channel_thumbs: None,
             channel_views: HashMap::new(),
             type_layout: None,
+            type_clicks: None,
             type_transform_preview: None,
             type_font_preview: None,
             guide_drag: None,
             layer_box: None,
             crop: Default::default(),
+            pcrop: Default::default(),
             hover_doc: None,
             clone_preview: None,
             info_sample: None,
@@ -735,6 +791,7 @@ impl PhotocraftApp {
             style_preview: None,
             text_style_preview: None,
             solid_fill_preview: None,
+            pattern_fill_preview: None,
             shape_fill_preview: None,
             distort: Default::default(),
             gradient: Default::default(),
@@ -831,6 +888,9 @@ impl PhotocraftApp {
         if let Some(result) = delete_layer_prompt::intercept(self, id, &params) {
             return result;
         }
+        if let Some(result) = mask_trash_prompt::intercept(self, id, &params) {
+            return result;
+        }
         // Automation input also gates every step a command runs on its behalf (`actions.play`).
         let gate = if self.automation_input && self.session.authorize.is_none() { self.services.automation_authorize } else { None };
         if gate.is_some() {
@@ -839,6 +899,16 @@ impl PhotocraftApp {
         let result = self.run_command(id, params);
         if gate.is_some() {
             self.session.authorize = None;
+        }
+        // An explicit channel target (⌘2, ⌘\, ⌘3…) decides what the Layers panel targets too:
+        // ⌘2 after the mask was targeted goes back to the layer's pixels.
+        if result.is_ok() && id.starts_with("channel.target") {
+            if let Some(t) = self.session.active().map(|st| st.channel_view.target) {
+                use photocraft_engine::channel_cmds::ChannelTarget;
+                self.ui.mask_target = t == ChannelTarget::LayerMask;
+                self.ui.vector_mask_target = t == ChannelTarget::VectorMask;
+            }
+            self.sync_mask_targets();
         }
         result
     }
@@ -859,6 +929,9 @@ impl PhotocraftApp {
         if let Some(r) = transform_tool::intercept(self, id) {
             return r;
         }
+        if let Some(r) = crate::crop_ui::intercept(self, id) {
+            return r;
+        }
         let suppress_events = self.automation_input && self.session.prefs().script_events.enabled;
         if suppress_events {
             self.session.edit_prefs(|prefs| prefs.script_events.enabled = false);
@@ -871,7 +944,8 @@ impl PhotocraftApp {
             }
             if self.session.clipboard.is_none() && self.services.clipboard_get_image.is_some() {
                 // Enabled on the strength of the OS clipboard, which held no image: a quiet no-op.
-                self.ui.status = "Nothing to paste: the clipboard holds no image".into();
+                let message = "Nothing to paste: the clipboard holds no image";
+                self.ui.status = tl!(message).into();
                 self.ui.status_error = false;
                 return Ok(serde_json::json!({"pasted": false}));
             }
@@ -898,6 +972,9 @@ impl PhotocraftApp {
             // Adding a layer mask targets it, as in Photoshop (#2166).
             self.ui.mask_target = true;
             self.ui.vector_mask_target = false;
+            // Properties still shows the new adjustment or fill layer's settings, not its mask,
+            // as in Photoshop (#3369): clicking the mask thumbnail switches it to the mask.
+            self.ui.properties_layer = if creates_adjustment_or_fill { self.session.active().and_then(|st| st.active_layer).map(|l| l.0) } else { None };
         }
         if r.is_ok() && id == "select.toWorkPath" {
             // Make Work Path selects the new work path in the Paths panel, as in Photoshop.
@@ -922,6 +999,13 @@ impl PhotocraftApp {
         match &r {
             Ok(_) => {
                 self.sync_views();
+                let removed = self.session.take_samplers_removed();
+                if removed > 0 {
+                    // A canvas-size change (crop, Canvas Size, Image Size, rotation) dropped Color
+                    // Sampler points that fell outside the new canvas (#1046).
+                    self.ui.status = crate::i18n::trn(crate::i18n::current(), removed as u64, "{n} sample point removed", "{n} sample points removed");
+                    self.ui.status_error = false;
+                }
                 if self.ui.status_error {
                     self.ui.status.clear();
                     self.ui.status_error = false;
@@ -948,6 +1032,7 @@ impl PhotocraftApp {
 
     pub fn sync_views(&mut self) {
         type_transform::cancel_stale(self);
+        crate::cam_transform::cancel_stale(self);
         crate::lasso_ui::cancel_stale(self);
         crate::crop_ui::cancel_stale(self);
         let ids: Vec<DocId> = self.session.documents().iter().map(|d| d.doc.id).collect();
@@ -1054,13 +1139,13 @@ impl PhotocraftApp {
             st.source_read_only = photocraft_io::affinity::is_affinity(bytes);
         }
         self.sync_views();
-        self.ui.status = format!("Opened {name}");
+        self.ui.status = crate::i18n::fmt(tl!("Opened {name}"), &[("name", name)]);
         self.ui.status_error = false;
         if camera_raw_ui::wants_open_dialog(self, &warnings) {
             camera_raw_ui::queue_open_dialog(self, name, None, Some(bytes));
-            notices::io_warnings(self, &format!("Opened {name}"), &camera_raw_ui::without_develop_note(&warnings));
+            notices::io_warnings(self, &crate::i18n::fmt(tl!("Opened {name}"), &[("name", name)]), &camera_raw_ui::without_develop_note(&warnings));
         } else {
-            notices::io_warnings(self, &format!("Opened {name}"), &warnings);
+            notices::io_warnings(self, &crate::i18n::fmt(tl!("Opened {name}"), &[("name", name)]), &warnings);
         }
         // Script events bound to "Open Document".
         photocraft_engine::automate_cmds::document_opened(&mut self.session);
@@ -1103,9 +1188,9 @@ impl PhotocraftApp {
             st.source_read_only = photocraft_io::affinity::is_affinity(bytes);
         }
         self.sync_views();
-        self.ui.status = format!("Opened {name}");
+        self.ui.status = crate::i18n::fmt(tl!("Opened {name}"), &[("name", name)]);
         self.ui.status_error = false;
-        notices::io_warnings(self, &format!("Opened {name}"), &warnings);
+        notices::io_warnings(self, &crate::i18n::fmt(tl!("Opened {name}"), &[("name", name)]), &warnings);
         Ok(warnings)
     }
 
@@ -1219,6 +1304,23 @@ impl PhotocraftApp {
         self.save_as_step(path.to_string(), params.get("tiffLayers").and_then(Value::as_bool), tga_bits)
     }
 
+    /// What a save writes by default under the preferences: File Handling › Image Previews
+    /// decides whether a PSD/PSB gets its thumbnail. Ask When Saving has no Save As checkbox
+    /// here yet, so it saves the preview, as Photoshop's checkbox starts on. A JPEG or WebP
+    /// is written the way the active document's file was (its JPEG quality, a WebP lossy at
+    /// its quality or lossless), as Photoshop's Save and Save As options start there.
+    pub(crate) fn save_settings(&self) -> ExportSettings {
+        let previews = self.session.prefs().file_handling.image_previews != photocraft_engine::prefs::Ask::Never;
+        let mut settings = ExportSettings { image_previews: previews, ..ExportSettings::default() };
+        if let Some(st) = self.session.active() {
+            let e = &st.doc.file_encoding;
+            settings.jpeg_quality = e.jpeg_quality.map(|q| q.clamp(1, 100));
+            settings.webp_lossless = e.webp_lossless.unwrap_or(settings.webp_lossless);
+            settings.webp_quality = e.webp_quality.map(|q| q.min(100));
+        }
+        settings
+    }
+
     /// Whether saving the active document to `path` writes a copy. `tiff_layers` is the TIFF
     /// Options answer: `Some(false)` discards the layers and saves a copy.
     fn saves_copy(&self, path: &str, tiff_layers: Option<bool>) -> Result<bool, String> {
@@ -1236,7 +1338,7 @@ impl PhotocraftApp {
     /// pixel (`None`: 32 with an alpha channel or transparency, else 24).
     fn write_save(&mut self, path: String, tiff_layers: Option<bool>, tga_bits: Option<photocraft_io::TgaBits>) -> Result<Value, String> {
         let copy = self.saves_copy(&path, tiff_layers)?;
-        let settings = ExportSettings { tiff_layers: tiff_layers.unwrap_or(ExportSettings::default().tiff_layers), tga_bits, ..Default::default() };
+        let settings = ExportSettings { tiff_layers: tiff_layers.unwrap_or(ExportSettings::default().tiff_layers), tga_bits, ..self.save_settings() };
         match self.write_document(path.clone(), &settings, copy)? {
             Some((path, warnings)) => Ok(serde_json::json!({"path": path, "warnings": warnings})),
             None => Ok(serde_json::json!({"path": path, "warnings": [], "pending": true, "job": self.jobs.last_started.map(|j| j.0)})),
@@ -1299,7 +1401,11 @@ impl PhotocraftApp {
                     && let Some(i) = app.session.active_index()
                     && let Some(r) = photocraft_engine::automate_cmds::document_saved(&mut app.session, i)
                 {
-                    app.ui.status = format!("Saved {path}; {} image assets in {}", r["files"].as_array().map_or(0, Vec::len), r["dir"].as_str().unwrap_or(""));
+                    let template = "Saved {path}; image assets: {n} in {dir}";
+                    app.ui.status = crate::i18n::fmt(
+                        tl!(template),
+                        &[("path", path), ("n", &r["files"].as_array().map_or(0, Vec::len).to_string()), ("dir", r["dir"].as_str().unwrap_or(""))],
+                    );
                 }
                 Ok(())
             });
@@ -1341,7 +1447,7 @@ impl PhotocraftApp {
         if self.background_jobs
             && let Some(save) = self.services.automation_save.clone()
         {
-            return match jobs_ui::start_save(self, target.clone(), ExportSettings { tga_bits, ..Default::default() }, false, save, true)? {
+            return match jobs_ui::start_save(self, target.clone(), ExportSettings { tga_bits, ..self.save_settings() }, false, save, true)? {
                 Some((path, warnings)) => Ok(reply(&path, &warnings)),
                 None => {
                     let job = self.jobs.last_started;
@@ -1351,8 +1457,9 @@ impl PhotocraftApp {
         }
         let state = self.session.active().ok_or("no document")?;
         let (doc, revision) = (state.doc.id, state.revision);
+        let settings = ExportSettings { tga_bits, ..self.save_settings() };
         let export = self.services.export.as_ref().ok_or("no exporter configured")?;
-        let (bytes, warnings) = export(&state.doc, &target, &ExportSettings { tga_bits, ..Default::default() })?;
+        let (bytes, warnings) = export(&state.doc, &target, &settings)?;
         let write = self.services.automation_write.as_mut().ok_or("automation write authority is not configured")?;
         write(&target, &bytes)?;
         self.saved_automation(doc, revision, &target, &warnings, false);
@@ -1454,19 +1561,22 @@ impl eframe::App for PhotocraftApp {
         }
         self.drain_control(ctx);
         native_menu::run(self, ctx);
-        if self.ui.text_edit.is_some() && !self.ui.tool.is_type() {
+        // Switching tools commits, also between the Type and Type Mask tools.
+        if self.ui.text_edit.as_ref().is_some_and(|ed| !self.ui.tool.is_type() || ed.mask != self.ui.tool.is_type_mask()) {
             type_tool::commit(self);
         }
         if self.ui.pen.as_ref().is_some_and(|p| !p.drawn_with(self.ui.tool)) {
             vector_ui::pen_commit(self, false);
         }
         transform_tool::end_if_left(self);
+        shape_stroke_ui::sync_editor(self, ctx);
         self.collect_screenshots(ctx);
         self.issue_screenshots(ctx);
         prefs_ui::tick(self, ctx);
-        monitor_status::poll(self, ctx);
+        monitor_status::poll_frame(self, ctx, frame);
         // Control requests and persisted preferences can change the language in this frame.
         i18n::sync_context(ctx, &self.session.prefs().interface.language);
+        type_tool::sync_font_names(ctx, self.session.prefs().type_.show_font_names_in_english);
         // A window bigger than its display (1440 × 900 on 1366 × 768) runs under the taskbar:
         // maximize it into the work area once (#315).
         work_area::fit_window(ctx);
@@ -1539,9 +1649,16 @@ impl eframe::App for PhotocraftApp {
             return;
         }
         let t0 = gpu_canvas::now_ms();
+        // A text field's right-click menu, before any field is drawn (text_field_menu.rs).
+        text_field_menu::show(&ctx);
         // Each painting tool keeps its own brush (#218), so switch the active tool's brush in
         // before anything this frame reads it (the cursor, the options bar, a stroke).
         paint_mouse::sync_tool_brush(self);
+        // A unit typed into a value field (`1in` in a px field) converts at the active document's
+        // resolution, as in Photoshop.
+        let ppi = self.session.prefs().units_and_rulers.point_size.per_inch();
+        let dpi = self.session.active().map_or(72.0, |d| f64::from(d.doc.resolution_dpi.max(1.0)));
+        crate::widgets::set_field_resolution(&ctx, dpi, ppi);
         // View › Screen Mode › Full Screen Mode: only the image, on black (F or Esc returns).
         screen_picker::show(&ctx);
         if screen_picker::busy(&ctx) && screen_picker::showing(&ctx) {
@@ -1618,7 +1735,10 @@ impl eframe::App for PhotocraftApp {
         brush_picker::persist(self, &ctx);
         // Tool options are remembered between launches the same way (#2814).
         tool_memory::persist(self, &ctx);
+        // So are View › Extras, Show and Snap To (#3762).
+        view_cmds::persist(self, &ctx);
         self.automation_input = false;
+        shape_stroke_ui::finish_frame(self, &ctx);
         native_menu::sync(self, &ctx);
         if screen_picker::busy(&ctx) {
             // Block input without a backdrop: the worker may still be capturing the screen.
@@ -1635,6 +1755,9 @@ impl eframe::App for PhotocraftApp {
                 let _ = w.send(serde_json::json!({"ok": true, "result": null}));
             }
         }
+        // A menu or dialog can start a filter after `jobs_ui::tick` ran in this frame. Keep
+        // polling it even when the platform would otherwise put the event loop to sleep.
+        jobs_ui::keep_polling(self, &ctx);
         // Menus and buttons in this frame may have asked for a file dialog.
         self.poll_file_dialog(&ctx, Some(frame));
     }
@@ -1669,28 +1792,48 @@ impl PhotocraftApp {
         }
     }
 
-    /// The Layers panel targets the active layer's mask, and no alpha channel or Quick Mask
-    /// takes over (the engine routes those itself).
+    /// The active layer's mask is what pixel commands edit: the Layers panel targets it, or every
+    /// colour channel is off and that mask is the picture. An alpha channel or Quick Mask wins,
+    /// as the engine routes those itself.
     pub fn layer_mask_targeted(&self) -> bool {
-        let Some(st) = self.session.active().filter(|_| self.ui.mask_target) else { return false };
-        let composite = st.channel_view.target == photocraft_engine::channel_cmds::ChannelTarget::Composite && st.doc.quick_mask.is_none();
-        composite && st.active_layer.and_then(|id| st.doc.layer(id)).is_some_and(|l| l.mask.is_some())
+        let Some(st) = self.session.active() else { return false };
+        let layer_mask = st.channel_view.target == photocraft_engine::channel_cmds::ChannelTarget::LayerMask;
+        let composite = (st.channel_view.target == photocraft_engine::channel_cmds::ChannelTarget::Composite || layer_mask) && st.doc.quick_mask.is_none();
+        let has_mask = st.active_layer.and_then(|id| st.doc.layer(id)).is_some_and(|l| l.mask.is_some());
+        if !composite || !has_mask {
+            return false;
+        }
+        if self.ui.mask_target || layer_mask {
+            return true;
+        }
+        let colors_off = st.channel_view.visible_colors(photocraft_engine::channel_cmds::color_count(&st.doc)) == 0;
+        let alpha_on = (0..st.doc.channels.len()).any(|i| st.channel_view.alpha_shown(i));
+        colors_off && !alpha_on
     }
 
     /// Viewing a layer mask (#196) targets it; a vector-mask target needs a vector mask on the
     /// active layer (a shape layer's path is its content, not a mask). Targeting a mask or the
     /// pixels brings back that target's foreground/background pair, as in Photoshop (#2166).
     pub(crate) fn sync_mask_targets(&mut self) {
-        if let Some(st) = self.session.active() {
-            if photocraft_engine::mask_view_cmds::current(st).is_some() {
+        if let Some(st) = self.session.active_mut() {
+            if photocraft_engine::mask_view_cmds::current(st).is_some() || st.channel_view.target == photocraft_engine::channel_cmds::ChannelTarget::LayerMask {
                 self.ui.mask_target = true;
                 self.ui.vector_mask_target = false;
+            } else if st.channel_view.target == photocraft_engine::channel_cmds::ChannelTarget::VectorMask {
+                self.ui.vector_mask_target = true;
+                self.ui.mask_target = false;
             }
             if self.ui.vector_mask_target && !mask_thumbs_ui::has_vector_mask(st) {
                 self.ui.vector_mask_target = false;
             }
             if self.ui.mask_target && st.active_layer.and_then(|id| st.doc.layer(id)).is_none_or(|l| l.mask.is_none()) {
                 self.ui.mask_target = false;
+            }
+            if !self.ui.mask_target && st.channel_view.target == photocraft_engine::channel_cmds::ChannelTarget::LayerMask {
+                st.channel_view.target = photocraft_engine::channel_cmds::ChannelTarget::Composite;
+            }
+            if !self.ui.mask_target || self.ui.properties_layer != st.active_layer.map(|l| l.0) {
+                self.ui.properties_layer = None;
             }
         }
         let mask = self.layer_mask_targeted();
@@ -1737,6 +1880,12 @@ impl PhotocraftApp {
     }
 
     pub(crate) fn apply_theme(&mut self, ctx: &egui::Context, kind: theme::ThemeKind) {
+        // Color and Swatches trade indices between Pro and Studio layouts.
+        if let Some(selected) = dock::Group::Color.tabs(theme::Tokens::for_kind(self.ui.theme).pro).get(self.ui.dock_tabs.color)
+            && let Some(tab) = dock::Group::Color.tabs(theme::Tokens::for_kind(kind).pro).iter().position(|name| name == selected)
+        {
+            self.ui.dock_tabs.color = tab;
+        }
         self.ui.theme = kind;
         panel_docking::sync_visibility(self);
         theme::apply(ctx, kind);
@@ -1762,6 +1911,29 @@ impl PhotocraftApp {
             photocraft_raster::to_rgba(&s.format(), &px[..n])
         });
         self.store_thumb(ctx, key, rev, img)
+    }
+
+    /// The History panel thumbnail of snapshot `snap` of document `doc` (#2966): its composite,
+    /// centred in a square. Thumbnails of `doc`'s snapshots not in `live` are dropped.
+    pub fn snapshot_thumb(&mut self, ctx: &egui::Context, doc: DocId, snap: &photocraft_engine::history_cmds::Snapshot, live: &[u64]) -> egui::TextureId {
+        self.snapshot_thumbs.retain(|(d, id), _| *d != doc || live.contains(id));
+        if let Some(tex) = self.snapshot_thumbs.get(&(doc, snap.id)) {
+            return tex.id();
+        }
+        let comp = photocraft_compose::thumbnail(&snap.doc, 56);
+        let (w, h) = (comp.width as usize, comp.height as usize);
+        let side = w.max(h);
+        let (ox, oy) = ((side - w) / 2, (side - h) / 2);
+        let mut px = vec![egui::Color32::TRANSPARENT; side * side];
+        for (i, &[r, g, b, a]) in comp.pixels.as_chunks::<4>().0.iter().enumerate() {
+            if let Some(out) = px.get_mut((i / w + oy) * side + i % w + ox) {
+                *out = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
+            }
+        }
+        let tex = ctx.load_texture(format!("snapshot-{}", snap.id), egui::ColorImage::new([side, side], px), egui::TextureOptions::LINEAR);
+        let id = tex.id();
+        self.snapshot_thumbs.insert((doc, snap.id), tex);
+        id
     }
 
     pub fn mask_thumb(&mut self, ctx: &egui::Context, doc: &Document, id: photocraft_doc::LayerId, mask: &photocraft_doc::LayerMask) -> egui::TextureId {
@@ -1854,9 +2026,12 @@ impl PhotocraftApp {
     /// very first frame renders; otherwise `logic` does it and the first frame is skipped.
     pub fn setup_context(ctx: &egui::Context, kind: theme::ThemeKind) {
         ctx.add_plugin(tool_cursor::CursorLifecycle);
+        ctx.add_plugin(single_line_drag::SingleLineDrag::default());
         theme::install_fonts(ctx);
         egui_extras::install_image_loaders(ctx);
         theme::apply(ctx, kind);
+        // Right-click in any text field: its Cut / Copy / Paste menu (text_field_menu.rs).
+        ctx.add_plugin(text_field_menu::TextFieldMenu);
         // egui's own ⌘+ / ⌘- / ⌘0 scale the whole interface; PhotoCraft zooms the canvas instead
         // (shortcuts.rs), like Photoshop.
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
@@ -2102,6 +2277,9 @@ impl PhotocraftApp {
 mod color_swatch_tests;
 
 #[cfg(test)]
+mod profile_prompt_tests;
+
+#[cfg(test)]
 mod input_tests;
 
 #[cfg(test)]
@@ -2110,10 +2288,17 @@ mod pen_variants_tests;
 #[cfg(test)]
 mod color_replacement_tests;
 #[cfg(test)]
+mod layer_shortcut_tests;
+#[cfg(test)]
 mod pencil_tests;
+#[cfg(test)]
+mod tool_shortcut_tests;
 
 #[cfg(test)]
 mod pixel_aspect_tests;
+
+#[cfg(test)]
+mod transform_fx_tests;
 
 #[cfg(test)]
 mod transform_undo_tests;
@@ -2129,6 +2314,9 @@ mod move_auto_select_tests;
 
 #[cfg(test)]
 mod new_group_button_tests;
+
+#[cfg(test)]
+mod new_layer_button_tests;
 
 #[cfg(test)]
 mod move_outline_tests;
@@ -2152,7 +2340,13 @@ mod warp_text_dialog_tests;
 mod blend_dropdown_wheel_tests;
 
 #[cfg(test)]
+mod dropdown_press_tests;
+
+#[cfg(test)]
 mod marquee_tests;
+
+#[cfg(test)]
+mod canvas_menu_tests;
 
 #[cfg(test)]
 mod caps_lock_tests;
@@ -2165,6 +2359,8 @@ mod stamp_tests;
 
 #[cfg(test)]
 mod alt_click_tests;
+#[cfg(test)]
+mod status_bar_tests;
 #[cfg(test)]
 mod stroke_timing_tests;
 
@@ -2335,6 +2531,35 @@ mod clipboard_tests {
         }
         assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0, "the OS clipboard is read only on an explicit paste");
         assert!(h.state().session.clipboard.is_none());
+    }
+
+    /// #2928: with the layer mask targeted, ⌘C copies the mask's values as grayscale, not the
+    /// layer's pixels — so ⌘V (targeting another layer's mask, #1035) moves the mask itself.
+    #[test]
+    fn copy_with_the_mask_targeted_copies_the_mask_not_the_pixels() {
+        let (os, reads) = (OsClip::default(), Arc::default());
+        let mut app = app_with_os_clipboard(&os, &reads);
+        app.run("layer.new.layer", serde_json::json!({})).unwrap();
+        app.run("layer.layerMask.hideAll", serde_json::json!({})).unwrap();
+        // Black pixels, a white square in the mask: the copy must carry the mask.
+        app.run("select.all", serde_json::json!({})).unwrap();
+        app.run("edit.fill", serde_json::json!({"color": "#000000"})).unwrap();
+        app.run("select.rect", serde_json::json!({"x": 4, "y": 4, "width": 8, "height": 8})).unwrap();
+        app.run("edit.fill", serde_json::json!({"color": "#ffffff", "target": "mask"})).unwrap();
+        app.run("select.deselect", serde_json::json!({})).unwrap();
+        app.ui.mask_target = true;
+        crate::menus::invoke(&mut app, &egui::Context::default(), "edit.copy", serde_json::json!({})).unwrap();
+        let clip = app.session.clipboard.clone().expect("the mask was copied");
+        let st = app.session.active().unwrap();
+        let (w, h) = (st.doc.size.width as i32, st.doc.size.height as i32);
+        assert_eq!(
+            [clip.bounds.x0, clip.bounds.y0, clip.bounds.width() as i32, clip.bounds.height() as i32],
+            [0, 0, w, h],
+            "the mask, whole — not the black pixels"
+        );
+        let px = clip.surface.rgba(6, 6);
+        assert!(px[0] > 0.99 && px[3] > 0.99, "white mask values: {px:?}");
+        assert!(clip.surface.rgba(20, 20)[0] < 0.01, "the hidden area copies as black");
     }
 
     /// #1035: with the layer mask targeted (its thumbnail clicked), ⌘V pastes the clipboard's

@@ -126,7 +126,7 @@ pub fn layers_in_rect(doc: &Document, r: Rect, group: bool) -> Vec<LayerId> {
     let canvas = doc.bounds();
     for (path, _, l) in doc.walk().iter().rev() {
         if matches!(l.content, LayerContent::Group(_) | LayerContent::Adjustment(_))
-            || crate::layer_multi_cmds::is_locked_background(l)
+            || doc.is_background(l.id)
             || doc.effective_locks(l.id).all
             || !(1..=path.len()).all(|n| doc.layer_at(&path[..n]).is_some_and(|a| a.visible))
         {

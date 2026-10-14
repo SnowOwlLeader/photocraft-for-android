@@ -73,7 +73,8 @@ pub fn pointer_if_armed(app: &PhotocraftApp, ctx: &egui::Context) -> Option<egui
     if get(ctx).is_none() && move_drag(app).is_none() {
         return None;
     }
-    ctx.input(|i| i.pointer.latest_pos())
+    // Touch releases include PointerGone; interact_pos retains the release point for this frame.
+    ctx.input(|i| i.pointer.interact_pos())
 }
 
 /// The pointer is over document tab `index` while layers are dragged: a Move drag becomes a
@@ -110,7 +111,7 @@ pub fn over_tab(app: &mut PhotocraftApp, ctx: &egui::Context, index: usize) {
 /// layers there; while the button is held a ghost follows the pointer.
 pub fn finish(app: &mut PhotocraftApp, ctx: &egui::Context) {
     let Some(t) = get(ctx) else { return };
-    let (pos, released, down) = ctx.input(|i| (i.pointer.latest_pos(), i.pointer.any_released(), i.pointer.primary_down()));
+    let (pos, released, down) = ctx.input(|i| (i.pointer.interact_pos(), i.pointer.any_released(), i.pointer.primary_down()));
     let target = pos.and_then(|p| target_at(app, p));
     if !released {
         if !down {

@@ -63,17 +63,9 @@ pub fn dropdown_options() -> Vec<(String, &'static str)> {
     v
 }
 
-/// The unit a suffix names (`in`, `cm`, `mm`, `px`, `pt`, `pica`, and their long forms).
+/// The unit a suffix names ([`Unit::from_suffix`]); a crop size has no percent.
 fn unit_of(suffix: &str) -> Option<Unit> {
-    Some(match suffix.to_ascii_lowercase().as_str() {
-        "px" | "pixel" | "pixels" => Unit::Pixels,
-        "in" | "inch" | "inches" | "\"" => Unit::Inches,
-        "cm" | "centimeter" | "centimeters" | "centimetre" | "centimetres" => Unit::Centimeters,
-        "mm" | "millimeter" | "millimeters" | "millimetre" | "millimetres" => Unit::Millimeters,
-        "pt" | "point" | "points" => Unit::Points,
-        "pica" | "picas" => Unit::Picas,
-        _ => return None,
-    })
+    Unit::from_suffix(suffix).filter(|u| *u != Unit::Percent)
 }
 
 /// A typed length: a positive number and an optional unit ("4 in", "4in", "10,5 cm", "1024").
@@ -375,7 +367,8 @@ mod tests {
         assert_eq!(parse_length("1024 px", Unit::Inches), Some((1024.0, Unit::Pixels)));
         assert_eq!(parse_length("8,5 in", Unit::Pixels), Some((8.5, Unit::Inches)));
         assert_eq!(parse_length("12", Unit::Centimeters), Some((12.0, Unit::Centimeters)), "a bare number keeps the field's unit");
-        for bad in ["", "in", "0 in", "-4 in", "4 furlongs", "NaN", "1e400 px", "4 in 5"] {
+        assert_eq!(parse_length("3 pc", Unit::Pixels), Some((3.0, Unit::Picas)), "the shared unit table");
+        for bad in ["", "in", "0 in", "-4 in", "4 furlongs", "NaN", "1e400 px", "4 in 5", "50 %", "50 percent"] {
             assert_eq!(parse_length(bad, Unit::Pixels), None, "{bad}");
         }
         assert_eq!(normalize_length("4in", ""), "4 in");

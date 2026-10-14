@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="ai.storyteller.photocraft.android" android:versionCode="7003" android:versionName="0.7.0-android.3">
+    package="ai.storyteller.photocraft.android" android:versionCode="8211" android:versionName="0.8.2-android.11">
     <uses-sdk android:minSdkVersion="28" android:targetSdkVersion="35" />
     <uses-feature android:glEsVersion="0x00030000" android:required="true" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
@@ -8,7 +8,7 @@
         android:allowBackup="false" android:hasCode="true" android:extractNativeLibs="true" android:largeHeap="true"
         android:icon="@drawable/icon">
         <activity android:name="ai.storyteller.photocraft.PhotoCraftActivity" android:exported="true"
-            android:screenOrientation="sensorLandscape" android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|screenLayout|uiMode|density"
+            android:screenOrientation="unspecified" android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|screenLayout|uiMode|density"
             android:windowSoftInputMode="adjustResize">
             <meta-data android:name="android.app.lib_name" android:value="photocraft_android" />
             <intent-filter>

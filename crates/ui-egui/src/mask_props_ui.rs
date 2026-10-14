@@ -10,9 +10,10 @@ use crate::{PhotocraftApp, widgets};
 /// Image › Adjustments › Invert, which inverts a targeted layer mask in place (#780).
 const INVERT: &str = "image.adjustments.invert";
 
-/// The Layers panel targets the active layer's pixel mask (not its vector mask).
+/// The Layers panel targets the active layer's pixel mask (not its vector mask) and Properties
+/// shows it: a just-created adjustment or fill layer shows its own settings instead (#3369).
 pub fn targeted(app: &PhotocraftApp, layer: &Layer) -> bool {
-    app.ui.mask_target && !app.ui.vector_mask_target && layer.mask.is_some()
+    app.ui.mask_target && !app.ui.vector_mask_target && layer.mask.is_some() && app.ui.properties_layer != Some(layer.id.0)
 }
 
 /// The Layers panel targets the active layer's vector mask.

@@ -264,8 +264,13 @@ fn delete_key_command(app: &PhotocraftApp, id: String) -> String {
     }
     let Some(st) = app.session.active() else { return id };
     let composite = st.channel_view.target == photocraft_engine::channel_cmds::ChannelTarget::Composite && st.doc.quick_mask.is_none();
-    let mask = app.ui.mask_target && st.active_layer.and_then(|l| st.doc.layer(l)).is_some_and(|l| l.mask.is_some());
-    if mask && composite {
+    let has_mask = st.active_layer.and_then(|l| st.doc.layer(l)).is_some_and(|l| l.mask.is_some());
+    let colors_off = st.channel_view.visible_colors(photocraft_engine::channel_cmds::color_count(&st.doc)) == 0;
+    let alpha_on = (0..st.doc.channels.len()).any(|i| st.channel_view.alpha_shown(i));
+    let solo_mask = colors_off && has_mask && !alpha_on && st.doc.quick_mask.is_none();
+    let layer_mask = st.channel_view.target == photocraft_engine::channel_cmds::ChannelTarget::LayerMask;
+    let mask = (app.ui.mask_target || solo_mask || layer_mask) && has_mask;
+    if mask && (composite || layer_mask) {
         let cmd = if st.doc.selection.is_some() { "edit.fillBackground" } else { "layer.layerMask.delete" };
         return cmd.into();
     }
@@ -304,7 +309,8 @@ pub fn dispatch(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str) {
     let command_id = if action.is_some() { "actions.play" } else { id };
     let outcome = if !crate::menus::is_enabled(app, command_id) {
         let why = disabled_reason(app, command_id);
-        app.ui.status = format!("{} is not available: {why}", label(id));
+        let template = "{label} is not available: {reason}";
+        app.ui.status = crate::i18n::fmt(tl!(template), &[("label", crate::i18n::tr_id(crate::i18n::current(), id, &label(id))), ("reason", tl!(&why))]);
         app.ui.status_error = true;
         Outcome::Disabled(why)
     } else if ctx.data(|d| d.get_temp::<bool>(dry_run_id())).unwrap_or(false) {

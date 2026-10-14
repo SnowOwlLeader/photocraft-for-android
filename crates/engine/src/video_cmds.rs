@@ -200,9 +200,38 @@ fn rasterize(s: &mut Session, _p: &Value) -> Result<Value> {
 
 // ------------------------------------------------------------------ file-based footage
 
-/// Load frames from `path`: a single image (1 frame), or a directory of images (sorted = an image
-/// sequence). Each becomes a full raster frame in the document's format.
-fn load_frames(path: &str, fmt: photocraft_color::PixelFormat) -> Result<Vec<Surface>> {
+/// Frames loaded from a file or an image sequence.
+struct Footage {
+    frames: Vec<Surface>,
+    /// The frame rate the footage itself implies (a single animated GIF's delays); `None` for
+    /// stills and sequences, which carry none.
+    fps: Option<f32>,
+}
+
+/// The frame rate for a GIF's frame delays (milliseconds): that of the most common delay, the
+/// first one seen on a tie. GIF has a delay per frame but the timeline one rate. Delays under
+/// 20 ms, which includes the 0 and 10 ms many encoders write, are shown at 100 ms, as browsers
+/// do, since they would otherwise play at an unintended 50-100 fps.
+fn fps_from_delays(delays: &[u32]) -> Option<f32> {
+    let clean = |d: u32| if d < 20 { 100 } else { d };
+    let mut counts: Vec<(u32, usize)> = Vec::new();
+    for d in delays.iter().copied().map(clean) {
+        match counts.iter_mut().find(|(k, _)| *k == d) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((d, 1)),
+        }
+    }
+    let best = counts.iter().fold(None::<(u32, usize)>, |best, &(d, n)| match best {
+        Some((_, bn)) if bn >= n => best,
+        _ => Some((d, n)),
+    });
+    best.map(|(d, _)| 1000.0 / d as f32)
+}
+
+/// Load frames from `path`: a single image (1 frame, or every frame of an animated GIF), or a
+/// directory of images (sorted = an image sequence). Each becomes a full raster frame in the
+/// document's format.
+fn load_frames(path: &str, fmt: photocraft_color::PixelFormat) -> Result<Footage> {
     let p = std::path::Path::new(path);
     let is_img = |f: &std::path::Path| {
         matches!(
@@ -225,9 +254,19 @@ fn load_frames(path: &str, fmt: photocraft_color::PixelFormat) -> Result<Vec<Sur
         return Err(EngineError::Other(format!("no images in `{path}`")));
     }
     let mut frames = Vec::with_capacity(files.len());
+    let mut delays = Vec::new();
     for f in &files {
         let bytes = std::fs::read(f).map_err(|e| EngineError::Other(format!("read `{}`: {e}", f.display())))?;
         let name = f.to_string_lossy();
+        if photocraft_codecs::detect(&bytes) == Some(photocraft_codecs::Format::Gif) {
+            photocraft_io::import_gif_frames(&name, &bytes, &mut |doc, delay_ms| {
+                frames.push(crate::file_cmds::flattened(&doc, fmt));
+                delays.push(delay_ms);
+                Ok(())
+            })
+            .map_err(|e| EngineError::Other(format!("`{}`: {e}", f.display())))?;
+            continue;
+        }
         let mut doc = crate::file_cmds::import(&name, &bytes)?;
         // A Targa's alpha opens as a channel (as in Photoshop); a frame's alpha is transparency.
         if f.extension().is_some_and(|e| e.eq_ignore_ascii_case("tga")) {
@@ -235,7 +274,9 @@ fn load_frames(path: &str, fmt: photocraft_color::PixelFormat) -> Result<Vec<Sur
         }
         frames.push(crate::file_cmds::flattened(&doc, fmt));
     }
-    Ok(frames)
+    // Only a lone GIF says how fast it plays; a sequence mixing files has no single rate.
+    let fps = if files.len() == 1 { fps_from_delays(&delays) } else { None };
+    Ok(Footage { frames, fps })
 }
 
 fn new_from_file(s: &mut Session, p: &Value) -> Result<Value> {
@@ -244,9 +285,10 @@ fn new_from_file(s: &mut Session, p: &Value) -> Result<Value> {
         .and_then(Value::as_str)
         .ok_or_else(|| EngineError::BadParams { cmd: "layer.videoLayers.newVideoLayerFromFile".into(), msg: "need `path`".into() })?
         .to_string();
-    let fps = p.get("fps").and_then(Value::as_f64).unwrap_or(30.0) as f32;
     let fmt = s.active().ok_or(EngineError::NoDocument)?.doc.pixel_format();
-    let frames = load_frames(&path, fmt)?;
+    let Footage { frames, fps: footage_fps } = load_frames(&path, fmt)?;
+    // An explicit `fps` wins, then the rate the footage implies, then 30.
+    let fps = p.get("fps").and_then(Value::as_f64).map(|f| f as f32).or(footage_fps).unwrap_or(30.0);
     let n = frames.len();
     let id = s.edit("New Video Layer from File", |doc, active| {
         store(doc);
@@ -277,7 +319,7 @@ fn replace_footage(s: &mut Session, p: &Value) -> Result<Value> {
         .ok_or_else(|| EngineError::BadParams { cmd: "layer.videoLayers.replaceFootage".into(), msg: "need `path`".into() })?
         .to_string();
     let fmt = s.active().ok_or(EngineError::NoDocument)?.doc.pixel_format();
-    let frames = load_frames(&path, fmt)?;
+    let frames = load_frames(&path, fmt)?.frames;
     edit_video(s, "Replace Footage", move |v, _| {
         v.original_frames = Some(frames.clone());
         v.frames = frames;
@@ -311,7 +353,7 @@ fn reload_frame(s: &mut Session, _p: &Value) -> Result<Value> {
     let photocraft_doc::VideoSource::File { path } = src else {
         return Err(EngineError::BadParams { cmd: "layer.videoLayers.reloadFrame".into(), msg: "this layer has no file source to reload".into() });
     };
-    let frames = load_frames(&path, fmt)?;
+    let frames = load_frames(&path, fmt)?.frames;
     edit_video(s, "Reload Frame", move |v, _| {
         v.original_frames = Some(frames.clone());
         v.frames = frames;
@@ -327,7 +369,7 @@ fn frames_to_layers(s: &mut Session, p: &Value) -> Result<Value> {
         .ok_or_else(|| EngineError::BadParams { cmd: "file.import.videoFramesToLayers".into(), msg: "need `path`".into() })?
         .to_string();
     let fmt = s.active().ok_or(EngineError::NoDocument)?.doc.pixel_format();
-    let frames = load_frames(&path, fmt)?;
+    let frames = load_frames(&path, fmt)?.frames;
     let n = frames.len();
     s.edit("Video Frames to Layers", |doc, active| {
         let mut above = *active;

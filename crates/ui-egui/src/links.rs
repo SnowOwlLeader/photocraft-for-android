@@ -6,15 +6,22 @@ use serde_json::{Value, json};
 
 use crate::PhotocraftApp;
 
-pub const DISCORD: &str = "https://discord.gg/artcraft";
+pub const COMMUNITY_LABEL: &str = "加入我们的 QQ 社群";
+pub const COMMUNITY_GROUP: &str = "1129505510";
+pub const COMMUNITY_URL: &str = "mqqapi://card/show_pslcard?src_type=internal&version=1&uin=1129505510&card_type=group&source=qrcode";
 pub const ARTCRAFT_WEBSITE: &str = "https://getartcraft.com";
 pub const APP_PAGE: &str = "https://getartcraft.com/apps/photocraft";
 pub const GITHUB: &str = "https://github.com/storytold/photocraft";
 pub const ISSUES: &str = "https://github.com/storytold/photocraft/issues";
 
 /// Help-menu link commands: (id, url). Labels live in `menus::UI_COMMANDS`.
-pub const COMMANDS: &[(&str, &str)] =
-    &[("help.discord", DISCORD), ("help.website", APP_PAGE), ("help.artcraftWebsite", ARTCRAFT_WEBSITE), ("help.github", GITHUB), ("help.reportIssue", ISSUES)];
+pub const COMMANDS: &[(&str, &str)] = &[
+    ("help.discord", COMMUNITY_URL),
+    ("help.website", APP_PAGE),
+    ("help.artcraftWebsite", ARTCRAFT_WEBSITE),
+    ("help.github", GITHUB),
+    ("help.reportIssue", ISSUES),
+];
 
 pub fn url_for(id: &str) -> Option<&'static str> {
     COMMANDS.iter().find(|c| c.0 == id).map(|c| c.1)
@@ -27,21 +34,17 @@ pub fn open(app: &mut PhotocraftApp, ctx: &egui::Context, url: &str) -> Value {
     if !opened {
         ctx.open_url(egui::OpenUrl::new_tab(url));
     }
-    app.ui.status = format!("Opened {url}");
+    let template = "Opened {url}";
+    app.ui.status = crate::i18n::fmt(tl!(template), &[("url", url)]);
     json!({"url": url})
 }
 
-/// The prominent "Join us on Discord" button.
-pub fn discord_button(app: &mut PhotocraftApp, ui: &mut egui::Ui, min_width: f32) -> egui::Response {
-    #[cfg(target_os = "android")]
-    let (label, url) = ("加入我们的 QQ 社群", "mqqapi://card/show_pslcard?src_type=internal&version=1&uin=378525932&card_type=group&source=qrcode");
-    #[cfg(not(target_os = "android"))]
-    let (label, url) = (tl!("Join us on Discord"), DISCORD);
-    let r = crate::widgets::primary_button(ui, label, min_width).on_hover_text(url);
-    #[cfg(target_os = "android")]
-    ui.label("QQ群号：378525932（可在 QQ 中搜索加入）");
+/// The community entry shared by the start screen and About dialog.
+pub fn community_button(app: &mut PhotocraftApp, ui: &mut egui::Ui, min_width: f32) -> egui::Response {
+    let r = crate::widgets::primary_button(ui, COMMUNITY_LABEL, min_width).on_hover_text(COMMUNITY_URL);
+    ui.label(format!("QQ群号：{COMMUNITY_GROUP}（可在 QQ 中搜索加入）"));
     if r.clicked() {
-        open(app, ui.ctx(), url);
+        open(app, ui.ctx(), COMMUNITY_URL);
     }
     r
 }
@@ -79,7 +82,7 @@ mod tests {
 
     #[test]
     fn links_open_through_the_platform_service() {
-        // Issue #14: links (Help menu, Discord button, start-page links) must open in the browser.
+        // Help, community and start-page links must reach the platform service.
         // They route through the `open_url` service rather than the unreliable `ctx.open_url`.
         use std::sync::{Arc, Mutex};
         let opened: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -98,9 +101,9 @@ mod tests {
             crate::menus::invoke(&mut app, &ctx, id, json!({})).unwrap();
             assert_eq!(opened.lock().unwrap().last().map(String::as_str), Some(*url), "{id}");
         }
-        // The direct open() helper (Discord button / start-page links) also uses it.
-        open(&mut app, &ctx, DISCORD);
-        assert_eq!(opened.lock().unwrap().last().map(String::as_str), Some(DISCORD));
+        // The direct helper used by community and start-page links also uses it.
+        open(&mut app, &ctx, COMMUNITY_URL);
+        assert_eq!(opened.lock().unwrap().last().map(String::as_str), Some(COMMUNITY_URL));
     }
 
     #[test]
@@ -118,7 +121,7 @@ mod tests {
         let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
         let ctx = egui::Context::default();
         for (id, url) in [
-            ("help.discord", "https://discord.gg/artcraft"),
+            ("help.discord", COMMUNITY_URL),
             ("help.website", "https://getartcraft.com/apps/photocraft"),
             ("help.github", "https://github.com/storytold/photocraft"),
         ] {
@@ -126,5 +129,35 @@ mod tests {
             assert_eq!(r["url"], url);
             assert_eq!(app.ui.status, format!("Opened {url}"));
         }
+    }
+
+    #[test]
+    fn community_button_opens_the_current_qq_group() {
+        use egui_kittest::kittest::Queryable;
+        use std::sync::{Arc, Mutex};
+        let urls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = urls.clone();
+        let mut app = PhotocraftApp::new(
+            photocraft_engine::Session::new(),
+            crate::Services {
+                open_url: Some(Box::new(move |url| {
+                    recorded.lock().unwrap().push(url.to_owned());
+                    Ok(())
+                })),
+                ..Default::default()
+            },
+        );
+        let mut h = egui_kittest::Harness::new_ui(|ui| {
+            if ui.ctx().fonts(|f| f.families().contains(&egui::FontFamily::Name("medium".into()))) {
+                community_button(&mut app, ui, 160.0);
+            }
+        });
+        PhotocraftApp::setup_context(&h.ctx, Default::default());
+        h.run_steps(2);
+        h.get_by_label(COMMUNITY_LABEL).click();
+        h.run();
+        assert_eq!(*urls.lock().unwrap(), [COMMUNITY_URL]);
+        assert!(COMMUNITY_URL.contains("uin=1129505510&card_type=group"));
+        h.get_by_label_contains("1129505510");
     }
 }

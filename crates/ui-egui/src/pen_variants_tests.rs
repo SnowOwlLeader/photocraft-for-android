@@ -104,3 +104,68 @@ fn curvature_pen_clicks_make_a_smooth_path_through_every_point() {
     assert!(!sp.knots[1].smooth && sp.knots[1].in_ctrl == sp.knots[1].anchor, "a corner point");
     assert!(sp.knots[0].smooth && sp.knots[2].smooth);
 }
+
+fn ev(app: &mut PhotocraftApp, kind: &str, x: f64, y: f64, mods: Modifiers) {
+    let e = match kind {
+        "down" => ToolEvent::Down { x, y, pressure: 1.0 },
+        "up" => ToolEvent::Up { x, y },
+        _ => ToolEvent::Move { x, y, pressure: 1.0 },
+    };
+    tool_event(app, e, mods);
+}
+
+#[test]
+fn freeform_pen_alt_clicks_draw_straight_segments_between_freehand_runs() {
+    // Photoshop: ⌥ held at the release keeps the path open, each ⌥-click adds a straight segment,
+    // releasing ⌥ with the button down goes on freehand.
+    let mut app = app(Tool::FreeformPen);
+    app.sync_views();
+    let before = app.session.active().unwrap().history.entries().len();
+    ev(&mut app, "down", 20.0, 20.0, Modifiers::NONE);
+    for x in (22..=80).step_by(2) {
+        ev(&mut app, "move", f64::from(x), 20.0, Modifiers::NONE);
+    }
+    ev(&mut app, "move", 80.0, 20.0, Modifiers::ALT);
+    ev(&mut app, "up", 80.0, 20.0, Modifiers::ALT);
+    assert!(app.session.active().unwrap().doc.work_path.is_none(), "⌥ at the release keeps the path open");
+    // Hovering only moves the rubber band; the click adds a straight segment.
+    ev(&mut app, "move", 120.0, 40.0, Modifiers::ALT);
+    ev(&mut app, "down", 80.0, 100.0, Modifiers::ALT);
+    // ⌥ released with the button down: freehand again, a half circle down to (20, 100).
+    for i in 0..=36 {
+        let a = (f64::from(i) * 5.0).to_radians();
+        ev(&mut app, "move", 50.0 + 30.0 * a.cos(), 100.0 + 30.0 * a.sin(), Modifiers::NONE);
+    }
+    ev(&mut app, "up", 20.0, 100.0, Modifiers::NONE);
+    let path = work_path(&app);
+    let knots = &path.subpaths[0].knots;
+    let anchors: Vec<[f64; 2]> = knots.iter().map(|k| [k.anchor.x.round(), k.anchor.y.round()]).collect();
+    assert_eq!(anchors[..3], [[20.0, 20.0], [80.0, 20.0], [80.0, 100.0]], "{anchors:?}");
+    assert_eq!(anchors.last(), Some(&[20.0, 100.0]));
+    assert!(!anchors.contains(&[120.0, 40.0]), "the hover is not a point");
+    // The ⌥-click segment is straight: no handles on either end of it.
+    assert_eq!((knots[1].out_ctrl, knots[2].in_ctrl), (knots[1].anchor, knots[2].anchor));
+    assert!(!knots[1].smooth && !knots[2].smooth);
+    // The freehand run after it curves.
+    assert!(knots[2..].iter().any(|k| k.out_ctrl != k.anchor), "{knots:?}");
+    assert_eq!(app.session.active().unwrap().history.entries().len(), before + 1, "one History step");
+}
+
+#[test]
+fn new_pens_with_command_edit_paths_as_direct_selection() {
+    for tool in [Tool::FreeformPen, Tool::CurvaturePen] {
+        let mut app = app(Tool::Pen);
+        click(&mut app, 30.0, 30.0);
+        click(&mut app, 90.0, 30.0);
+        crate::vector_ui::pen_commit(&mut app, false);
+        app.ui.tool = tool;
+        // ⌘-drag (Ctrl off the Mac) on an anchor moves it; the tool stays.
+        ev(&mut app, "down", 90.0, 30.0, Modifiers::COMMAND);
+        ev(&mut app, "move", 90.0, 70.0, Modifiers::COMMAND);
+        ev(&mut app, "up", 90.0, 70.0, Modifiers::COMMAND);
+        let wp = work_path(&app);
+        assert_eq!(wp.subpaths.len(), 1, "{tool:?} drew nothing");
+        assert_eq!([wp.subpaths[0].knots[1].anchor.x, wp.subpaths[0].knots[1].anchor.y], [90.0, 70.0], "{tool:?}");
+        assert_eq!(app.ui.tool, tool);
+    }
+}

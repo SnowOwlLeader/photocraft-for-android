@@ -50,6 +50,66 @@ codec_rt!(tiff_rgb16, "tif", ColorMode::Rgb, SampleType::U16, false, 0.0);
 codec_rt!(tiff_cmyk8, "tiff", ColorMode::Cmyk, SampleType::U8, false, 0.0);
 codec_rt!(tiff_cmyka16, "tiff", ColorMode::Cmyk, SampleType::U16, true, 0.0);
 codec_rt!(tiff_gray8, "tiff", ColorMode::Grayscale, SampleType::U8, false, 0.0);
+codec_rt!(fits_rgb8, "fits", ColorMode::Rgb, SampleType::U8, false, 0.0);
+codec_rt!(fits_gray16, "fit", ColorMode::Grayscale, SampleType::U16, false, 0.0);
+codec_rt!(fits_rgb32, "fits", ColorMode::Rgb, SampleType::F32, false, 0.0);
+
+fn indexed_bmp_8() -> Vec<u8> {
+    const FILE_HEADER_SIZE: usize = 14;
+    const INFO_HEADER_SIZE: usize = 40;
+    const PALETTE_ENTRY_SIZE: usize = 4;
+    const PALETTE: [[u8; 3]; 2] = [[10, 20, 30], [200, 100, 50]];
+    const PIXEL_ROW: [u8; 4] = [0, 1, 0, 0];
+    let pixel_offset = FILE_HEADER_SIZE + INFO_HEADER_SIZE + PALETTE.len() * PALETTE_ENTRY_SIZE;
+    let file_size = pixel_offset + PIXEL_ROW.len();
+    let mut bytes = Vec::with_capacity(file_size);
+    bytes.extend_from_slice(b"BM");
+    bytes.extend_from_slice(&(file_size as u32).to_le_bytes());
+    bytes.extend_from_slice(&[0; 4]);
+    bytes.extend_from_slice(&(pixel_offset as u32).to_le_bytes());
+    bytes.extend_from_slice(&(INFO_HEADER_SIZE as u32).to_le_bytes());
+    bytes.extend_from_slice(&2i32.to_le_bytes());
+    bytes.extend_from_slice(&1i32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&8u16.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&(PIXEL_ROW.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&0i32.to_le_bytes());
+    bytes.extend_from_slice(&0i32.to_le_bytes());
+    bytes.extend_from_slice(&(PALETTE.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    for [r, g, b] in PALETTE {
+        bytes.extend_from_slice(&[b, g, r, 0]);
+    }
+    bytes.extend_from_slice(&PIXEL_ROW);
+    bytes
+}
+
+#[test]
+fn indexed_bmp_opens_with_its_color_table() {
+    let doc = import("indexed.bmp", &indexed_bmp_8()).unwrap().document;
+    assert_eq!(doc.mode, ColorMode::Indexed);
+    assert_eq!(doc.depth, SampleType::U8);
+    assert_eq!(doc.color_table.as_ref().unwrap().colors.get(..2), Some(&[[10, 20, 30], [200, 100, 50]][..]));
+    let px = doc.layers[0].surface().unwrap().rgba(1, 0);
+    assert!((px[0] - 200.0 / 255.0).abs() < 1e-6);
+    assert!((px[1] - 100.0 / 255.0).abs() < 1e-6);
+    assert!((px[2] - 50.0 / 255.0).abs() < 1e-6);
+}
+
+/// FITS header cards travel as the document's text metadata, so an astro frame keeps its
+/// OBJECT, EXPTIME and the rest through an edit.
+#[test]
+fn fits_header_cards_round_trip_as_text() {
+    let mut d = single(ColorMode::Grayscale, SampleType::U16, false);
+    d.metadata.text = vec![("OBJECT".into(), "NGC 246".into()), ("EXPTIME".into(), "480.0".into())];
+    let r = export(&d, "a.fits", &ExportOptions::default()).unwrap();
+    assert!(r.bytes.starts_with(b"SIMPLE  ="));
+    let back = import("a.fits", &r.bytes).unwrap().document;
+    for kv in &d.metadata.text {
+        assert!(back.metadata.text.contains(kv), "{kv:?}: {:?}", back.metadata.text);
+    }
+}
 
 /// EXR stores linear light: a linear document round-trips exactly; an sRGB (untagged) one is
 /// linearised on export and comes back tagged linear sRGB with the same colours.
@@ -296,8 +356,8 @@ fn transparent_flat_images_open_as_layer_0() {
         ("ga.png", enc(ChannelLayout::GrayA, CS::U8, Format::Png), true),
         ("a.tif", enc(ChannelLayout::Rgba, CS::U8, Format::Tiff), true),
         ("ga.tif", enc(ChannelLayout::GrayA, CS::U16, Format::Tiff), true),
-        ("pal.png", photocraft_codecs::encode_png_indexed(w, h, &[0, 1].repeat(n / 2), &[[255, 0, 0], [0, 0, 255]], Some(0)).unwrap(), true),
-        ("pal_opaque.png", photocraft_codecs::encode_png_indexed(w, h, &[0, 1].repeat(n / 2), &[[255, 0, 0], [0, 0, 255]], None).unwrap(), false),
+        ("pal.png", photocraft_codecs::encode_png_indexed(w, h, &[0, 1].repeat(n / 2), &[[255, 0, 0], [0, 0, 255]], Some(0), None).unwrap(), true),
+        ("pal_opaque.png", photocraft_codecs::encode_png_indexed(w, h, &[0, 1].repeat(n / 2), &[[255, 0, 0], [0, 0, 255]], None, None).unwrap(), false),
         ("rgb.png", enc(ChannelLayout::Rgb, CS::U8, Format::Png), false),
         ("g.png", enc(ChannelLayout::Gray, CS::U16, Format::Png), false),
         ("rgb.tif", enc(ChannelLayout::Rgb, CS::U8, Format::Tiff), false),

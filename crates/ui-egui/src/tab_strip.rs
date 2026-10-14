@@ -44,10 +44,10 @@ pub struct StripOut {
     /// A tab was dragged along the strip and dropped: `(tab, before)`, draw `tab` just before
     /// tab `before` (`None`: last).
     pub reorder: Option<(usize, Option<usize>)>,
-    /// A tab is being dragged away from the strip (the dock moves the whole group then).
-    pub dragging_out: bool,
-    /// A tab drag ended away from the strip.
-    pub dropped_out: bool,
+    /// The index of a tab being dragged away from this strip.
+    pub dragging_out: Option<usize>,
+    /// The index of a tab whose drag ended away from this strip.
+    pub dropped_out: Option<usize>,
 }
 
 /// Width of the » overflow button.
@@ -110,8 +110,8 @@ fn tabs_in(
         responses: Vec::with_capacity(f.shown.len()),
         chevron: None,
         reorder: None,
-        dragging_out: false,
-        dropped_out: false,
+        dragging_out: None,
+        dropped_out: None,
     };
     // Without reordering, drags on a tab fall through to the strip behind it.
     let sense = if reorderable { Sense::click_and_drag() } else { Sense::click() };
@@ -184,8 +184,8 @@ fn tabs_in(
                     crate::widgets::drop_line(ui, *r, slot >= out.tabs.len(), true, &t);
                 }
             }
-            None if released => out.dropped_out = true,
-            None => out.dragging_out = true,
+            None if released => out.dropped_out = Some(tab),
+            None => out.dragging_out = Some(tab),
         }
     }
     out

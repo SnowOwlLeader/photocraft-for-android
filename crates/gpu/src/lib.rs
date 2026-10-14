@@ -82,6 +82,12 @@ const FLUSH_BYTES: u64 = 512 << 20;
 /// command buffer holding a whole huge refresh can run for seconds, long enough for the OS to
 /// reset the GPU.
 const FLUSH_WORK: u64 = 1 << 30;
+/// Copies and render passes [`Compositor::render`] records before submitting. wgpu opens up to
+/// two backend command buffers for each (a render pass and its barrier pre-pass), and Metal
+/// treats more than 4096 outstanding ones as a lost device: a refresh of a document with a few
+/// hundred layers reached that inside a single page cell (P12, "pc_compose_uniforms is
+/// invalid"), where the work and byte limits above never trigger.
+const FLUSH_OPS: u32 = 1000;
 
 /// A finished chunk: straight-alpha RGBA32F pixels of `rect` (document coordinates) at the
 /// texture's origin.
@@ -99,6 +105,9 @@ pub struct Stats {
     pub slots: u32,
     pub tiles_uploaded: usize,
     pub bytes_uploaded: usize,
+    /// Tiles a new layer texture took from another layer's texture by a GPU copy (a duplicate
+    /// shares its source's tiles) instead of uploading them.
+    pub tiles_shared: usize,
     /// Effect layers whose shape was (re)rendered, fully or partially.
     pub fx_shapes: usize,
     /// Effect map programs run (one per effect whose maps were rebuilt).
@@ -187,6 +196,10 @@ struct Resident {
     stamp: u64,
     /// CMYK profile the texels were converted with (`CmykSpace::id`, 0 = built-in / not CMYK).
     cmyk: u64,
+    /// Its texels were copied to or from another layer texture by the encoder, so every write
+    /// to it goes through the encoder too: a queued write lands before the encoder runs, and
+    /// would be overwritten by the copy, or leak into it.
+    ordered: bool,
 }
 
 impl Resident {
@@ -422,6 +435,8 @@ pub struct Compositor {
     stamp: u64,
     /// Bytes staged by uploads since the last submit.
     staged: u64,
+    /// Copies and render passes recorded since the last submit.
+    recorded: u32,
     acc_format: wgpu::TextureFormat,
     /// Whether the effect-map pipelines could be built (else documents with layer effects are
     /// [`Unsupported`] and use the CPU compositor).
@@ -617,6 +632,7 @@ impl Compositor {
             frame: 0,
             stamp: 0,
             staged: 0,
+            recorded: 0,
             acc_format,
             effect_maps: map_error.is_none(),
             cmyk: 0,
@@ -907,6 +923,7 @@ impl Compositor {
         self.frame += 1;
         self.stamp += 1;
         self.staged = 0;
+        self.recorded = 0;
 
         // Only render owns submission. A caller may discard encode's command buffer, so it
         // cannot establish (or consume) a checkpoint whose GPU copy might never execute.
@@ -937,9 +954,7 @@ impl Compositor {
         }
         let flush_bytes = FLUSH_BYTES.min(self.memory_budget() / 8).max(16 << 20);
         stats.cells = cells.len();
-        // The previous intermediate submit (waited for before the next is queued; the web has
-        // no blocking wait and relies on the browser's own scheduling).
-        #[cfg(not(target_arch = "wasm32"))]
+        // The previous intermediate submit (see `submit_batch`).
         let mut last_submit: Option<wgpu::SubmissionIndex> = None;
         // Work recorded and bytes evicted since the last submit.
         let (mut work, mut freed) = (0u64, 0u64);
@@ -958,29 +973,19 @@ impl Compositor {
             let chunks = grid_rects(part, self.chunk);
             stats.chunks += chunks.len();
             work += part.width() as u64 * part.height() as u64 * plan.passes.len() as u64;
-            self.run_cell(device, queue, encoder, doc.id, &plan, &paged, cell, &fr, &chunks, checkpoint, &mut stats, sink);
+            let mut batch = flush.then_some(&mut last_submit);
+            self.run_cell(device, queue, encoder, doc.id, &plan, &paged, cell, &fr, &chunks, checkpoint, &mut stats, sink, &mut batch);
+            // The device was lost in a submit inside the cell: issue no more work.
+            if let Some(f) = self.fault() {
+                return Err(Unsupported(f.to_string()));
+            }
             let (evicted, bytes) = self.evict();
             stats.evicted += evicted;
             freed += bytes;
-            if flush && (self.staged >= flush_bytes || work >= FLUSH_WORK || freed >= flush_bytes) {
-                // Submit what's recorded, and wait for the previous submit, so at most two
-                // batches of uploads and evicted pages are in flight.
-                let done = std::mem::replace(encoder, device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pc_compose") }));
-                let index = queue.submit([done.finish()]);
-                #[cfg(not(target_arch = "wasm32"))]
-                if let Some(prev) = last_submit.replace(index) {
-                    match &self.health {
-                        Some(h) => {
-                            h.wait(device, Some(prev));
-                        }
-                        None => {
-                            let _ = device.poll(wgpu::PollType::Wait { submission_index: Some(prev), timeout: None });
-                        }
-                    }
-                }
-                #[cfg(target_arch = "wasm32")]
-                let _ = index;
+            if flush && (self.staged >= flush_bytes || work >= FLUSH_WORK || freed >= flush_bytes || self.recorded >= FLUSH_OPS) {
+                submit_batch(device, queue, encoder, self.health.as_ref(), &mut last_submit);
                 self.staged = 0;
+                self.recorded = 0;
                 work = 0;
                 freed = 0;
                 stats.flushes += 1;
@@ -1135,6 +1140,8 @@ impl Compositor {
         checkpoint: Option<plan::Checkpoint>,
         stats: &mut Stats,
         sink: &mut dyn FnMut(&mut wgpu::CommandEncoder, ChunkOut<'_>),
+        // The previous intermediate submit, when this refresh may submit in between.
+        batch: &mut Option<&mut Option<wgpu::SubmissionIndex>>,
     ) {
         if chunks.is_empty() {
             return;
@@ -1220,6 +1227,19 @@ impl Compositor {
                 if i < resume {
                     continue;
                 }
+                // Chunk textures, uniforms and bind groups outlive the submit, and the queue
+                // keeps the order, so a chunk may continue in the next command buffer.
+                if self.recorded >= FLUSH_OPS
+                    && let Some(last) = batch.as_deref_mut()
+                {
+                    submit_batch(device, queue, encoder, self.health.as_ref(), last);
+                    self.staged = 0;
+                    self.recorded = 0;
+                    stats.flushes += 1;
+                    if self.fault().is_some() {
+                        return;
+                    }
+                }
                 if resume == 0
                     && let Some(cp) = checkpoint.filter(|cp| cp.pass_end == i)
                     && let Some((src, _)) = self.pool.get(cp.slot as usize)
@@ -1257,10 +1277,12 @@ impl Compositor {
                             },
                             wgpu::Extent3d { width: scissor.width(), height: scissor.height(), depth_or_array_layers: 1 },
                         );
+                        self.recorded += 1;
                         continue;
                     }
                     _ => {}
                 }
+                self.recorded += 1;
                 let target = &self.pool[p.dst as usize].1;
                 let clear = p.kernel == Kernel::Clear;
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1333,38 +1355,85 @@ impl Compositor {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: kind.format(),
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
             let view = texture.create_view(&Default::default());
             let default_nonzero = default_pixel.iter().any(|v| *v != 0.0);
-            let mut r =
-                Resident { texture, view, region, kind, format, tiles: HashMap::new(), default_nonzero, default_bits, doc, last_used: 0, stamp: 0, cmyk };
-            // A new texture starts zeroed: write the tiles that are present, and the default pixel
-            // where they are missing if it isn't zero. Coordinates sharing a tile (a solid fill,
-            // the default) take one upload and GPU copies (#1774).
-            let mut present = Vec::new();
-            let mut missing = Vec::new();
-            for c in region.tiles() {
-                match surface.tile(c) {
-                    Some(t) => present.push((c, t.clone())),
-                    None if default_nonzero => missing.push(c),
-                    None => {}
+            let mut r = Resident {
+                texture,
+                view,
+                region,
+                kind,
+                format,
+                tiles: HashMap::new(),
+                default_nonzero,
+                default_bits: default_bits.clone(),
+                doc,
+                last_used: 0,
+                stamp: 0,
+                cmyk,
+                ordered: false,
+            };
+            // Only the region moved (painting past a layer's tiles grows it): keep the texels the
+            // old texture already holds instead of converting and uploading every tile again.
+            let kept = self.residents.remove(&key).map_or(Rect::EMPTY, |old| keep_overlap(device, queue, &old, &mut r));
+            // A new layer whose tiles another resident already holds (a duplicate shares its
+            // source's tiles) starts as a GPU copy of that texture. Duplicating a 20 MP photo
+            // converted and uploaded every tile again.
+            let shares =
+                |o: &Resident| region.tiles().filter(|c| surface.tile(*c).is_some_and(|t| o.tiles.get(c).is_some_and(|ot| Arc::ptr_eq(ot, t)))).count();
+            let donor = self
+                .residents
+                .iter()
+                .filter(|(k, o)| k.1 == key.1 && o.region == region && o.kind == kind && o.format == format && o.cmyk == cmyk && o.default_bits == default_bits)
+                .map(|(k, o)| (shares(o), *k))
+                .filter(|(n, _)| *n > 0)
+                .max_by_key(|(n, _)| *n);
+            if kept.is_empty()
+                && let Some((n, o)) = donor.and_then(|(n, k)| Some((n, self.residents.get_mut(&k)?)))
+            {
+                // Recorded in the frame's encoder, after the writes and copies that brought the
+                // donor up to date ([`keep_overlap`]'s own submission would run before those).
+                o.ordered = true;
+                encoder.copy_texture_to_texture(
+                    o.texture.as_image_copy(),
+                    r.texture.as_image_copy(),
+                    wgpu::Extent3d { width: region.width(), height: region.height(), depth_or_array_layers: 1 },
+                );
+                r.tiles = o.tiles.clone();
+                r.ordered = true;
+                stats.tiles_shared += n;
+            } else {
+                // A new texture starts zeroed: write the tiles that are present, and the default
+                // pixel where they are missing if it isn't zero. Coordinates sharing a tile (a
+                // solid fill, the default) take one upload and GPU copies (#1774). Kept tiles are
+                // brought up to date below, like those of a resident that didn't move.
+                let mut present = Vec::new();
+                let mut missing = Vec::new();
+                for c in region.tiles().filter(|c| !kept.contains_rect(&c.rect())) {
+                    match surface.tile(c) {
+                        Some(t) => present.push((c, t.clone())),
+                        None if default_nonzero => missing.push(c),
+                        None => {}
+                    }
                 }
-            }
-            if !missing.is_empty() {
-                let bytes = convert_tile(surface, None, kind, TileCoord::new(0, 0));
-                self.staged += put_tiles(device, queue, encoder, &r, &missing, &bytes);
-            }
-            let staged = &mut self.staged;
-            convert_tiles(surface, present, kind, |t, cs, bytes| {
-                *staged += put_tiles(device, queue, encoder, &r, cs, bytes);
-                for &c in cs {
-                    stats.tiles_uploaded += 1;
-                    stats.bytes_uploaded += bytes.len();
-                    r.tiles.insert(c, t.clone());
+                if !missing.is_empty() {
+                    let bytes = convert_tile(surface, None, kind, TileCoord::new(0, 0));
+                    self.staged += put_tiles(device, queue, encoder, &r, &missing, &bytes);
                 }
-            });
+                let staged = &mut self.staged;
+                convert_tiles(surface, present, kind, |t, cs, bytes| {
+                    *staged += put_tiles(device, queue, encoder, &r, cs, bytes);
+                    for &c in cs {
+                        stats.tiles_uploaded += 1;
+                        stats.bytes_uploaded += bytes.len();
+                        r.tiles.insert(c, t.clone());
+                    }
+                });
+            }
+            // Tiles the donor held that this surface doesn't, or holds differently, are fixed up
+            // by the pass over the region below.
             self.residents.insert(key, r);
         }
         // Present: inserted above when it was missing or stale.
@@ -1774,6 +1843,33 @@ fn write_tile(queue: &wgpu::Queue, r: &Resident, c: TileCoord, bytes: &[u8]) {
     );
 }
 
+/// Submit what `encoder` recorded and continue in a fresh one, then wait for the previous
+/// intermediate submit (`last`), so at most two batches of uploads and evicted pages are in
+/// flight. The web has no blocking wait and relies on the browser's own scheduling.
+fn submit_batch(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    encoder: &mut wgpu::CommandEncoder,
+    health: Option<&DeviceHealth>,
+    last: &mut Option<wgpu::SubmissionIndex>,
+) {
+    let done = std::mem::replace(encoder, device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pc_compose") }));
+    let prev = last.replace(queue.submit([done.finish()]));
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(prev) = prev {
+        match health {
+            Some(h) => {
+                h.wait(device, Some(prev));
+            }
+            None => {
+                let _ = device.poll(wgpu::PollType::Wait { submission_index: Some(prev), timeout: None });
+            }
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = (prev, health);
+}
+
 /// Distinct tiles converted per parallel batch: bounds the converted bytes held at once (64 tiles
 /// of a 16-bit page are 32 MiB).
 const CONVERT_BATCH: usize = 64;
@@ -1783,7 +1879,9 @@ const CONVERT_BATCH: usize = 64;
 /// a scratch tile and GPU copies from it: writing each one from the CPU sent 387 MB per refresh
 /// of a filled 50 MP 16-bit page (#1774).
 fn put_tiles(device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, r: &Resident, cs: &[TileCoord], bytes: &[u8]) -> u64 {
-    if let [c] = cs {
+    if let [c] = cs
+        && !r.ordered
+    {
         write_tile(queue, r, *c, bytes);
         return bytes.len() as u64;
     }
@@ -1829,6 +1927,40 @@ fn put_tiles(device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::Com
     bytes.len() as u64
 }
 
+/// Copy the texels `old` holds inside the region of its replacement `new` (same texel kind,
+/// format and default pixel; only the region moved) and carry over the tiles they show, so only
+/// tiles outside the overlap or changed since need uploading. Returns the kept (tile-aligned)
+/// rect; empty when nothing can be kept.
+fn keep_overlap(device: &wgpu::Device, queue: &wgpu::Queue, old: &Resident, new: &mut Resident) -> Rect {
+    let same = old.kind == new.kind && old.format == new.format && old.cmyk == new.cmyk && old.default_bits == new.default_bits;
+    let k = old.region.intersect(&new.region);
+    if !same || k.is_empty() {
+        return Rect::EMPTY;
+    }
+    // Its own submission: tile writes go through the queue and land at the start of the next
+    // submit, before anything in the frame's encoder, so a copy recorded there would overwrite
+    // the tiles written after it with the old texels.
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pc_compose_keep") });
+    encoder.copy_texture_to_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &old.texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d { x: (k.x0 - old.region.x0) as u32, y: (k.y0 - old.region.y0) as u32, z: 0 },
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyTextureInfo {
+            texture: &new.texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d { x: (k.x0 - new.region.x0) as u32, y: (k.y0 - new.region.y0) as u32, z: 0 },
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::Extent3d { width: k.width(), height: k.height(), depth_or_array_layers: 1 },
+    );
+    queue.submit([encoder.finish()]);
+    new.tiles = old.tiles.iter().filter(|(c, _)| k.contains_rect(&c.rect())).map(|(c, t)| (*c, t.clone())).collect();
+    k
+}
+
 /// Convert `tiles` of `surface` to `kind` texels and hand each distinct tile, the coordinates
 /// sharing it and its bytes to `put`. Each distinct tile is converted once (a solid fill shares
 /// one `Arc` across every coordinate it covers), in parallel batches. Converting every tile one
@@ -1866,7 +1998,7 @@ fn convert_tile(surface: &Surface, tile: Option<&Arc<Tile>>, kind: TexKind, c: T
     let fmt = surface.format();
     let ch = fmt.channels();
     if let (Some(t), TexKind::Rgba16F) = (tile, kind)
-        && let Some(out) = rgb_gray16_to_f16(&fmt, t.bytes())
+        && let Some(out) = rgb_gray16_to_f16(&fmt, t.bytes()).or_else(|| rgb_gray32_to_f16(&fmt, t.bytes()))
     {
         return out;
     }
@@ -1918,6 +2050,43 @@ fn rgb_gray16_to_f16(fmt: &PixelFormat, bytes: &[u8]) -> Option<Vec<u8>> {
             half.get(v as usize).copied().unwrap_or(0).to_le_bytes()
         };
         let (r, g, b) = if gray { (h(0), h(0), h(0)) } else { (h(0), h(1), h(2)) };
+        let a = if fmt.alpha { h(ch - 1) } else { one };
+        out.extend_from_slice(&r);
+        out.extend_from_slice(&g);
+        out.extend_from_slice(&b);
+        out.extend_from_slice(&a);
+    }
+    Some(out)
+}
+
+/// RGBA16F texels of a 32-bit float RGB or grayscale tile, straight from its samples: the same
+/// bytes as the general path without decoding the tile into a float buffer and converting it
+/// pixel by pixel (a brush dab on a 32-bit layer re-uploads the tiles it touched). `None` for
+/// other formats.
+fn rgb_gray32_to_f16(fmt: &PixelFormat, bytes: &[u8]) -> Option<Vec<u8>> {
+    use photocraft_color::ColorMode;
+    if fmt.sample != SampleType::F32 {
+        return None;
+    }
+    let gray = match fmt.mode {
+        ColorMode::Rgb => false,
+        ColorMode::Grayscale | ColorMode::Bitmap | ColorMode::Duotone => true,
+        _ => return None,
+    };
+    let one = f32_to_f16(1.0).to_le_bytes();
+    let ch = fmt.channels();
+    let mut out = Vec::with_capacity((TILE_SIZE * TILE_SIZE) as usize * 8);
+    for px in bytes.chunks_exact(ch * 4) {
+        let h = |i: usize| -> [u8; 2] {
+            let v = px.get(i * 4..i * 4 + 4).map_or(0.0, |b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]]));
+            f32_to_f16(v).to_le_bytes()
+        };
+        let (r, g, b) = if gray {
+            let v = h(0);
+            (v, v, v)
+        } else {
+            (h(0), h(1), h(2))
+        };
         let a = if fmt.alpha { h(ch - 1) } else { one };
         out.extend_from_slice(&r);
         out.extend_from_slice(&g);
@@ -2223,22 +2392,28 @@ mod tests {
         assert_eq!((converted, n), (CONVERT_BATCH + 5, CONVERT_BATCH + 5));
     }
 
-    /// The 16-bit RGB/gray fast path gives exactly the general path's half floats.
+    /// The 16-bit and 32-bit float RGB/gray fast paths give exactly the general path's half
+    /// floats (32-bit samples above 1 and below 0 included).
     #[test]
-    fn sixteen_bit_fast_path_matches_the_general_one() {
+    fn sixteen_and_thirty_two_bit_fast_paths_match_the_general_one() {
         for fmt in [
             PixelFormat::RGBA16,
             PixelFormat { alpha: false, ..PixelFormat::RGBA16 },
             PixelFormat { sample: SampleType::U16, ..PixelFormat::GRAY8 },
             PixelFormat { sample: SampleType::U16, alpha: true, ..PixelFormat::GRAY8 },
+            PixelFormat::RGBA32F,
+            PixelFormat { alpha: false, ..PixelFormat::RGBA32F },
+            PixelFormat { sample: SampleType::F32, ..PixelFormat::GRAY8 },
+            PixelFormat { sample: SampleType::F32, alpha: true, ..PixelFormat::GRAY8 },
         ] {
             let mut s = Surface::new(fmt);
             let r = Rect::new(0, 0, TILE_SIZE, TILE_SIZE);
             let n = (TILE_SIZE * TILE_SIZE) as usize * fmt.channels();
-            let data: Vec<f32> = (0..n).map(|i| (i as u32).wrapping_mul(2_654_435_761) as f32 / u32::MAX as f32).collect();
+            let hdr = if fmt.sample == SampleType::F32 { 4.0 } else { 1.0 };
+            let data: Vec<f32> = (0..n).map(|i| (i as u32).wrapping_mul(2_654_435_761) as f32 / u32::MAX as f32 * hdr - (hdr - 1.0) / 4.0).collect();
             s.write_region(r, &data);
             let t = s.tile(TileCoord::new(0, 0)).expect("written").clone();
-            let fast = rgb_gray16_to_f16(&fmt, t.bytes()).expect("fast path");
+            let fast = rgb_gray16_to_f16(&fmt, t.bytes()).or_else(|| rgb_gray32_to_f16(&fmt, t.bytes())).expect("fast path");
             let raw = s.read_region(r);
             let general: Vec<u8> =
                 raw.chunks_exact(fmt.channels()).flat_map(|px| photocraft_raster::to_rgba(&fmt, px).map(|x| f32_to_f16(x).to_le_bytes())).flatten().collect();
@@ -2247,6 +2422,8 @@ mod tests {
         }
         assert!(rgb_gray16_to_f16(&PixelFormat::RGBA8, &[]).is_none());
         assert!(rgb_gray16_to_f16(&PixelFormat { sample: SampleType::U16, ..PixelFormat::CMYKA8 }, &[]).is_none());
+        assert!(rgb_gray32_to_f16(&PixelFormat::RGBA16, &[]).is_none());
+        assert!(rgb_gray32_to_f16(&PixelFormat { sample: SampleType::F32, ..PixelFormat::CMYKA8 }, &[]).is_none());
     }
 
     #[test]

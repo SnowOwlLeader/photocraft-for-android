@@ -255,6 +255,21 @@ fn reads_other_applications_stacks() {
 }
 
 #[test]
+fn preserves_surrounding_whitespace_in_layer_and_group_names() {
+    let xml = r#"<image w="2" h="2"><stack>
+      <stack name=" Folder "><layer name=" Pixel " src="a.png"/></stack>
+      <layer name="  " src="a.png"/>
+    </stack></image>"#;
+    let bytes = archive(xml, &[("a.png", solid_png(2, 2, [255, 0, 0, 255]))]);
+    let result = crate::import("names.ora", &bytes).unwrap();
+    let layers = &result.document.layers;
+
+    let folder = layers.iter().find(|layer| layer.name == " Folder ").expect("group name is preserved");
+    assert_eq!(folder.children().unwrap()[0].name, " Pixel ");
+    assert!(layers.iter().any(|layer| layer.name == "Layer 3"), "blank names keep the fallback");
+}
+
+#[test]
 fn malformed_archives_fail_cleanly() {
     let png = solid_png(2, 2, [1, 2, 3, 4]);
     let ok = |s: &str| archive(s, &[("a.png", png.clone())]);

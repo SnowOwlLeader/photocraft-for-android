@@ -75,6 +75,22 @@ fn mode_opacity_and_preserve_transparency() {
 }
 
 #[test]
+fn alt_reset_restores_photoshop_defaults_not_last_used() {
+    let mut app = app();
+    // Remember a non-default choice, then open (which restores it) and Reset.
+    fill(&mut app, json!({"contents": "white", "opacity": 40})).unwrap();
+    let id = open(&mut app);
+    assert_eq!(app.ui.dialog_mut(id).unwrap().fields["opacity"].as_f64(), Some(40.0));
+    let mut fields = app.ui.dialog_mut(id).unwrap().fields.clone();
+    reset(&app, &mut fields);
+    app.ui.dialog_mut(id).unwrap().fields = fields;
+    let f = &app.ui.dialog_mut(id).unwrap().fields;
+    assert_eq!(f["opacity"].as_f64(), Some(100.0));
+    assert_eq!(f["contents"], json!("foreground"));
+    assert!(app.ui.dialogs.iter().any(|d| d.id == id));
+}
+
+#[test]
 fn choices_persist_across_restarts() {
     let mut app = app();
     // Photoshop's defaults the first time.

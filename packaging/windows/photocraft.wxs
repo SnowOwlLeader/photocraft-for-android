@@ -37,7 +37,7 @@
     <Property Id="ARPPRODUCTICON" Value="PhotocraftIcon.exe" />
     <Property Id="ARPURLINFOABOUT" Value="https://getartcraft.com/apps/photocraft" />
     <Property Id="ARPURLUPDATEINFO" Value="https://getartcraft.com/apps/photocraft" />
-    <Property Id="ARPHELPLINK" Value="https://discord.gg/artcraft" />
+    <Property Id="ARPHELPLINK" Value="https://qm.qq.com/cgi-bin/qm/qr?group_code=1129505510" />
 
     <StandardDirectory Id="ProgramFiles6432Folder">
       <Directory Id="INSTALLFOLDER" Name="PhotoCraft" />

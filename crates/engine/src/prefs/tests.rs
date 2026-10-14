@@ -22,6 +22,26 @@ fn defaults_match_photoshop() {
     }
 }
 
+#[test]
+fn ui_size_levels_validate_persist_and_default_for_older_settings() {
+    let mut s = Session::new();
+    assert_eq!(s.prefs().interface.ui_size_level, 5);
+    for level in 1..=10 {
+        s.execute("prefs.set", json!({"path": "interface.uiSizeLevel", "value": level})).unwrap();
+        let mut restored = Session::new();
+        restored.load_prefs_json(&s.prefs_to_json()).unwrap();
+        assert_eq!(restored.prefs().interface.ui_size_level, level);
+    }
+    for value in [json!(0), json!(11), json!(-1), json!(5.5), json!("5"), Value::Null] {
+        assert!(s.execute("prefs.set", json!({"path": "interface.uiSizeLevel", "value": value})).is_err());
+        assert_eq!(s.prefs().interface.ui_size_level, 10);
+    }
+    s.execute("prefs.reset", json!({"path": "interface.uiSizeLevel"})).unwrap();
+    assert_eq!(s.prefs().interface.ui_size_level, 5);
+    s.load_prefs_json(r#"{"interface":{"uiScale":"auto"}}"#).unwrap();
+    assert_eq!(s.prefs().interface.ui_size_level, 5);
+}
+
 /// #2264: the Studio workspace dot pattern can be hidden without changing themes.
 #[test]
 fn canvas_dot_grid_can_be_disabled_persisted_and_reset() {
@@ -87,6 +107,17 @@ fn appearance_choices_validate_and_legacy_theme_still_selects() {
     assert_eq!(s.prefs().interface.appearance_mode, AppearanceMode::Light);
     assert_eq!(s.prefs().interface.light_theme, LightTheme::StudioLight);
     assert_eq!(s.prefs().interface.dark_theme, DarkTheme::Pro);
+    // #2661: the light Pro brightness levels are light themes.
+    for (theme, light) in [("proLightGray", LightTheme::ProLightGray), ("proLight", LightTheme::ProLight)] {
+        s.execute("prefs.set", json!({"path": "interface.theme", "value": theme})).unwrap();
+        assert_eq!(s.prefs().interface.appearance_mode, AppearanceMode::Light);
+        assert_eq!(s.prefs().interface.light_theme, light);
+        s.execute("prefs.set", json!({"path": "interface.lightTheme", "value": theme})).unwrap();
+        let mut migrated = Session::new();
+        migrated.load_prefs_json(&json!({"interface": {"theme": theme}}).to_string()).unwrap();
+        assert_eq!(migrated.prefs().interface.appearance_mode, AppearanceMode::Light);
+        assert_eq!(migrated.prefs().interface.light_theme, light);
+    }
 }
 
 #[test]
@@ -335,7 +366,13 @@ fn temporary_tools_and_fill_keys_are_rebindable() {
     let mut s = session();
     let r = s.execute("edit.keyboardShortcuts", json!({"filter": "tools.temporary"})).unwrap();
     let ids: Vec<&str> = r["commands"].as_array().unwrap().iter().filter_map(|c| c["id"].as_str()).collect();
-    assert!(ids.contains(&"tools.temporary.hand") && ids.contains(&"tools.temporary.zoomIn") && ids.contains(&"tools.temporary.zoomOut"), "{ids:?}");
+    assert!(
+        ids.contains(&"tools.temporary.hand")
+            && ids.contains(&"tools.temporary.zoomIn")
+            && ids.contains(&"tools.temporary.zoomOut")
+            && ids.contains(&"tools.temporary.erase"),
+        "{ids:?}"
+    );
     assert!(r["commands"].as_array().unwrap().iter().all(|c| c["hold"] == true));
     // Rebind the temporary zoom; an unknown id still fails.
     s.execute("edit.keyboardShortcuts", json!({"set": {"tools.temporary.zoomIn": "Ctrl+Space"}})).unwrap();
@@ -595,4 +632,14 @@ fn ruler_units_round_to_their_own_decimal_places() {
     assert_eq!(r.format(1500.0, 300.0, 1500.0), "12.7");
     let r = super::UnitsAndRulers { rulers: Unit::Inches, ..Default::default() };
     assert_eq!(r.format(100.0, 300.0, 1500.0), "0.333");
+}
+
+/// #3296: like Photoshop, "Use Shift Key for Tool Switch" is on by default; a stored choice wins.
+#[test]
+fn shift_key_tool_switch_is_on_by_default_and_a_stored_false_is_kept() {
+    assert!(Preferences::default().tools.use_shift_key_for_tool_switch);
+    let missing: Tools = serde_json::from_value(json!({"showTooltips": false})).unwrap();
+    assert!(missing.use_shift_key_for_tool_switch, "a settings file without the key gets the new default");
+    let stored: Tools = serde_json::from_value(json!({"useShiftKeyForToolSwitch": false})).unwrap();
+    assert!(!stored.use_shift_key_for_tool_switch);
 }

@@ -1,6 +1,9 @@
 //! Camera Raw through the real app shell and its existing agent entry point.
 use egui::{Event, Modifiers, MouseWheelUnit, accesskit::Role, pos2, vec2};
-use egui_kittest::{Harness, kittest::Queryable};
+use egui_kittest::{
+    Harness,
+    kittest::{NodeT, Queryable},
+};
 use photocraft_ui_egui::{PhotocraftApp, camera_raw_ui, control, theme::ThemeKind};
 use serde_json::{Value, json};
 
@@ -109,8 +112,12 @@ fn settings_sections_group_existing_controls_without_rendering_or_document_edits
         h.run_steps(12);
         h.get_by_role_and_label(Role::Button, tr("Color")).click();
         h.run_steps(12);
+        // The dock also has Saturation; query only the Camera Raw settings panel.
+        let settings = std::iter::successors(Some(h.get_by_role_and_label(Role::Button, tr("Color"))), |node| node.parent())
+            .find(|node| node.query_by_label(tr("Tone Histogram")).is_some())
+            .expect("Camera Raw settings panel");
         for label in ["Temperature", "Tint", "Vibrance", "Saturation"] {
-            assert!(h.query_by_label(tr(label)).is_some(), "color control: {label}");
+            assert!(settings.query_by_label(tr(label)).is_some(), "color control: {label}");
         }
         assert!(h.query_by_label(tr("Exposure")).is_none());
         h.get_by_role_and_label(Role::Button, tr("Color")).click();

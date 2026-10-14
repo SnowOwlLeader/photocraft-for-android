@@ -217,3 +217,16 @@ fn copied_link_groups_are_distinct_from_each_other_and_destination() {
     assert!(first.is_some() && second.is_some());
     assert_ne!(first, second);
 }
+
+#[test]
+fn a_named_duplicate_takes_the_name_in_one_step() {
+    let (mut s, paint) = two_docs(40, 30, 8);
+    let before = s.active().unwrap().history.past_len();
+    let same = LayerId(s.execute("layer.duplicate", json!({"name": "Ink"})).unwrap()["layer"].as_u64().unwrap());
+    assert_eq!(doc(&s, 0).layer(same).unwrap().name, "Ink");
+    assert_eq!(s.active().unwrap().history.past_len(), before + 1);
+    s.undo();
+    s.execute("layer.select", json!({"layer": paint.0})).unwrap();
+    let r = s.execute("layer.copyToDocument", json!({"document": 1, "name": "Ink"})).unwrap();
+    assert_eq!(doc(&s, 1).layer(copied(&r)).unwrap().name, "Ink");
+}

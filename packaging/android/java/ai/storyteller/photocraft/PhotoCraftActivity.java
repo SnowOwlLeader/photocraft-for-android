@@ -13,10 +13,11 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 
 /** Android document-provider bridge. Image editing remains in the Rust engine. */
 public class PhotoCraftActivity extends NativeActivity {
-    private static final int OPEN = 41, SAVE = 42;
+    private static final int OPEN = 41, SAVE = 42, TREE = 43;
     private static final long MAX_FILE = 256L * 1024 * 1024;
     private final ConcurrentLinkedQueue<String> replies = new ConcurrentLinkedQueue<>();
     private String saveName = "Untitled.pcraft";
+    private boolean transientImport;
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -33,6 +34,7 @@ public class PhotoCraftActivity extends NativeActivity {
 
     public String dataDirectory() { return getFilesDir().getAbsolutePath(); }
     public String selfTestRequested() { return getIntent().getBooleanExtra("self_test", false) ? "yes" : "no"; }
+    public String inputDiagnosticsRequested() { return getIntent().getBooleanExtra("input_diagnostics", false) ? "yes" : "no"; }
     public String pollReply() { String s = replies.poll(); return s == null ? "" : s; }
 
     public void editText(String json) {
@@ -72,6 +74,7 @@ public class PhotoCraftActivity extends NativeActivity {
             try {
                 JSONObject request = new JSONObject(json);
                 boolean save = request.optBoolean("save");
+                transientImport = request.optBoolean("transient");
                 Intent intent = new Intent(save ? Intent.ACTION_CREATE_DOCUMENT : Intent.ACTION_OPEN_DOCUMENT);
                 intent.addCategory(Intent.CATEGORY_OPENABLE);
                 intent.setType("*/*");
@@ -85,10 +88,77 @@ public class PhotoCraftActivity extends NativeActivity {
         });
     }
 
+    /** UI lives in Rust/egui; provider operations run away from the render thread. */
+    public void browseFiles(String json) {
+        try {
+            JSONObject action = new JSONObject(json);
+            if ("authorize".equals(action.optString("action"))) {
+                runOnUiThread(() -> {
+                    try {
+                        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+                        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
+                        startActivityForResult(intent, TREE);
+                    } catch (Exception e) { browserError(e); }
+                });
+                return;
+            }
+            new Thread(() -> {
+                try {
+                    JSONObject result = new FileBrowserBridge(this).run(action);
+                    if (result.has("files") || result.has("save") || result.has("folder")) replies.add(result.toString());
+                    else replies.add(new JSONObject().put("browser", result).toString());
+                } catch (Exception e) { browserError(e); }
+            }, "PhotoCraft file manager").start();
+        } catch (Exception e) { browserError(e); }
+    }
+
+    private void browserError(Exception e) {
+        try { replies.add(new JSONObject().put("browser", new JSONObject().put("error", "文件操作失败：" + e.toString())).toString()); }
+        catch (Exception ignored) { replies.add("{\"browser\":{\"error\":\"文件操作失败\"}}"); }
+    }
+
+    public void editFileText(String json) {
+        runOnUiThread(() -> {
+            try {
+                JSONObject request = new JSONObject(json);
+                android.widget.EditText input = new android.widget.EditText(this);
+                input.setSingleLine(true);
+                input.setText(request.optString("value"));
+                input.selectAll();
+                android.app.AlertDialog dialog = new android.app.AlertDialog.Builder(this)
+                    .setTitle(request.optString("title", "输入名称")).setView(input)
+                    .setPositiveButton("确定", (d, which) -> {
+                        try { replies.add(new JSONObject().put("browserInput",request.optString("field")).put("value",input.getText().toString()).toString()); }
+                        catch(Exception e) {browserError(e);}
+                    }).setNegativeButton("取消", (d, which) -> replies.add("{\"browser\":{\"cancelled\":true}}")).create();
+                dialog.setOnCancelListener(d -> replies.add("{\"browser\":{\"cancelled\":true}}"));
+                dialog.setOnShowListener(d -> {
+                    input.requestFocus();
+                    if (dialog.getWindow()!=null) dialog.getWindow().setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
+                    input.postDelayed(() -> {
+                        android.view.inputmethod.InputMethodManager ime=(android.view.inputmethod.InputMethodManager)getSystemService(INPUT_METHOD_SERVICE);
+                        if(ime!=null) ime.showSoftInput(input,android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT);
+                    },150);
+                });
+                dialog.show();
+            } catch(Exception e) {browserError(e);}
+        });
+    }
+
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
+        if (request == TREE) {
+            if (result != RESULT_OK || data == null || data.getData() == null) { replies.add("{\"browser\":{\"cancelled\":true}}"); return; }
+            try {
+                Uri uri = data.getData();
+                getContentResolver().takePersistableUriPermission(uri, data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION));
+                browseFiles(new JSONObject().put("action", "list").put("uri", android.provider.DocumentsContract.buildDocumentUriUsingTree(uri, android.provider.DocumentsContract.getTreeDocumentId(uri)).toString()).toString());
+            } catch (Exception e) { browserError(e); }
+            return;
+        }
         if (request != OPEN && request != SAVE) return;
         if (result != RESULT_OK || data == null) { replies.add("{\"cancelled\":true}"); return; }
+        final boolean temporary = transientImport;
         new Thread(() -> {
             try {
                 JSONObject answer = new JSONObject();
@@ -97,21 +167,13 @@ public class PhotoCraftActivity extends NativeActivity {
                     if (uri == null) throw new IOException("No destination selected");
                     try { getContentResolver().takePersistableUriPermission(uri, data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION)); }
                     catch (SecurityException ignored) { /* Some providers grant this session only. */ }
-                    File dir = new File(getFilesDir(), "exports/" + java.util.UUID.randomUUID());
-                    if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException("Cannot create export directory");
-                    String localName = displayName(uri, saveName);
-                    int dot = localName.lastIndexOf('.');
-                    if (dot > 0) localName = localName.substring(0, dot) + localName.substring(dot).toLowerCase(java.util.Locale.ROOT);
-                    File local = new File(dir, localName);
-                    if (!getSharedPreferences("destinations", MODE_PRIVATE).edit().putString(local.getAbsolutePath(), uri.toString()).commit())
-                        throw new IOException("Cannot remember save destination");
-                    answer.put("save", local.getAbsolutePath());
+                    answer = prepareSave(uri, saveName);
                 } else {
                     JSONArray files = new JSONArray();
                     if (data.getClipData() != null) {
                         if (data.getClipData().getItemCount() > 16) throw new IOException("Please select at most 16 files at a time");
-                        for (int i = 0; i < data.getClipData().getItemCount(); i++) files.put(importFile(data.getClipData().getItemAt(i).getUri()));
-                    } else if (data.getData() != null) files.put(importFile(data.getData()));
+                        for (int i = 0; i < data.getClipData().getItemCount(); i++) files.put(importFile(data.getClipData().getItemAt(i).getUri(), data.getFlags(), temporary));
+                    } else if (data.getData() != null) files.put(importFile(data.getData(), data.getFlags(), temporary));
                     answer.put("files", files);
                 }
                 replies.add(answer.toString());
@@ -119,16 +181,42 @@ public class PhotoCraftActivity extends NativeActivity {
         }, "PhotoCraft documents").start();
     }
 
-    private JSONObject importFile(Uri uri) throws Exception {
+    JSONObject importFile(Uri uri, int flags, boolean temporary) throws Exception {
         String name = displayName(uri, "image");
-        File temp = File.createTempFile("import-", ".tmp", getCacheDir());
-        try (InputStream in = getContentResolver().openInputStream(uri); OutputStream out = new FileOutputStream(temp)) {
+        // Keep a named, private mirror for Rust's path-based IO, and remember the original
+        // provider URI. File > Save can then write back instead of creating a new document.
+        // Font uploads are transient and must not become document save destinations.
+        File dir = new File(temporary ? getCacheDir() : getFilesDir(), "imports/" + java.util.UUID.randomUUID());
+        if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException("Cannot create import directory");
+        File local = new File(dir, name);
+        try (InputStream in = getContentResolver().openInputStream(uri); OutputStream out = new FileOutputStream(local)) {
             copy(in, out, MAX_FILE);
-        } catch (Exception e) { temp.delete(); throw e; }
-        return new JSONObject().put("name", name).put("path", temp.getAbsolutePath());
+        } catch (Exception e) { local.delete(); dir.delete(); throw e; }
+        if (!temporary) {
+            try { getContentResolver().takePersistableUriPermission(uri, flags & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION)); }
+            catch (SecurityException ignored) { /* Some providers grant this session only. */ }
+            if (!getSharedPreferences("destinations", MODE_PRIVATE).edit().putString(local.getAbsolutePath(), uri.toString()).commit()) {
+                local.delete(); dir.delete();
+                throw new IOException("Cannot remember original document destination");
+            }
+        }
+        return new JSONObject().put("name", name).put("path", local.getAbsolutePath());
+    }
+
+    JSONObject prepareSave(Uri uri, String fallback) throws Exception {
+        File dir = new File(getFilesDir(), "exports/" + java.util.UUID.randomUUID());
+        if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException("Cannot create export directory");
+        String localName = displayName(uri, fallback);
+        int dot = localName.lastIndexOf('.');
+        if (dot > 0) localName = localName.substring(0, dot) + localName.substring(dot).toLowerCase(java.util.Locale.ROOT);
+        File local = new File(dir, localName);
+        if (!getSharedPreferences("destinations", MODE_PRIVATE).edit().putString(local.getAbsolutePath(), uri.toString()).commit())
+            throw new IOException("Cannot remember save destination");
+        return new JSONObject().put("save", local.getAbsolutePath());
     }
 
     private String displayName(Uri uri, String fallback) {
+        if ("file".equals(uri.getScheme()) && uri.getPath()!=null) return cleanName(new File(uri.getPath()).getName());
         try (Cursor c = getContentResolver().query(uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
             if (c != null && c.moveToFirst()) return cleanName(c.getString(0));
         }
@@ -145,7 +233,9 @@ public class PhotoCraftActivity extends NativeActivity {
                 copy(in, out, Long.MAX_VALUE);
             }
             return "";
-        } catch (Exception e) { return e.toString(); }
+        } catch (SecurityException e) {
+            return "原文件没有写入权限或授权已失效，保存未完成。请重新打开文件授权，或使用另存为。";
+        } catch (Exception e) { return "保存未完成：" + e.toString(); }
     }
 
     public void openLink(String url) {
@@ -155,10 +245,10 @@ public class PhotoCraftActivity extends NativeActivity {
                 if (url.startsWith("mqqapi:")) {
                     new android.app.AlertDialog.Builder(this)
                         .setTitle("加入我们的 QQ 社群")
-                        .setMessage("QQ群号：378525932\n请在 QQ 中搜索群号申请加入。")
+                        .setMessage("QQ群号：1129505510\n请在 QQ 中搜索群号申请加入。")
                         .setPositiveButton("复制群号", (dialog, which) -> {
                             android.content.ClipboardManager clipboard = (android.content.ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
-                            if (clipboard != null) clipboard.setPrimaryClip(android.content.ClipData.newPlainText("QQ群号", "378525932"));
+                            if (clipboard != null) clipboard.setPrimaryClip(android.content.ClipData.newPlainText("QQ群号", "1129505510"));
                         }).setNegativeButton("关闭", null).show();
                 } else error(e);
             }

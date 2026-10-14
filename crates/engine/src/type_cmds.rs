@@ -57,7 +57,7 @@ fn color(v: &Value) -> Option<Color> {
 }
 
 /// Normalises line breaks to `\n`.
-fn norm_text(s: &str) -> String {
+pub(crate) fn norm_text(s: &str) -> String {
     s.replace("\r\n", "\n").replace('\r', "\n")
 }
 
@@ -121,10 +121,23 @@ pub fn check_size_tracking(p: &Value) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// The PostScript name of the installed face of `family` at exactly `weight`/`italic`. A PSD names
+/// a type layer by PostScript name, and Photoshop treats a name no font has as missing (#3556).
+/// Only an exact face is named: layout picks a named face before weight and italic, so naming a
+/// nearby face would override the requested weight (a variable font's axis, a weight between two
+/// faces) or italic. Without an exact face the style keeps no name and layout matches as before.
+fn installed_postscript(family: &str, weight: u16, italic: bool) -> Option<String> {
+    let mut shared = photocraft_text::shared().lock().unwrap_or_else(|e| e.into_inner());
+    let faces = shared.fonts.faces(family);
+    let face = faces.iter().find(|f| f.italic == italic && f.weight.round() as u16 == weight)?;
+    face.postscript_name.clone()
+}
+
 /// Applies character-style keys from JSON. Returns true if any key was present.
 pub fn apply_char_props(s: &mut CharStyle, p: &Value) -> bool {
     let mut any = false;
     let mut hit = |b: bool| any |= b;
+    let font_key = ["font", "family", "fontStyle", "weight", "italic"].iter().any(|k| p.get(k).is_some());
     if let Some(v) = p.get("font").or_else(|| p.get("family")).and_then(Value::as_str) {
         s.font_family = v.to_string();
         s.postscript_name = None;
@@ -133,6 +146,9 @@ pub fn apply_char_props(s: &mut CharStyle, p: &Value) -> bool {
     if let Some(v) = p.get("fontStyle").and_then(Value::as_str) {
         s.font_style = v.to_string();
         s.postscript_name = None;
+        // The style sets the weight, so a weight slider value set earlier stops overriding it
+        // (`variations` in the same call apply after this).
+        s.variations.retain(|f| f.axis != "wght");
         let l = v.to_lowercase();
         s.italic = l.contains("italic") || l.contains("oblique");
         let g = photocraft_text::fonts::guess_from_postscript(&format!("X-{}", v.replace(' ', "")));
@@ -150,6 +166,7 @@ pub fn apply_char_props(s: &mut CharStyle, p: &Value) -> bool {
             s.postscript_name = None;
             s.font_style.clear();
         }
+        s.variations.retain(|f| f.axis != "wght");
         s.weight = weight;
         hit(true);
     }
@@ -164,6 +181,11 @@ pub fn apply_char_props(s: &mut CharStyle, p: &Value) -> bool {
     if let Some(v) = p.get("postscriptName").and_then(Value::as_str) {
         s.postscript_name = Some(v.to_string());
         hit(true);
+    }
+    // A font named by family (or a style that matched no face) has no PostScript name yet: fill in
+    // the installed face's real name, so the PSD does not invent "<Family>-Regular" (#3556).
+    if font_key && s.postscript_name.is_none() {
+        s.postscript_name = installed_postscript(&s.font_family, s.weight, s.italic);
     }
     if let Some(v) = f32p(p, "size") {
         s.size_pt = v.max(0.01);
@@ -448,6 +470,13 @@ pub fn refresh(doc: &Document, t: &mut TextLayer) {
 /// `name`), which is applied in the same step; otherwise an auto-named layer follows its text.
 fn with_text_layer<R>(s: &mut Session, p: &Value, label: &str, f: impl FnOnce(&mut TextLayer, &Document, &mut Option<String>) -> Result<R>) -> Result<R> {
     let id = layer_id(s, p)?;
+    {
+        let doc = &s.active().ok_or(EngineError::NoDocument)?.doc;
+        let layer = doc.layer(id).ok_or(EngineError::NoLayer(id))?;
+        if doc.effective_locks(id).all {
+            return Err(EngineError::Other(format!("Could not complete your request because the layer \"{}\" is locked", layer.name)));
+        }
+    }
     let (r, damage) = s.edit(label, |doc, _| {
         let snapshot = doc.clone();
         let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
@@ -610,7 +639,8 @@ fn info(s: &Session, p: &Value) -> Result<Value> {
         .map(|ln| json!({ "start": char_at(text, ln.range.start), "end": char_at(text, ln.range.end), "baseline": ln.baseline, "x0": ln.x0, "x1": ln.x1, "ascent": ln.ascent, "descent": ln.descent }))
         .collect();
     let bounds = t.cache.as_ref().map(|c| c.content_bounds()).map(|r| json!([r.x0, r.y0, r.x1, r.y1]));
-    Ok(json!({
+    let warnings = crate::type_extra_cmds::missing_font_warnings_for_layer(t);
+    let mut out = json!({
         "layer": id.0,
         "text": text,
         "shape": t.shape,
@@ -623,7 +653,57 @@ fn info(s: &Session, p: &Value) -> Result<Value> {
         "lines": lines,
         "bounds": bounds,
         "pxPerPt": layout.px_per_pt,
-    }))
+    });
+    if !warnings.is_empty() {
+        out["warnings"] = json!(warnings);
+    }
+    Ok(out)
+}
+
+/// A type layer (not yet rendered or added) from `type.create`'s params: text, point `x`/`y` or
+/// paragraph `box`, `orientation`, character and paragraph keys, starting from the default type
+/// styles in the foreground colour. Shared with the Type Mask tools' `type.createSelection`.
+pub(crate) fn new_text_layer(s: &Session, p: &Value, cmd: &str) -> Result<TextLayer> {
+    let orientation = match p.get("orientation") {
+        None => Orientation::Horizontal,
+        Some(Value::String(value)) if value == "horizontal" => Orientation::Horizontal,
+        Some(Value::String(value)) if value == "vertical" => Orientation::Vertical,
+        _ => return Err(bad(cmd, "orientation must be horizontal or vertical")),
+    };
+    check_kerning(p).map_err(|m| bad(cmd, m))?;
+    check_size_tracking(p).map_err(|m| bad(cmd, m))?;
+    let text = norm_text(p.get("text").and_then(Value::as_str).unwrap_or(""));
+    // Type › Save Default Type Styles sets the starting styles; the colour is always
+    // the foreground colour, as in Photoshop.
+    let (mut style, mut para) = s
+        .type_defaults
+        .clone()
+        .unwrap_or_else(|| (CharStyle { font_family: photocraft_text::fonts::DEFAULT_FAMILY.into(), ..Default::default() }, ParagraphStyle::default()));
+    let fg = s.tools.foreground;
+    style.color = Color::rgba(fg[0], fg[1], fg[2], fg[3]);
+    apply_char_props(&mut style, p);
+    apply_para_props(&mut para, p);
+    let (shape, transform) = match p.get("box").and_then(Value::as_array) {
+        Some(b) if b.len() == 4 => {
+            let v: Vec<f32> = b.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect();
+            if v[2] <= 0.0 || v[3] <= 0.0 {
+                return Err(bad(cmd, "box width and height must be positive"));
+            }
+            (TextShape::Box { x: 0.0, y: 0.0, width: v[2], height: v[3] }, Affine::translate(f64::from(v[0]), f64::from(v[1])))
+        }
+        _ => (TextShape::Point, Affine::translate(f32p(p, "x").unwrap_or(0.0).into(), f32p(p, "y").unwrap_or(0.0).into())),
+    };
+    let mut t = TextLayer {
+        runs: vec![TextRun { len: text.len(), style }],
+        paragraphs: vec![ParagraphRun { len: text.len(), style: para }],
+        text,
+        shape,
+        transform,
+        orientation,
+        ..Default::default()
+    };
+    t.sync_summary();
+    Ok(t)
 }
 
 const CHAR_PARAMS: &str = r##""font":str,"fontStyle":str,"weight":100..900,"italic":bool,"size":0.1..=1296 pt,"color":"#rrggbb"|[r,g,b,a],"tracking":-1000..=10000 (1/1000 em),"leading":pt|"auto","baselineShift":pt,"horizontalScale":%,"verticalScale":%,"underline":bool,"strikethrough":bool,"fauxBold":bool,"fauxItalic":bool,"kerning":1/1000em (manual, after each character)|"metrics"|"optical"|"off","caps":"normal|small|all","ligatures":bool,"discretionaryLigatures":bool,"features":{"ss01":1},"variations":{"wght":650},"language":str"##;
@@ -639,42 +719,7 @@ pub fn specs() -> Vec<CommandSpec> {
             enabled: has_doc,
             journal: true,
             run: |s, p| {
-                let orientation = match p.get("orientation") {
-                    None => Orientation::Horizontal,
-                    Some(Value::String(value)) if value == "horizontal" => Orientation::Horizontal,
-                    Some(Value::String(value)) if value == "vertical" => Orientation::Vertical,
-                    _ => return Err(bad("type.create", "orientation must be horizontal or vertical")),
-                };
-                check_kerning(p).map_err(|m| bad("type.create", m))?;
-                check_size_tracking(p).map_err(|m| bad("type.create", m))?;
-                let text = norm_text(p.get("text").and_then(Value::as_str).unwrap_or(""));
-                // Type › Save Default Type Styles sets the starting styles; the colour is always
-                // the foreground colour, as in Photoshop.
-                let (mut style, mut para) = s.type_defaults.clone().unwrap_or_else(|| (CharStyle { font_family: photocraft_text::fonts::DEFAULT_FAMILY.into(), ..Default::default() }, ParagraphStyle::default()));
-                let fg = s.tools.foreground;
-                style.color = Color::rgba(fg[0], fg[1], fg[2], fg[3]);
-                apply_char_props(&mut style, p);
-                apply_para_props(&mut para, p);
-                let (shape, transform) = match p.get("box").and_then(Value::as_array) {
-                    Some(b) if b.len() == 4 => {
-                        let v: Vec<f32> = b.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect();
-                        if v[2] <= 0.0 || v[3] <= 0.0 {
-                            return Err(bad("type.create", "box width and height must be positive"));
-                        }
-                        (TextShape::Box { x: 0.0, y: 0.0, width: v[2], height: v[3] }, Affine::translate(f64::from(v[0]), f64::from(v[1])))
-                    }
-                    _ => (TextShape::Point, Affine::translate(f32p(p, "x").unwrap_or(0.0).into(), f32p(p, "y").unwrap_or(0.0).into())),
-                };
-                let mut t = TextLayer {
-                    runs: vec![TextRun { len: text.len(), style }],
-                    paragraphs: vec![ParagraphRun { len: text.len(), style: para }],
-                    text,
-                    shape,
-                    transform,
-                    orientation,
-                    ..Default::default()
-                };
-                t.sync_summary();
+                let mut t = new_text_layer(s, p, "type.create")?;
                 let name = p.get("name").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| layer_name(&t.text));
                 let id = s.edit("New Type Layer", |doc, active| {
                     refresh(doc, &mut t);
@@ -683,7 +728,14 @@ pub fn specs() -> Vec<CommandSpec> {
                     Ok(id)
                 })?;
                 let bounds = s.active().and_then(|d| d.doc.layer(id)).and_then(|l| l.surface()).map(|c| c.content_bounds());
-                Ok(json!({ "layer": id.0, "bounds": bounds.map(|r| [r.x0, r.y0, r.x1, r.y1]) }))
+                let mut out = json!({ "layer": id.0, "bounds": bounds.map(|r| [r.x0, r.y0, r.x1, r.y1]) });
+                if let Some(LayerContent::Text(t)) = s.active().and_then(|d| d.doc.layer(id)).map(|l| &l.content) {
+                    let warnings = crate::type_extra_cmds::missing_font_warnings_for_layer(t);
+                    if !warnings.is_empty() {
+                        out["warnings"] = json!(warnings);
+                    }
+                }
+                Ok(out)
             },
         },
         CommandSpec {
@@ -967,12 +1019,49 @@ mod tests {
         assert_eq!(style.weight, 600);
         assert_eq!(style.postscript_name.as_deref(), Some("Inter-SemiBold"));
         apply_char_props(&mut style, &json!({"weight": 400}));
-        assert!(style.postscript_name.is_none());
+        // #3556: a style change re-resolves to the installed face instead of leaving it nameless.
+        assert_eq!(style.postscript_name.as_deref(), Some("Inter-Regular"));
         assert!(style.font_style.is_empty());
         apply_char_props(&mut style, &json!({"fontStyle": "unknown-style"}));
-        assert!(style.postscript_name.is_none());
+        assert_eq!(style.postscript_name.as_deref(), Some("Inter-Regular"));
         apply_char_props(&mut style, &json!({"fontStyle": "Regular", "postscriptName": "ExplicitFace"}));
         assert_eq!(style.postscript_name.as_deref(), Some("ExplicitFace"));
+    }
+
+    /// #3556: a font named by family stores the installed face's PostScript name, so PSD export
+    /// names a real font instead of inventing "<Family>-Regular" that Photoshop calls missing.
+    #[test]
+    fn a_family_font_gets_the_installed_postscript_name() {
+        let mut style = CharStyle { font_family: "Inter".into(), ..Default::default() };
+        apply_char_props(&mut style, &json!({"font": "Inter"}));
+        assert_eq!(style.font_family, "Inter");
+        assert_eq!(style.postscript_name.as_deref(), Some("Inter-Regular"), "resolved from the font database");
+        // A weight picks that face's name.
+        apply_char_props(&mut style, &json!({"font": "Inter", "weight": 600}));
+        assert_eq!(style.postscript_name.as_deref(), Some("Inter-SemiBold"));
+        // A weight no face has (a variable font's axis, or between two faces) names no face, so
+        // layout still matches the requested weight instead of a nearby face's.
+        apply_char_props(&mut style, &json!({"weight": 650}));
+        assert!(style.postscript_name.is_none(), "{:?}", style.postscript_name);
+        // A family PhotoCraft does not have keeps no name; the export falls back as before.
+        let mut absent = CharStyle { font_family: "No Such Family 123".into(), ..Default::default() };
+        apply_char_props(&mut absent, &json!({"font": "No Such Family 123"}));
+        assert!(absent.postscript_name.is_none());
+    }
+
+    /// Picking a style or weight resets the weight axis to it; other axes keep their values (#2985).
+    #[test]
+    fn a_style_or_weight_resets_the_weight_axis() {
+        let mut style = CharStyle::default();
+        apply_char_props(&mut style, &json!({"variations": {"wght": 650, "wdth": 80}}));
+        apply_char_props(&mut style, &json!({"fontStyle": "Bold"}));
+        let axes = |s: &CharStyle| s.variations.iter().map(|v| (v.axis.clone(), v.value)).collect::<Vec<_>>();
+        assert_eq!(axes(&style), [("wdth".to_string(), 80.0)]);
+        apply_char_props(&mut style, &json!({"variations": {"wght": 650}}));
+        apply_char_props(&mut style, &json!({"weight": 300}));
+        assert_eq!(axes(&style), [("wdth".to_string(), 80.0)]);
+        apply_char_props(&mut style, &json!({"fontStyle": "Light", "variations": {"wght": 350}}));
+        assert_eq!(axes(&style), [("wdth".to_string(), 80.0), ("wght".to_string(), 350.0)], "same-call values apply after the style");
     }
 
     #[test]
@@ -1190,6 +1279,28 @@ mod tests {
         assert_eq!(info["lines"].as_array().unwrap().len(), 2);
         let t = text_layer(&s, id);
         assert_eq!(t.runs.iter().map(|r| r.len).sum::<usize>(), t.text.len());
+    }
+
+    #[test]
+    fn all_locked_type_edit_rejects_text_replacement_without_history() {
+        let mut s = session();
+        let id = s.execute("type.create", json!({"x": 20, "y": 20, "text": "a", "size": 12})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("layer.setProps", json!({"layer": id, "locked": true})).unwrap();
+        let history = s.active().unwrap().history.past_len();
+
+        let result = s.execute("type.edit", json!({"layer": id, "text": "b"}));
+        assert!(matches!(&result, Err(EngineError::Other(message)) if message.contains("locked")), "{result:?}");
+        assert_eq!(text_layer(&s, id).text, "a");
+        assert_eq!(s.active().unwrap().history.past_len(), history);
+
+        s.execute("layer.setProps", json!({"layer": id, "locked": false})).unwrap();
+        let history = s.active().unwrap().history.past_len();
+        s.execute("type.edit", json!({"layer": id, "text": "b"})).unwrap();
+        assert_eq!(text_layer(&s, id).text, "b");
+        assert_eq!(s.active().unwrap().history.past_len(), history + 1);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(text_layer(&s, id).text, "a");
+        assert_eq!(s.active().unwrap().history.past_len(), history);
     }
 
     #[test]
@@ -1482,5 +1593,23 @@ mod tests {
             s.execute("edit.undo", json!({})).unwrap();
             assert!(s.active().unwrap().doc.layer(LayerId(id)).is_none());
         }
+    }
+
+    #[test]
+    fn missing_font_emits_warning_in_create_set_style_and_edit() {
+        let mut s = session();
+        let r = s.execute("type.create", json!({"x": 10, "y": 20, "text": "Hello", "font": "NoSuchFamily123"})).unwrap();
+        assert_eq!(r["warnings"], json!(["font 'NoSuchFamily123' is not installed; text may render using a fallback face"]));
+        let id = r["layer"].as_u64().unwrap();
+        let styled = s.execute("type.setStyle", json!({"layer": id, "font": "StillNoSuchFamily456"})).unwrap();
+        assert_eq!(styled["warnings"], json!(["font 'StillNoSuchFamily456' is not installed; text may render using a fallback face"]));
+        let edited = s.execute("type.edit", json!({"layer": id, "runs": [{"start": 0, "end": 2, "font": "AnotherMissingFont789"}]})).unwrap();
+        assert_eq!(
+            edited["warnings"],
+            json!([
+                "font 'AnotherMissingFont789' is not installed; text may render using a fallback face",
+                "font 'StillNoSuchFamily456' is not installed; text may render using a fallback face"
+            ])
+        );
     }
 }

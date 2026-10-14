@@ -115,6 +115,8 @@ fn is_point_tool(t: Tool) -> bool {
             | Tool::Line
             | Tool::Type
             | Tool::VerticalType
+            | Tool::HorizontalTypeMask
+            | Tool::VerticalTypeMask
     )
 }
 
@@ -259,7 +261,7 @@ fn apply(app: &mut PhotocraftApp, p: [f64; 2], mods: egui::Modifiers) -> [f64; 2
         return p;
     }
     let (out, lines) = match &snap.gesture {
-        Gesture::Point => live_crop_handle(app, p, mods, &snap.targets, tol).unwrap_or_else(|| snap.targets.snap_point(p, tol)),
+        Gesture::Point => crop_handle(app, p, mods, &snap.targets, tol).unwrap_or_else(|| snap.targets.snap_point(p, tol)),
         Gesture::Guide => snap.targets.snap_point(p, tol),
         Gesture::Move { rect } | Gesture::TransformMove { rect } | Gesture::SelectionMove { rect } => {
             let d = [p[0] - snap.start[0], p[1] - snap.start[1]];
@@ -273,18 +275,26 @@ fn apply(app: &mut PhotocraftApp, p: [f64; 2], mods: egui::Modifiers) -> [f64; 2
     out
 }
 
-/// Snap the proposed handle on the image, calculated from the original camera. Snapping the
-/// pointer in the moving camera feeds the previous frame's pan back into the resize and makes
+/// Snap a crop handle being dragged: the handle itself (the frame's edge or corner), not the
+/// pointer, which grabbed it up to the grab radius away (#1919: snapping the pointer left a strip
+/// as wide as that offset between the frame and the edge it showed as snapped to). With Auto
+/// Center Preview the handle is found on the image, calculated from the original camera: snapping
+/// the pointer in the moving camera feeds the previous frame's pan back into the resize and makes
 /// a stationary pointer oscillate near the canvas edges.
-fn live_crop_handle(app: &PhotocraftApp, p: [f64; 2], mods: egui::Modifiers, targets: &SnapTargets, tol: f64) -> Option<([f64; 2], Vec<SnapLine>)> {
+fn crop_handle(app: &PhotocraftApp, p: [f64; 2], mods: egui::Modifiers, targets: &SnapTargets, tol: f64) -> Option<([f64; 2], Vec<SnapLine>)> {
     if app.ui.tool != Tool::Crop {
         return None;
     }
-    let crate::crop_ui::CropDrag::Resize { hx, hy, start, rect, view: Some(view) } = app.crop.drag? else { return None };
+    let crate::crop_ui::CropDrag::Resize { hx, hy, start, rect, view } = app.crop.drag? else { return None };
     let deg = crate::crop_ui::angle(app);
-    let q = crate::crop_mode::to_press(app, Some(view), p);
-    let g = crate::crop_mode::LiveResize { rect, deg, hx, hy, start, q, ratio: crate::crop_ui::resize_ratio(app, rect, mods), alt: mods.alt };
-    let (frame, _) = crate::crop_mode::resized_frame(g)?;
+    let ratio = crate::crop_ui::resize_ratio(app, rect, mods);
+    let q = view.map_or(p, |view| crate::crop_mode::to_press(app, Some(view), p));
+    // The frame for the pointer at `q`, as `crop_ui` resizes it.
+    let frame_at = |q: [f64; 2]| match view {
+        Some(_) => crate::crop_mode::resized_frame(crate::crop_mode::LiveResize { rect, deg, hx, hy, start, q, ratio, alt: mods.alt }).map(|(f, _)| f),
+        None => Some(crate::crop_ui::resized_turned(rect, deg, hx, hy, [q[0] - start[0], q[1] - start[1]], ratio, mods.alt)),
+    };
+    let frame = frame_at(q)?;
     let at = |r: [f64; 4]| {
         let c = crate::crop_ui::center(r);
         crate::crop_ui::turn([c[0] + f64::from(hx) * (r[2] - r[0]) / 2.0, c[1] + f64::from(hy) * (r[3] - r[1]) / 2.0], c, deg)
@@ -302,35 +312,39 @@ fn live_crop_handle(app: &PhotocraftApp, p: [f64; 2], mods: egui::Modifiers, tar
     if deg == 0.0 {
         lines.retain(|line| if line.vertical { hx != 0 } else { hy != 0 });
     }
-    // Auto Center Preview moves both screen edges. On the image the opposite edge stays put,
-    // so the grabbed edge travels twice as far as the pointer (once with Alt).
-    let scale = if mods.alt { 1.0 } else { 2.0 };
     if lines.is_empty() {
         return Some((p, lines));
     }
+    // Auto Center Preview moves both screen edges. On the image the opposite edge stays put,
+    // so the grabbed edge travels twice as far as the pointer (once with Alt). Without it the
+    // handle follows the pointer.
+    let scale = if view.is_some() && !mods.alt { 2.0 } else { 1.0 };
+    // How much the frame's extent grows per unit of pointer travel: both sides with Auto Center
+    // Preview or Alt, else the grabbed one.
+    let grow = if view.is_some() || mods.alt { 2.0 } else { 1.0 };
     let original = at(rect);
     let travel = crate::crop_ui::turn([handle[0] - original[0], handle[1] - original[1]], [0.0, 0.0], -deg);
     let mut local = [(travel[0] + d[0]) / scale, (travel[1] + d[1]) / scale];
     if deg == 0.0
         && hx != 0
         && hy != 0
-        && let Some(k) = g.ratio
+        && let Some(k) = ratio
     {
         // A corner with a ratio has one degree of freedom. Put the other axis on the same
         // ratio, rather than letting the raw pointer's unused axis override the snapped edge.
         if lines.iter().any(|line| line.vertical) {
-            local[1] = f64::from(hy) * ((rect[2] - rect[0] + 2.0 * f64::from(hx) * local[0]) / k - (rect[3] - rect[1])) / 2.0;
+            local[1] = f64::from(hy) * ((rect[2] - rect[0] + grow * f64::from(hx) * local[0]) / k - (rect[3] - rect[1])) / grow;
         } else {
-            local[0] = f64::from(hx) * ((rect[3] - rect[1] + 2.0 * f64::from(hy) * local[1]) * k - (rect[2] - rect[0])) / 2.0;
+            local[0] = f64::from(hx) * ((rect[3] - rect[1] + grow * f64::from(hy) * local[1]) * k - (rect[2] - rect[0])) / grow;
         }
     }
     let d = crate::crop_ui::turn(local, [0.0, 0.0], deg);
     let q = [start[0] + d[0], start[1] + d[1]];
-    if let Some((snapped_frame, _)) = crate::crop_mode::resized_frame(crate::crop_mode::LiveResize { q, ..g }) {
+    if let Some(snapped_frame) = frame_at(q) {
         let h = at(snapped_frame);
         lines.retain(|line| (if line.vertical { h[0] } else { h[1] } - line.pos).abs() < 1e-3);
     }
-    Some((crate::crop_mode::from_press(app, view, q), lines))
+    Some((view.map_or(q, |view| crate::crop_mode::from_press(app, view, q)), lines))
 }
 
 /// Snap a tool event's coordinates (called by `canvas::tool_event` before the tools see it).

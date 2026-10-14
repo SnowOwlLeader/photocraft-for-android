@@ -51,7 +51,7 @@ fn cancel_legacy_drag(app: &mut PhotocraftApp, ctx: &egui::Context) -> bool {
     }
 }
 
-fn normalize(raw: &str) -> Option<&'static str> {
+pub(crate) fn normalize(raw: &str) -> Option<&'static str> {
     PANELS.iter().find(|(id, label, _)| id.eq_ignore_ascii_case(raw.trim()) || label.eq_ignore_ascii_case(raw.trim())).map(|p| p.0)
 }
 
@@ -387,7 +387,8 @@ pub(crate) fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui) -> bool {
     let Some(layout) = app.ui.docking.as_ref() else { return false };
     if !valid(layout) {
         app.ui.docking = None;
-        app.ui.status = "Invalid panel layout; restored the default dock".into();
+        let message = "Invalid panel layout; restored the default dock";
+        app.ui.status = tl!(message).into();
         return false;
     }
     let layout = layout.clone();

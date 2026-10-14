@@ -65,6 +65,7 @@ pub fn no_embedded(_: CjkScript) -> Vec<&'static CraftFont> {
 impl Sources {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn system() -> Self {
+        cjk::start_fontconfig_cjk_scan();
         Self {
             locale: || match crate::i18n::current().code() {
                 code @ ("ja" | "ko" | "zh-hans" | "zh-hant") => Some(code.to_string()),
@@ -88,6 +89,18 @@ impl Sources {
             embedded: craft_embedded,
         }
     }
+}
+
+/// Headless test frame pumps do not wait for `request_repaint_after`, so let the optional
+/// Fontconfig worker finish before asserting on installed system fonts.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn wait_for_fontconfig_cjk_scan() {
+    cjk::start_fontconfig_cjk_scan();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while cjk::fontconfig_cjk_scan_pending() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!cjk::fontconfig_cjk_scan_pending(), "Fontconfig CJK lookup did not finish within 10 seconds");
 }
 
 /// The lazy loader's state: which scripts were tried and which files were read.
@@ -139,14 +152,20 @@ impl CjkFallback {
             if self.tried.contains(&s) {
                 continue;
             }
-            self.tried.push(s);
             if let Some(f) = self.load_embedded(s) {
+                self.tried.push(s);
                 return Some(f);
             }
+            let fontconfig_pending = cjk::fontconfig_cjk_scan_pending();
             let files = (self.sources.files)(s);
             if let Some(f) = self.load_first(&files) {
+                self.tried.push(s);
                 return Some(f);
             }
+            if fontconfig_pending {
+                return None;
+            }
+            self.tried.push(s);
         }
         if !self.last_resort_tried {
             self.last_resort_tried = true;
@@ -211,7 +230,7 @@ impl CjkFallback {
                 continue;
             }
             let Some(bytes) = read_font(&f.path) else { continue };
-            let index = cjk::face_index_for_family(&bytes, f.family);
+            let index = cjk::face_index_for_family(&bytes, &f.family);
             self.loaded.push(f.path.clone());
             let name = format!("{FONT_PREFIX}-{}", self.registered.len());
             log::info!("UI font fallback: registered {} (face {index}) as {name}", f.path.display());
@@ -348,6 +367,8 @@ impl egui::Plugin for CjkFontPlugin {
         if let Some((name, data)) = font {
             add_to_all_families(ctx, name, data);
             ctx.request_repaint();
+        } else if cjk::classify(c).is_some() && cjk::fontconfig_cjk_scan_pending() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         } else if !self.0.exhausted() || !self.0.scripts_exhausted() {
             // Nothing readable for this script; try the next one on the next frame.
             ctx.request_repaint();
@@ -375,7 +396,6 @@ pub fn install_with(ctx: &egui::Context, sources: Sources) {
         ctx.add_plugin(CjkFontPlugin(fallback));
     }
 }
-
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
@@ -447,7 +467,7 @@ mod tests {
     }
 
     fn fake(name: &str) -> FontFile {
-        FontFile { path: fake_dir().join(name), family: "" }
+        FontFile { path: fake_dir().join(name), family: String::new() }
     }
 
     fn fake_sources(locale: fn() -> Option<String>) -> Sources {
@@ -805,6 +825,8 @@ mod tests {
     /// machine has no font for it, e.g. CI Linux without Noto CJK).
     #[test]
     fn system_fonts_cover_cjk_samples() {
+        #[cfg(target_os = "linux")]
+        wait_for_fontconfig_cjk_scan();
         let available = |s: CjkScript| cjk::font_files(s).iter().any(|f| f.path.is_file());
         let samples = [
             ("图层", CjkScript::SimplifiedChinese),

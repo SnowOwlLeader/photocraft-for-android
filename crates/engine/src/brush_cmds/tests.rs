@@ -869,3 +869,17 @@ fn an_offer_that_does_not_match_the_commit_is_ignored() {
     let r = s.execute("paint.stroke", other).unwrap();
     assert!(r.get("fromLive").is_none());
 }
+
+/// Photoshop's Clear painting mode (#3439): a Brush or Pencil stroke in `"mode": "clear"` erases
+/// with that brush, and History still names the tool rather than the Eraser.
+#[test]
+fn clear_mode_erases_with_the_brush_or_pencil() {
+    for (cmd, label) in [("paint.stroke", "Brush Tool"), ("paint.pencil", "Pencil")] {
+        let mut s = session(40, 20);
+        s.execute("edit.fill", json!({"color": "#ff0000"})).unwrap();
+        s.execute(cmd, json!({"points": [[2, 10], [38, 10]], "size": 6, "mode": "clear", "brush": {"hardness": 1.0}})).unwrap();
+        assert_eq!(rgba(&s, 20, 10)[3], 0.0, "{cmd}: cleared to transparency");
+        assert_eq!(rgba(&s, 20, 2), [1.0, 0.0, 0.0, 1.0], "{cmd}: untouched pixels stay");
+        assert_eq!(s.active().unwrap().history.undo_label(), Some(label), "{cmd}");
+    }
+}

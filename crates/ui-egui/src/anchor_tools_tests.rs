@@ -48,8 +48,8 @@ fn both_tools_join_the_pen_group() {
     let group: Vec<Tool> = Tool::ALL.iter().copied().filter(|t| t.key() == 'P').collect();
     assert_eq!(
         group,
-        vec![Tool::Pen, Tool::FreeformPen, Tool::CurvaturePen, Tool::AddAnchorPoint, Tool::DeleteAnchorPoint],
-        "P cycles Pen → Freeform → Curvature → Add → Delete"
+        vec![Tool::Pen, Tool::FreeformPen, Tool::CurvaturePen, Tool::AddAnchorPoint, Tool::DeleteAnchorPoint, Tool::ConvertPoint],
+        "P cycles Pen → Freeform → Curvature → Add → Delete → Convert Point"
     );
     let mut app = app(Tool::Brush);
     app.ui.tool = Tool::from_name("addAnchorPoint").unwrap();

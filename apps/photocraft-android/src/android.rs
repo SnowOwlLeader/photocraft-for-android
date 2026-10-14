@@ -68,6 +68,7 @@ impl Bridge {
 }
 
 type Pending = Rc<RefCell<Option<FileDialogReply>>>;
+type BrowserRequest = Rc<RefCell<Option<Value>>>;
 
 fn guarded<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
@@ -91,8 +92,7 @@ fn export(doc: &photocraft_doc::Document, path: &str, settings: &photocraft_ui_e
     })
 }
 
-fn services(bridge: Arc<Bridge>, pending: Pending, directory: &Path) -> Services {
-    let picker = bridge.clone();
+fn services(bridge: Arc<Bridge>, pending: Pending, browser_request: BrowserRequest, directory: &Path) -> Services {
     let writer = bridge.clone();
     let saver = bridge.clone();
     let preferences = directory.join("preferences.json");
@@ -117,16 +117,13 @@ fn services(bridge: Arc<Bridge>, pending: Pending, directory: &Path) -> Services
         file_dialog: Some(Box::new(move |request, _, reply| {
             let request = match request {
                 FileDialogRequest::Open { multiple, .. } => json!({"multiple": multiple}),
+                FileDialogRequest::Folder { .. } => json!({"folder": true}),
                 FileDialogRequest::Save { suggested } => {
                     json!({"save": true, "name": Path::new(&suggested).file_name().map(|p| p.to_string_lossy()).unwrap_or_default()})
                 }
             };
-            if let Err(e) = picker.call("requestFile", Some(&request.to_string()), false) {
-                log::error!("{e}");
-                reply.send(None);
-            } else {
-                *pending.borrow_mut() = Some(reply);
-            }
+            *browser_request.borrow_mut() = Some(request);
+            *pending.borrow_mut() = Some(reply);
         })),
         load_prefs: Some(Box::new(move || std::fs::read_to_string(&load_preferences).ok())),
         save_prefs: Some(Box::new(move |text| photocraft_format::atomic_write(&preferences, text.as_bytes()).map_err(|e| e.to_string()))),
@@ -163,6 +160,9 @@ struct AndroidShell {
     font_directory: PathBuf,
     font_pending: bool,
     font_theme: Option<photocraft_ui_egui::theme::ThemeKind>,
+    browser_request: BrowserRequest,
+    browser: super::file_browser::Browser,
+    input_diagnostics: bool,
 }
 
 fn android_fonts(script: photocraft_text::cjk::CjkScript) -> Vec<photocraft_text::cjk::FontFile> {
@@ -173,7 +173,7 @@ fn android_fonts(script: photocraft_text::cjk::CjkScript) -> Vec<photocraft_text
         CjkScript::SimplifiedChinese => "Noto Sans CJK SC",
         CjkScript::TraditionalChinese => "Noto Sans CJK TC",
     };
-    vec![FontFile { path: PathBuf::from("/system/fonts/NotoSansCJK-Regular.ttc"), family }]
+    vec![FontFile { path: PathBuf::from("/system/fonts/NotoSansCJK-Regular.ttc"), family: family.into() }]
 }
 
 impl AndroidShell {
@@ -183,6 +183,21 @@ impl AndroidShell {
             return Ok(());
         }
         let event: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        if let Some(field) = event.get("browserInput").and_then(Value::as_str) {
+            let value = event.get("value").and_then(Value::as_str).unwrap_or("").to_string();
+            match field {
+                "search" => self.browser.search = value,
+                "filename" => self.browser.filename = value,
+                "name" => self.browser.name_input = value,
+                _ => {}
+            }
+            self.browser.busy = false;
+            return Ok(());
+        }
+        if let Some(response) = event.get("browser") {
+            self.browser.receive(response);
+            return Ok(());
+        }
         if let Some(text) = event.get("text").and_then(Value::as_str) {
             let layer = event.get("layer").and_then(Value::as_u64).ok_or("Missing text layer")?;
             let session = event.get("session").and_then(Value::as_str).ok_or("Missing text session")?;
@@ -200,6 +215,8 @@ impl AndroidShell {
         }
         if self.font_pending {
             self.font_pending = false;
+            self.browser.request = None;
+            self.browser.busy = false;
             if let Some(error) = event.get("error").and_then(Value::as_str) {
                 return Err(error.into());
             }
@@ -228,22 +245,18 @@ impl AndroidShell {
             return Ok(());
         }
         let reply = self.pending.borrow_mut().take();
+        self.browser.request = None;
+        self.browser.busy = false;
         if let Some(error) = event.get("error").and_then(Value::as_str) {
             return Err(error.into());
         }
         let Some(reply) = reply else { return Ok(()) };
         let answer = if let Some(path) = event.get("save").and_then(Value::as_str) {
             Some(FileDialogAnswer::SaveTo(path.into()))
+        } else if let Some(path) = event.get("folder").and_then(Value::as_str) {
+            Some(FileDialogAnswer::FolderTo(path.into()))
         } else if let Some(files) = event.get("files").and_then(Value::as_array) {
-            let mut contents = Vec::new();
-            for file in files {
-                let path = file.get("path").and_then(Value::as_str).ok_or("Missing imported file")?;
-                let name = file.get("name").and_then(Value::as_str).unwrap_or("image");
-                let bytes = photocraft_format::read_file(Path::new(path)).map_err(|e| e.to_string());
-                let _ = std::fs::remove_file(path);
-                contents.push((name.to_string(), bytes?));
-            }
-            Some(FileDialogAnswer::ContentsMany(contents))
+            Some(super::documents::picked_files(files)?)
         } else {
             None
         };
@@ -256,6 +269,27 @@ impl AndroidShell {
             self.error = Some(error);
         }
     }
+
+    fn browser_action(&mut self, action: Value) {
+        let result = match action.get("action").and_then(Value::as_str) {
+            Some("cancel") => {
+                self.browser.request = None;
+                self.browser.busy = false;
+                self.font_pending = false;
+                if let Some(reply) = self.pending.borrow_mut().take() {
+                    reply.send(None);
+                }
+                Ok(String::new())
+            }
+            Some("system") => self.bridge.call("requestFile", Some(&action["request"].to_string()), false),
+            Some("input") => self.bridge.call("editFileText", Some(&action.to_string()), false),
+            _ => self.bridge.call("browseFiles", Some(&action.to_string()), false),
+        };
+        if let Err(error) = result {
+            self.browser.busy = false;
+            self.browser.error = error;
+        }
+    }
 }
 
 impl eframe::App for AndroidShell {
@@ -264,6 +298,11 @@ impl eframe::App for AndroidShell {
             self.error = Some(e);
         }
         self.app.logic(ctx, frame);
+        let request = self.browser_request.borrow_mut().take();
+        if let Some(request) = request {
+            let action = self.browser.begin(request);
+            self.browser_action(action);
+        }
         if self.font_theme != Some(self.app.ui.theme) {
             let mut sources = photocraft_ui_egui::cjk_fonts::Sources::system();
             sources.files = android_fonts;
@@ -271,34 +310,90 @@ impl eframe::App for AndroidShell {
             self.font_theme = Some(self.app.ui.theme);
         }
         // The native file picker finishes off-thread, outside winit's input queue.
-        if self.pending.borrow().is_some() || self.font_pending || self.app.ui.text_edit.is_some() {
+        if self.pending.borrow().is_some() || self.font_pending || self.app.ui.text_edit.is_some() || self.browser.request.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
     fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        // Explicit developer opt-in: inspect native pointer mapping without logging typed text.
+        if self.input_diagnostics {
+            for event in &input.events {
+                if matches!(
+                    event,
+                    egui::Event::PointerButton { .. } | egui::Event::PointerGone | egui::Event::MouseWheel { .. } | egui::Event::ModifiersChanged(_)
+                ) {
+                    log::info!("PHOTOCRAFT_INPUT {event:?}");
+                }
+            }
+        }
         self.app.raw_input_hook(ctx, input);
     }
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let narrow = ctx.content_rect().width() < 800.0;
+        let menu_bar = self.app.ui.panels.menu_bar;
         egui::Panel::top("android_actions").show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                for (label, command) in [
-                    ("New", "file.new"),
-                    ("Open", "file.open"),
-                    ("Save", "file.save"),
-                    ("Save As", "file.saveAs"),
-                    ("Undo", "edit.undo"),
-                    ("Redo", "edit.redo"),
-                    ("Fit", "view.fitOnScreen"),
-                ] {
-                    if ui.add_sized([50.0, 32.0], egui::Button::new(photocraft_ui_egui::i18n::t(label))).clicked() {
-                        self.command(&ctx, command);
-                    }
+            ui.horizontal(|ui| {
+                let commands_width = (ui.available_width() - 140.0).max(64.0);
+                ui.allocate_ui_with_layout(egui::vec2(commands_width, 34.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    egui::ScrollArea::horizontal().id_salt("android-actions-scroll").show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if photocraft_ui_egui::icons::button(ui, "settings", 32.0, false, "设置").clicked() {
+                                photocraft_ui_egui::prefs_ui::open_ui_size_settings(&mut self.app);
+                            }
+                            for (icon, label, command) in [
+                                ("file-plus", "新建", "file.new"),
+                                ("folder-open", "文件管理 / 打开", "file.open"),
+                                ("", "保存", "file.save"),
+                                ("", "另存", "file.saveAs"),
+                                ("undo-2", "撤销", "edit.undo"),
+                                ("redo-2", "重做", "edit.redo"),
+                                ("maximize-2", "适合屏幕", "view.fitOnScreen"),
+                            ] {
+                                let clicked = if icon.is_empty() {
+                                    ui.add_sized([48.0, 32.0], egui::Button::new(label)).clicked()
+                                } else {
+                                    photocraft_ui_egui::icons::button(ui, icon, 32.0, false, label).clicked()
+                                };
+                                if clicked {
+                                    self.command(&ctx, command);
+                                }
+                            }
+                            if ui.button("文件管理").clicked() {
+                                self.command(&ctx, "file.open");
+                            }
+                        });
+                    });
+                });
+                let color = ui.visuals().text_color();
+                if ui
+                    .add_sized(
+                        [64.0, 32.0],
+                        egui::Button::image_and_text(photocraft_ui_egui::icons::image("layers", 16.0, color), "图层").selected(self.app.ui.panels.dock),
+                    )
+                    .clicked()
+                {
+                    self.app.ui.panels.dock = !self.app.ui.panels.dock;
                 }
-                ui.toggle_value(&mut self.app.ui.panels.dock, "图层");
-                ui.toggle_value(&mut self.app.ui.panels.options_bar, "选项");
+                if ui
+                    .add_sized(
+                        [64.0, 32.0],
+                        egui::Button::image_and_text(photocraft_ui_egui::icons::image("sliders-horizontal", 16.0, color), "选项")
+                            .selected(self.app.ui.panels.options_bar),
+                    )
+                    .clicked()
+                {
+                    self.app.ui.panels.options_bar = !self.app.ui.panels.options_bar;
+                }
             });
         });
+        if narrow && menu_bar {
+            egui::Panel::top("android_menus").show(ui, |ui| {
+                egui::ScrollArea::horizontal().id_salt("android-menus-scroll").show(ui, |ui| {
+                    photocraft_ui_egui::menus::menu_bar(&mut self.app, ui);
+                });
+            });
+        }
         if let Some(error) = self.error.clone() {
             egui::Window::new("PhotoCraft").collapsible(false).show(&ctx, |ui| {
                 ui.label(error);
@@ -307,11 +402,32 @@ impl eframe::App for AndroidShell {
                 }
             });
         }
+        let floating_layers = narrow && self.app.ui.panels.dock;
+        if floating_layers {
+            self.app.ui.panels.dock = false;
+        }
+        if narrow {
+            self.app.ui.panels.menu_bar = false;
+        }
         self.app.ui(ui, frame);
+        if narrow {
+            self.app.ui.panels.menu_bar = menu_bar;
+        }
+        if floating_layers {
+            self.app.ui.panels.dock = true;
+            let area = ctx.content_rect();
+            let width = (area.width() - 16.0).clamp(160.0, 310.0);
+            let height = (area.height() * 0.52).clamp(120.0, 430.0);
+            egui::Window::new("图层")
+                .anchor(egui::Align2::RIGHT_BOTTOM, [-8.0, -8.0])
+                .fixed_size([width, height])
+                .collapsible(false)
+                .show(&ctx, |ui| photocraft_ui_egui::panels::mobile_layers(&mut self.app, ui));
+        }
         if self.app.ui.tool.is_type() {
             egui::Window::new("文字工具")
-                .default_pos([40.0, 90.0])
-                .default_width((ctx.content_rect().width() - 64.0).clamp(240.0, 540.0))
+                .default_pos([16.0, 56.0])
+                .default_width((ctx.content_rect().width() - 32.0).clamp(160.0, 540.0))
                 .resizable(false)
                 .collapsible(true)
                 .show(&ctx, |ui| {
@@ -328,14 +444,18 @@ impl eframe::App for AndroidShell {
                             self.text_session = None;
                         }
                         if ui.add_enabled(!self.font_pending && self.pending.borrow().is_none(), egui::Button::new("上传字体")).clicked() {
-                            match self.bridge.call("requestFile", Some("{\"multiple\":true}"), false) {
-                                Ok(_) => self.font_pending = true,
-                                Err(e) => self.error = Some(e),
-                            }
+                            self.font_pending = true;
+                            *self.browser_request.borrow_mut() = Some(json!({"multiple":true,"transient":true}));
                         }
                         ui.label("TTF / OTF / TTC");
                     });
                 });
+        }
+        if let Err(error) = super::pixel_pencil::show(&mut self.app, &ctx) {
+            self.error = Some(error);
+        }
+        if let Some(action) = self.browser.show(&ctx) {
+            self.browser_action(action);
         }
         if let Some(ed) = self.app.ui.text_edit.clone() {
             if self.text_session.as_deref() != Some(&ed.session) {
@@ -358,6 +478,7 @@ impl eframe::App for AndroidShell {
 fn start(android: AndroidApp) -> Result<(), String> {
     let bridge = Arc::new(Bridge::new(&android)?);
     let directory = PathBuf::from(bridge.call("dataDirectory", None, true)?);
+    let input_diagnostics = bridge.call("inputDiagnosticsRequested", None, true)? == "yes";
     if bridge.call("selfTestRequested", None, true)? == "yes" {
         let result = super::smoke::run();
         let report = json!({"passed": result.is_ok(), "error": result.err()}).to_string();
@@ -381,8 +502,9 @@ fn start(android: AndroidApp) -> Result<(), String> {
             let mut session = photocraft_engine::Session::new();
             let _ = session.attach_preset_store(photocraft_engine::preset_store::open_dir(directory.join("Presets")));
             let pending = Rc::new(RefCell::new(None));
+            let browser_request = Rc::new(RefCell::new(None));
             PhotocraftApp::setup_context(&cc.egui_ctx, photocraft_ui_egui::theme::ThemeKind::Pro);
-            let mut app = PhotocraftApp::new(session, services(bridge.clone(), pending.clone(), &directory));
+            let mut app = PhotocraftApp::new(session, services(bridge.clone(), pending.clone(), browser_request.clone(), &directory));
             app.background_jobs = true;
             app.ui.tool_options.move_auto_select = true;
             app.ui.tool_options.move_show_transform = true;
@@ -402,7 +524,19 @@ fn start(android: AndroidApp) -> Result<(), String> {
             if let Some(render) = cc.wgpu_render_state.clone() {
                 app.set_wgpu(render);
             }
-            Ok(Box::new(AndroidShell { app, bridge, pending, error: None, font_theme: None, text_session: None, font_directory, font_pending: false }))
+            Ok(Box::new(AndroidShell {
+                app,
+                bridge,
+                pending,
+                error: None,
+                font_theme: None,
+                text_session: None,
+                font_directory,
+                font_pending: false,
+                browser_request,
+                browser: Default::default(),
+                input_diagnostics,
+            }))
         }),
     )
     .map_err(|e| e.to_string())

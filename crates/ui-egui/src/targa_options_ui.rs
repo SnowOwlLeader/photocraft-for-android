@@ -77,7 +77,7 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
     p.bits = bits;
     if ok || ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
         let Some(p) = app.targa_options.take() else { return };
-        let settings = ExportSettings { tga_bits: Some(p.bits), ..Default::default() };
+        let settings = ExportSettings { tga_bits: Some(p.bits), ..app.save_settings() };
         let step = serde_json::json!({"path": p.path, "tgaBits": p.bits.bits()});
         let written = app.with_document(p.doc, |app| app.write_document(p.path, &settings, p.copy));
         if written.is_ok() && p.record {

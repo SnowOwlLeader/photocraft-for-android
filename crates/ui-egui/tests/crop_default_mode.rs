@@ -24,6 +24,8 @@ fn harness() -> Option<Harness> {
         egui_kittest::Harness::builder().with_size(egui::vec2(900.0, 640.0)).with_max_steps(64).wgpu().build_eframe(|cc| {
             PhotocraftApp::setup_context(&cc.egui_ctx, Default::default());
             let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
+            // The queries below use English labels; don't follow the system locale.
+            app.session.prefs.edit(|p| p.interface.language = "en".into());
             if let Some(rs) = cc.wgpu_render_state.as_ref() {
                 app.set_wgpu(rs.clone());
             }
@@ -169,6 +171,7 @@ fn a_resize_renders_the_frame_and_image_with_the_same_camera() {
 
 #[test]
 fn dragging_inside_moves_the_image_and_the_box_stays_centred() {
+    let _gpu = photocraft_testkit::gpu_lock();
     let Some(mut h) = setup() else { return };
     assert!(!photocraft_ui_egui::crop_ui::pending(h.state()), "the untouched frame");
     let c = h.state().last_canvas_rect.center();
@@ -199,6 +202,7 @@ fn dragging_inside_moves_the_image_and_the_box_stays_centred() {
 
 #[test]
 fn a_resize_keeps_the_box_centre_after_a_space_pan() {
+    let _gpu = photocraft_testkit::gpu_lock();
     let Some(mut h) = setup() else { return };
     // Space held: the temporary Hand pans the view 80, 40.
     let c = h.state().last_canvas_rect.center();

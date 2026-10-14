@@ -184,7 +184,9 @@ pub fn add_anchor(path: &mut Path, knot: [usize; 2], t: f64) -> Result<[usize; 2
     let a = *knot_mut(path, knot)?;
     let b = *knot_mut(path, end)?;
     let new = if retracted(&a, Handle::Out) && retracted(&b, Handle::In) {
-        let p = lerp(a.anchor, b.anchor, t);
+        // Hit testing and hover feedback use the cubic parameter, which is not linear even
+        // when both handles are retracted. Keep the inserted corner at that same point.
+        let p = eval(&[a.anchor, a.out_ctrl, b.in_ctrl, b.anchor], t);
         Knot::corner(p.x, p.y)
     } else {
         let (p01, p12, p23) = (lerp(a.anchor, a.out_ctrl, t), lerp(a.out_ctrl, b.in_ctrl, t), lerp(b.in_ctrl, b.anchor, t));
@@ -454,13 +456,35 @@ mod tests {
     }
 
     #[test]
+    fn adding_to_a_straight_segment_uses_the_hit_position() {
+        for (points, closed) in [
+            (vec![(0.0, 0.0), (100.0, 0.0)], false),
+            (vec![(0.0, 0.0), (0.0, 100.0)], false),
+            (vec![(0.0, 0.0), (100.0, 100.0)], false),
+            (vec![(0.0, 0.0), (100.0, 0.0), (100.0, 100.0)], true),
+        ] {
+            for t in [0.25, 0.75] {
+                let sp = if closed { Subpath::polygon(&points) } else { Subpath::polyline(&points) };
+                let mut p = Path::new(vec![sp]);
+                let segment = if closed { 2 } else { 0 };
+                let clicked = eval(&p.subpaths[0].segments()[segment], t);
+                let Some(Hit::Segment(knot, hit_t)) = hit(&p, clicked, 1.0, &[]) else { panic!("expected a segment hit at {clicked:?}") };
+                let added = add_anchor(&mut p, knot, hit_t).unwrap();
+                let inserted = at(&p, added[0], added[1]);
+                assert!(dist(inserted.anchor, clicked) < 1e-9, "t={t}: inserted {:?}, clicked {clicked:?}", inserted.anchor);
+                assert_eq!(inserted, Knot::corner(clicked.x, clicked.y), "straight segments retain retracted handles");
+            }
+        }
+    }
+
+    #[test]
     fn adding_to_a_straight_segment_makes_a_corner_on_the_line() {
         let mut p = tri();
         // The closing segment (2 → 0) wraps: the new anchor goes last.
         assert_eq!(add_anchor(&mut p, [0, 2], 0.5).unwrap(), [0, 3]);
         assert_eq!(at(&p, 0, 3), Knot::corner(25.0, 40.0));
         assert_eq!(add_anchor(&mut p, [0, 0], 0.25).unwrap(), [0, 1]);
-        assert_eq!(at(&p, 0, 1), Knot::corner(25.0, 0.0));
+        assert_eq!(at(&p, 0, 1), Knot::corner(15.625, 0.0));
         assert_eq!(p.subpaths[0].knots.len(), 5);
         assert!(p.subpaths[0].closed);
     }
