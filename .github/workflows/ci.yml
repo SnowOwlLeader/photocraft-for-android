@@ -48,7 +48,7 @@ jobs:
       legs: ${{ steps.pick.outputs.legs }}
       web: ${{ steps.pick.outputs.web }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - id: pick
@@ -100,7 +100,7 @@ jobs:
       # line-tables-only, so a backtrace with lines is one OS away).
       CARGO_PROFILE_DEV_DEBUG: ${{ startsWith(matrix.os, 'windows') && '0' || 'line-tables-only' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Unused toolchains in the image (Android SDK, .NET, GHC, CodeQL) are deleted in the
       # background: the space is free before the craft-fonts build needs it, and nothing waits.
@@ -169,7 +169,7 @@ jobs:
 
       # nextest runs the test binaries in parallel (cargo test runs them one at a time), with the
       # GPU tests capped by the `gpu` group in .config/nextest.toml (#2204).
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cargo-nextest@0.9.146
 
@@ -241,7 +241,7 @@ jobs:
       matrix:
         variant: [without heif, with craft-fonts]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Linux system dependencies (egui/winit/rfd)
         run: |
@@ -259,7 +259,7 @@ jobs:
           shared-key: test
           save-if: false
 
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cargo-nextest@0.9.146
 
@@ -275,7 +275,7 @@ jobs:
       # Filter execution to the three crates that read the optional font input (#6127).
       - name: Check out craft-fonts
         if: matrix.variant == 'with craft-fonts'
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: storytold/craft-fonts
           ref: abb83316d96aa59c1cf64784289e378fe9fa5695
@@ -306,7 +306,7 @@ jobs:
       CARGO_PROFILE_RELEASE_LTO: "false"
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -314,7 +314,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
       - name: Restore test corpora
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: corpus/
           key: corpus-${{ hashFiles('xtask/src/corpus_pins.rs', 'xtask/*.sha256') }}
@@ -328,7 +328,7 @@ jobs:
     name: wasm32 check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: wasm32-unknown-unknown
@@ -351,7 +351,7 @@ jobs:
       # Match release.yml so PR results reflect what would actually ship.
       TRUNK_VERSION: 0.21.14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: wasm32-unknown-unknown
@@ -419,8 +419,8 @@ jobs:
           - { crate: affinity, name: import_preview, args: "--features io" }
           - { crate: format, name: load }
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # nightly
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: crates/${{ matrix.target.crate }}/fuzz
@@ -433,7 +433,7 @@ jobs:
         run: cargo fuzz run ${{ matrix.target.name }} ${{ matrix.target.args }} -- -max_total_time="$FUZZ_SECONDS"
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-${{ matrix.target.crate }}-${{ matrix.target.name }}
           path: crates/${{ matrix.target.crate }}/fuzz/artifacts
