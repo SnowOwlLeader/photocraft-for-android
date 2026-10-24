@@ -109,7 +109,7 @@ pub fn savable(o: &ToolOptions) -> Option<(Map<String, Value>, String)> {
     if !(a.is_finite() && b.is_finite() && a > 0.0 && b > 0.0) {
         return None;
     }
-    let name = format!("{} : {}", crate::widgets::fmt_num(a), crate::widgets::fmt_num(b));
+    let name = format!("{} : {}", crop_size::fmt_ratio(a), crop_size::fmt_ratio(b));
     let mut fields = Map::new();
     fields.insert("crop_ratio".into(), json!(o.crop_ratio));
     Some((fields, name))
@@ -142,7 +142,9 @@ pub fn dropdown(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let current_user = users.iter().rev().find(|(_, f)| matches(o, f)).map(|(n, _)| n.clone());
     let can_new = savable(o).is_some();
     let mut chosen: Option<Choice> = None;
+    let parent_layer = ui.layer_id();
     egui::ComboBox::from_id_salt("crop-ratio").selected_text(label).width(140.0).height(420.0).icon(crate::widgets::chevron_icon).show_ui(ui, |ui| {
+        crate::press_menu::above_parent_ui(parent_layer, ui);
         let (before, after): (Vec<_>, Vec<_>) = builtin.iter().partition(|(k, _)| k != crop_size::FRONT);
         for (k, l) in &before {
             if ui.selectable_label(current_user.is_none() && *k == o.crop_ratio, tl!(l)).clicked() {

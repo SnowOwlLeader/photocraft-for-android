@@ -9,10 +9,10 @@
 //! what the Free Transform warp UI uses) or the active smart object's stored warp (a history step).
 
 use photocraft_algo::transform::{Homography, Interp};
-use photocraft_algo::warp::{warp_mesh_gray, warp_mesh_surface};
+use photocraft_algo::warp::{warp_mesh_gray, warp_mesh_surface_with};
 use photocraft_doc::{Document, Layer, LayerContent, LayerId, Locks, Rect};
 use photocraft_geom::warp::{BezierMesh, Warp, WarpStyle};
-use photocraft_raster::Surface;
+use photocraft_raster::{Interrupt, Surface};
 use serde_json::{Value, json};
 
 use crate::commands::CommandSpec;
@@ -112,16 +112,39 @@ pub fn warp_from_params(cmd: &str, p: &Value, rect: [f64; 4]) -> Result<Warp> {
 
 /// A Background is turned into a normal layer by the caller first
 /// ([`crate::extra_cmds::background_to_layer`]).
-fn warp_layer(doc_sel: Option<&Surface>, group: Locks, l: &mut Layer, w: &Warp, rect: Rect, interp: Interp) -> Result<()> {
+/// `Err(Cancelled)` once `ctl` is cancelled: between the steps of a warp that don't check it.
+fn cancelled(ctl: &Interrupt) -> Result<()> {
+    if ctl.cancelled() { Err(EngineError::Cancelled) } else { Ok(()) }
+}
+
+/// `ctl` reports progress and cancels (`Err(Cancelled)`, the layer left half-done for the caller
+/// to discard).
+#[allow(clippy::too_many_arguments)]
+fn warp_layer(
+    doc_sel: Option<&Surface>,
+    group: Locks,
+    l: &mut Layer,
+    w: &Warp,
+    rect: Rect,
+    interp: Interp,
+    frames: Option<&Frames>,
+    ctl: &Interrupt,
+) -> Result<()> {
     let locks = l.locks.union(group);
     if locks.position || locks.all {
         return Err(EngineError::Other(format!("layer \"{}\" is locked", l.name)));
     }
     let map = |x: f64, y: f64| w.map(x, y);
+    // A selection limits the linked mask exactly as it limits the pixels (#4175, as Free Transform
+    // and Perspective Warp do, #3083); a layer that moves whole takes its whole mask along.
+    let mask_sel = doc_sel.filter(|_| !crate::transform_cmds::moves_whole(l));
+    // The masks (and so a fill's frame) move, but a fill layer's cached render isn't warped:
+    // drop it, the fill re-renders from its model.
+    l.fill_cache = None;
     match &mut l.content {
         LayerContent::Group(g) => {
             for c in g.children.iter_mut() {
-                warp_layer(None, locks, c, w, rect, interp)?;
+                warp_layer(None, locks, c, w, rect, interp, frames, ctl)?;
             }
         }
         LayerContent::Text(_) => return Err(EngineError::Other("Warp needs rasterized type (or use Type › Warp Text)".into())),
@@ -135,13 +158,20 @@ fn warp_layer(doc_sel: Option<&Surface>, group: Locks, l: &mut Layer, w: &Warp, 
             let sb = corners.iter().fold([f64::MAX, f64::MAX, f64::MIN, f64::MIN], |b, p| [b[0].min(p[0]), b[1].min(p[1]), b[2].max(p[0]), b[3].max(p[1])]);
             let src_warp = match w.style {
                 WarpStyle::None => None,
-                WarpStyle::Custom => Some(Warp::custom(w.to_mesh(1, 1).map_points(|p| hom_apply(&inv, p)), sb)),
+                WarpStyle::Custom => {
+                    let mesh = w.to_mesh(1, 1).map_points(|p| hom_apply(&inv, p));
+                    // A `mesh` parameter's knots span the contents, not the warp box's image (#4113).
+                    match frames.and_then(|f| f.get(&l.id)).and_then(|&c| content_frame_warp(&mesh, c, sb)) {
+                        Some(cw) => Some(cw),
+                        None => Some(Warp::custom(mesh, sb)),
+                    }
+                }
                 _ => Some(Warp { bounds: sb, mesh: None, ..w.clone() }),
             };
             sm.warp = src_warp.filter(|w| !w.is_identity());
             // Fallback appearance for sources that can't be re-rendered.
             if let Some(c) = &mut sm.cache {
-                *c = warp_mesh_surface(c, rect, &map, interp);
+                *c = warp_mesh_surface_with(c, rect, &map, interp, ctl).ok_or(EngineError::Cancelled)?;
             }
             if let Some(m) = &mut sm.filter_mask {
                 m.surface = warp_mesh_gray(&m.surface, &map, interp);
@@ -152,7 +182,8 @@ fn warp_layer(doc_sel: Option<&Surface>, group: Locks, l: &mut Layer, w: &Warp, 
                 *surf = match doc_sel {
                     Some(sel) => {
                         let (lifted, mut rest) = crate::transform_cmds::split_selected(surf, sel)?;
-                        let moved = warp_mesh_surface(&lifted, rect, &map, interp);
+                        let moved = warp_mesh_surface_with(&lifted, rect, &map, interp, ctl).ok_or(EngineError::Cancelled)?;
+                        cancelled(ctl)?;
                         crate::transform_cmds::composite_over(&mut rest, &moved);
                         rest.prune();
                         rest
@@ -160,12 +191,20 @@ fn warp_layer(doc_sel: Option<&Surface>, group: Locks, l: &mut Layer, w: &Warp, 
                     None => {
                         // Content outside the warp box stays where it is.
                         let fmt = surf.format();
-                        let warped = warp_mesh_surface(surf, rect, &map, interp);
-                        let mut rest = surf.convert(photocraft_color::PixelFormat::new(fmt.mode, fmt.sample, true));
+                        let warped = warp_mesh_surface_with(surf, rect, &map, interp, ctl).ok_or(EngineError::Cancelled)?;
+                        cancelled(ctl)?;
+                        // Tiles are shared, so a surface that has alpha already costs nothing to copy.
+                        let mut rest = if fmt.alpha { surf.clone() } else { surf.convert(photocraft_color::PixelFormat::new(fmt.mode, fmt.sample, true)) };
                         crate::pixels::try_clear_surface(&mut rest, rect, None)?;
-                        crate::transform_cmds::composite_over(&mut rest, &warped);
-                        rest.prune();
-                        rest
+                        if rest.content_bounds().is_empty() {
+                            // The box held all of the layer: the warp is the whole result.
+                            warped
+                        } else {
+                            cancelled(ctl)?;
+                            crate::transform_cmds::composite_over(&mut rest, &warped);
+                            rest.prune();
+                            rest
+                        }
                     }
                 };
             }
@@ -174,7 +213,16 @@ fn warp_layer(doc_sel: Option<&Surface>, group: Locks, l: &mut Layer, w: &Warp, 
     if let Some(m) = l.mask.as_mut()
         && m.linked
     {
-        m.surface = warp_mesh_gray(&m.surface, &map, interp);
+        let whole = |m: &Surface| Ok(warp_mesh_gray(m, &map, interp));
+        m.surface = match mask_sel {
+            Some(sel) => crate::transform_cmds::move_gray_selected(
+                &m.surface,
+                sel,
+                &|lifted, src| warp_mesh_surface_with(lifted, src, &map, interp, ctl).ok_or(EngineError::Cancelled),
+                &whole,
+            )?,
+            None => whole(&m.surface)?,
+        };
     }
     if let Some(vm) = l.vector_mask.as_mut()
         && vm.linked
@@ -182,6 +230,75 @@ fn warp_layer(doc_sel: Option<&Surface>, group: Locks, l: &mut Layer, w: &Warp, 
         vm.path = crate::vector_cmds::map_path(&vm.path, None, Some(w))?;
     }
     Ok(())
+}
+
+/// Source boxes of the smart objects under a warped layer, by layer id.
+type Frames = std::collections::HashMap<LayerId, [f64; 4]>;
+
+fn source_frames(doc: &Document, l: &Layer, out: &mut Frames) {
+    match &l.content {
+        LayerContent::Group(g) => g.children.iter().for_each(|c| source_frames(doc, c, out)),
+        LayerContent::Smart(sm) => {
+            if let Some(b) = crate::smart_cmds::source_box(doc, sm) {
+                out.insert(l.id, b);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Rescales `knots` (spanning the box starting at `c0`, `cs` long) to span the frame `t0`, `ts`
+/// (which contains it). Returns the knots and whether the frame extends past the box at the start / end.
+fn reframe_knots(knots: &[f64], c0: f64, cs: f64, t0: f64, ts: f64) -> (Vec<f64>, bool, bool) {
+    let pre = (c0 - t0) / ts > 1e-9;
+    let post = (t0 + ts - (c0 + cs)) / ts > 1e-9;
+    let mut out: Vec<f64> = Vec::with_capacity(knots.len() + 2);
+    if pre {
+        out.push(0.0);
+    }
+    out.extend(knots.iter().map(|k| (c0 + k * cs - t0) / ts));
+    if post {
+        out.push(1.0);
+    }
+    // Keep the ends exactly 0 and 1.
+    if let Some(f) = out.first_mut() {
+        *f = 0.0;
+    }
+    if let Some(l) = out.last_mut() {
+        *l = 1.0;
+    }
+    (out, pre, post)
+}
+
+/// `items` with three more copies of the first / last one at the front (`pre`) / back (`post`).
+fn pad<T: Clone>(items: &[T], pre: bool, post: bool) -> Option<Vec<T>> {
+    let mut out = Vec::with_capacity(items.len() + 6);
+    if pre {
+        out.extend(std::iter::repeat_n(items.first()?.clone(), 3));
+    }
+    out.extend_from_slice(items);
+    if post {
+        out.extend(std::iter::repeat_n(items.last()?.clone(), 3));
+    }
+    Some(out)
+}
+
+/// A stored smart-object warp from `mesh` (points in source space) whose knots span the source
+/// box `c`: the knots are re-expressed over the frame `hull(c, b)` (`b` = the warp box's image in
+/// source space), with a degenerate patch padding every side where the frame extends past `c`.
+/// The surface over `c` is exactly the mesh's (#4113).
+fn content_frame_warp(mesh: &BezierMesh, c: [f64; 4], b: [f64; 4]) -> Option<Warp> {
+    let t = [c[0].min(b[0]), c[1].min(b[1]), c[2].max(b[2]), c[3].max(b[3])];
+    let (cw, ch) = (c[2] - c[0], c[3] - c[1]);
+    if !(cw > 0.0 && ch > 0.0 && t.iter().all(|v| v.is_finite())) {
+        return None;
+    }
+    let (us, left, right) = reframe_knots(&mesh.us, c[0], cw, t[0], t[2] - t[0]);
+    let (vs, top, bottom) = reframe_knots(&mesh.vs, c[1], ch, t[1], t[3] - t[1]);
+    let rows: Vec<Vec<[f64; 2]>> = mesh.points.chunks(mesh.nx()).map(|r| pad(r, left, right)).collect::<Option<_>>()?;
+    let rows = pad(&rows, top, bottom)?;
+    let m = BezierMesh { us, vs, points: rows.into_iter().flatten().collect() };
+    m.is_valid().then(|| Warp::custom(m, t))
 }
 
 /// Largest warp frame side: far above any real layer, far below what would exhaust memory.
@@ -238,7 +355,7 @@ fn warp_type_layer(s: &mut Session, cmd: &str, id: LayerId, w: &Warp) -> Result<
     }
     s.edit("Warp", |doc, _| {
         let group = crate::transform_cmds::group_locks(doc, id);
-        let snapshot = doc.clone();
+        let (dpi, format) = (doc.resolution_dpi, doc.pixel_format());
         let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
         let locks = l.locks.union(group);
         if locks.position || locks.all {
@@ -246,7 +363,7 @@ fn warp_type_layer(s: &mut Session, cmd: &str, id: LayerId, w: &Warp) -> Result<
         }
         let LayerContent::Text(t) = &mut l.content else { return Err(EngineError::Other("not a type layer".into())) };
         t.warp = tw.clone();
-        crate::type_cmds::refresh(&snapshot, t);
+        crate::type_cmds::refresh_at(dpi, format, t);
         Ok(())
     })?;
     Ok(json!({"layer": id.0, "changed": true, "warp": tw}))
@@ -263,23 +380,40 @@ fn apply(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
         return Ok(json!({"layer": id.0, "changed": false}));
     }
     let interp = Interp::parse(p.get("interpolation").and_then(Value::as_str).unwrap_or("bicubic"));
-    s.edit("Warp", |doc, _| {
-        let sel = doc.selection.clone();
-        let is_group = doc.layer(id).is_some_and(Layer::is_group);
-        let group = crate::transform_cmds::group_locks(doc, id);
-        crate::extra_cmds::background_to_layer(doc, id);
-        let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
-        warp_layer(if is_group { None } else { sel.as_ref() }, group, l, &w, rect, interp)?;
-        let snapshot = doc.clone();
-        if let Some(l) = doc.layer_mut(id) {
-            crate::transform_cmds::refresh_text(&snapshot, l);
+    let content_knots = p.get("mesh").is_some() && p.get("warp").is_none();
+    // A background job when started with `Session::start` (as Free Transform, #4218): the warp of
+    // a large layer runs on a worker with progress, and can be cancelled.
+    crate::jobs::edit_job(
+        s,
+        "Warp",
+        move |doc, _, ctx| ctx.stage(0.0, 1.0, "Warping", |ctl| warp_doc(doc, id, &w, rect, interp, content_knots, ctl)),
+        move |()| json!({"layer": id.0, "changed": true, "rect": [rect.x0, rect.y0, rect.x1, rect.y1]}),
+    )
+}
+
+/// The edit of [`apply`]: the layer and the selection outline.
+fn warp_doc(doc: &mut Document, id: LayerId, w: &Warp, rect: Rect, interp: Interp, content_knots: bool, ctl: &Interrupt) -> Result<()> {
+    let sel = doc.selection.clone();
+    let frames = content_knots.then(|| {
+        let mut f = Frames::new();
+        if let Some(l) = doc.layer(id) {
+            source_frames(doc, l, &mut f);
         }
-        if let Some(sel) = &doc.selection {
-            doc.selection = Some(warp_mesh_gray(sel, &|x, y| w.map(x, y), Interp::Bilinear)).filter(|s| !s.content_bounds().is_empty());
-        }
-        Ok(())
-    })?;
-    Ok(json!({"layer": id.0, "changed": true, "rect": [rect.x0, rect.y0, rect.x1, rect.y1]}))
+        f
+    });
+    let is_group = doc.layer(id).is_some_and(Layer::is_group);
+    let group = crate::transform_cmds::group_locks(doc, id);
+    crate::extra_cmds::background_to_layer(doc, id);
+    let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
+    warp_layer(if is_group { None } else { sel.as_ref() }, group, l, w, rect, interp, frames.as_ref(), ctl)?;
+    let snapshot = doc.clone();
+    if let Some(l) = doc.layer_mut(id) {
+        crate::transform_cmds::refresh_text(&snapshot, l);
+    }
+    if let Some(sel) = &doc.selection {
+        doc.selection = Some(warp_mesh_gray(sel, &|x, y| w.map(x, y), Interp::Bilinear)).filter(|s| !s.content_bounds().is_empty());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -455,7 +589,7 @@ fn grid(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 pub fn specs() -> Vec<CommandSpec> {
-    const P: &str = r##"{"layer":id?,"rect":[x0,y0,x1,y1]? (warp box; default = layer content ∩ selection),"style":"custom|none|arc|arcLower|arcUpper|arch|bulge|shellLower|shellUpper|flag|wave|fish|rise|fisheye|inflate|squeeze|twist","bend":%=50,"hDistort":%,"vDistort":%,"vertical":bool,"mesh":{"us":[0,…,1],"vs":[0,…,1],"points":[[x,y]…]} ((3c+1)×(3r+1) control points, row-major, document px),"grid":[cols,rows]?,"warp":{full warp object}?,"interpolation":"bicubic|bilinear|nearest"} — on a type layer a style (or none) sets its Warp Text and the type stays editable"##;
+    const P: &str = r##"{"layer":id?,"rect":[x0,y0,x1,y1]? (warp box; default = layer content ∩ selection),"style":"custom|none|arc|arcLower|arcUpper|arch|bulge|shellLower|shellUpper|flag|wave|fish|rise|fisheye|inflate|squeeze|twist","bend":%=50,"hDistort":%,"vDistort":%,"vertical":bool,"mesh":{"us":[0,…,1],"vs":[0,…,1],"points":[[x,y]…]} ((3c+1)×(3r+1) control points, row-major, document px; on a smart object `us`/`vs` span the source contents, so points equal to the placement are an identity warp even when it is skewed),"grid":[cols,rows]?,"warp":{full warp object}?,"interpolation":"bicubic|bilinear|nearest"} — on a type layer a style (or none) sets its Warp Text and the type stays editable"##;
     const S: &str = r##"{"warp":{…}? (the warp being edited; returned split),"rect":[x0,y0,x1,y1]?,"at":[x,y]? (document point; default = middle of the patch)} — without `warp`, edits the active smart object's warp. A 1×1 custom mesh is divided at the thirds first (the guides drawn on the default grid), so splitWarpCrosswise on an identity custom warp returns a 4×4 mesh (knots at 0, 1/3, 1/2, 2/3 and 1), not a 2×2. A preset is fitted as one patch and split without that step."##;
     const G: &str = r##"{"warp":{…}? (the warp being edited; returned with the new mesh),"rect":[x0,y0,x1,y1]?,"size":n|"default"|"3"|"4"|"5" (square patches, 1..=64; 1 and "default" are the single-patch grid)} — without `warp`/`style`/`mesh`, edits the active smart object's warp. The surface is kept and the new lines are real splits at i/n."##;
     vec![
@@ -535,6 +669,36 @@ pub fn specs() -> Vec<CommandSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_warp_box_holding_the_whole_layer_gives_what_compositing_over_the_cleared_layer_did() {
+        for depth in [8, 16, 32] {
+            let s = session(depth);
+            let st = s.active().unwrap();
+            let l = st.doc.layer(st.active_layer.unwrap()).unwrap().clone();
+            let surf = l.surface().unwrap().clone();
+            let rect = surf.content_bounds();
+            let w = Warp::preset(WarpStyle::Flag, 35.0, rect_f(rect));
+            // What the warp built before the shortcut: the warp composited over the cleared layer.
+            let map = |x: f64, y: f64| w.map(x, y);
+            let warped = warp_mesh_surface_with(&surf, rect, &map, Interp::Bicubic, &Interrupt::NONE).unwrap();
+            let mut want = surf.clone();
+            crate::pixels::try_clear_surface(&mut want, rect, None).unwrap();
+            crate::transform_cmds::composite_over(&mut want, &warped);
+            want.prune();
+            let mut got = l.clone();
+            warp_layer(None, Locks::default(), &mut got, &w, rect, Interp::Bicubic, None, &Interrupt::NONE).unwrap();
+            let got = got.surface().unwrap();
+            let b = want.content_bounds();
+            assert_eq!(got.content_bounds(), b, "depth {depth}");
+            let (g, wv) = (got.read_region(b), want.read_region(b));
+            // Exact at 8 and 16 bits. At 32 the composite's `t·a / a` rounds a few values by an
+            // ulp; the shortcut keeps the warp's own.
+            let tol = if depth == 32 { 1e-6 } else { 0.0 };
+            let worst = g.iter().zip(&wv).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            assert!(worst <= tol, "depth {depth}: off by {worst}");
+        }
+    }
 
     fn session(depth: u64) -> Session {
         let mut s = Session::new();
@@ -749,5 +913,78 @@ mod tests {
         let r = s.execute("edit.transform.warpGrid", json!({"warp": Warp::custom(m, b), "size": "default"})).unwrap();
         let back: Warp = serde_json::from_value(r["warp"].clone()).unwrap();
         assert_eq!(back.mesh.unwrap().us.len(), 2);
+    }
+
+    /// A selection limits the warp of a linked mask too, as it does the pixels (#4175; Free
+    /// Transform and Perspective Warp did this already, #3083): the moved part of the mask lines
+    /// up with the moved pixels and the unselected part stays put.
+    #[test]
+    fn linked_mask_with_a_selection_warps_only_the_selected_region() {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 100, "height": 100})).unwrap();
+        s.execute("layer.new.layer", json!({})).unwrap();
+        s.execute("layer.layerMask.revealAll", json!({})).unwrap();
+        s.edit("paint", |doc, active| {
+            let l = doc.layer_mut(active.unwrap()).unwrap();
+            l.surface_mut().unwrap().fill_rect(Rect::new(10, 10, 30, 20), &[1.0, 0.0, 0.0, 1.0]);
+            // Hide the left quarter (selected) and the right quarter (not selected).
+            let m = l.mask.as_mut().unwrap();
+            m.surface.fill_rect(Rect::new(10, 10, 15, 20), &[0.0]);
+            m.surface.fill_rect(Rect::new(25, 10, 30, 20), &[0.0]);
+            m.linked = true;
+            Ok(())
+        })
+        .unwrap();
+        let mask_at = |s: &Session, x, y| {
+            let st = s.active().unwrap();
+            st.doc.layer(st.active_layer.unwrap()).unwrap().mask.as_ref().unwrap().surface.sample_channel(x, y, 0)
+        };
+        let alpha_at = |s: &Session, x, y| {
+            let st = s.active().unwrap();
+            st.doc.layer(st.active_layer.unwrap()).unwrap().surface().unwrap().pixel(x, y)[3]
+        };
+        s.execute("select.rect", json!({"x": 10, "y": 10, "width": 10, "height": 10})).unwrap();
+        // A mesh that translates the selected box 50 px down.
+        let b = [10.0, 10.0, 20.0, 20.0];
+        let mesh = BezierMesh::identity(b, 1, 1).map_points(|p| [p[0], p[1] + 50.0]);
+        s.execute("edit.transform.warp", json!({"rect": [10, 10, 20, 20], "mesh": mesh})).unwrap();
+        // Moved pixels and their mask line up.
+        assert!(alpha_at(&s, 12, 65) > 0.99);
+        assert!(mask_at(&s, 12, 65) < 0.01, "selected hidden quarter moved");
+        assert!(mask_at(&s, 17, 65) > 0.99, "selected visible quarter moved");
+        // The vacated area reads as revealed, with transparent pixels.
+        assert!(alpha_at(&s, 12, 15) < 0.01);
+        assert!(mask_at(&s, 12, 15) > 0.99);
+        // The unselected part of the mask stays, aligned with the unselected pixels.
+        assert!(alpha_at(&s, 27, 15) > 0.99);
+        assert!(mask_at(&s, 27, 15) < 0.01, "unselected mask stays put");
+        assert!(mask_at(&s, 27, 65) > 0.99, "and isn't copied along");
+        for (x, y) in [(11, 61), (13, 68), (16, 61), (18, 68)] {
+            let want = if x < 15 { 0.0 } else { 1.0 };
+            assert!((mask_at(&s, x, y) - want).abs() < 0.01, "({x},{y}): {}", mask_at(&s, x, y));
+        }
+    }
+
+    /// Esc stops the warp of a selected linked mask too, not only of the pixels. A fill layer has
+    /// no pixels to warp, so the mask is the only part that can see the cancel.
+    #[test]
+    fn a_cancelled_warp_stops_in_a_selected_linked_mask() {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 100, "height": 100})).unwrap();
+        s.execute("layer.newFillLayer.solidColor", json!({})).unwrap();
+        s.execute("layer.layerMask.revealAll", json!({})).unwrap();
+        s.edit("link", |doc, active| {
+            doc.layer_mut(active.unwrap()).unwrap().mask.as_mut().unwrap().linked = true;
+            Ok(())
+        })
+        .unwrap();
+        s.execute("select.rect", json!({"x": 10, "y": 10, "width": 10, "height": 10})).unwrap();
+        let st = s.active().unwrap();
+        let (sel, mut l) = (st.doc.selection.clone().unwrap(), st.doc.layer(st.active_layer.unwrap()).unwrap().clone());
+        let rect = Rect::new(10, 10, 20, 20);
+        let w = Warp::preset(WarpStyle::Flag, 35.0, rect_f(rect));
+        let ctl = Interrupt::cancel_only(&|| true);
+        let r = warp_layer(Some(&sel), Locks::default(), &mut l, &w, rect, Interp::Bicubic, None, &ctl);
+        assert!(matches!(r, Err(EngineError::Cancelled)), "{r:?}");
     }
 }

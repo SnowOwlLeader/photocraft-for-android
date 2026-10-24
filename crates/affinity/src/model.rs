@@ -283,12 +283,18 @@ const MAX_TREE_DEPTH: usize = 128;
 /// Total layer nodes imported.
 const MAX_NODES: usize = 500_000;
 
+/// Total raw `Chld` slots inspected across the whole traversal, including null slots and slots
+/// reached through repeated references to a shared group. The node limit only counts produced
+/// nodes, so a shared group holding a large null-filled child array could still be rescanned
+/// many times; this bounds that work. Generous relative to MAX_NODES for real documents.
+const MAX_CHILD_SLOTS: usize = 8_000_000;
+
 /// Read a document: archive, `doc.dat` and the model.
 pub fn read(bytes: &[u8], limits: Limits) -> Result<Document, Error> {
     let mut archive = Archive::open(bytes, limits)?;
     let doc = archive.read("doc.dat")?;
     let s = stream::parse(&doc)?;
-    Reader::new(&s, &mut archive).document()
+    Reader::new(&s, &mut archive, limits).document()
 }
 
 pub(crate) struct Reader<'s, 'a, 'b> {
@@ -297,12 +303,40 @@ pub(crate) struct Reader<'s, 'a, 'b> {
     pub(crate) dpi: f64,
     warnings: BTreeMap<String, usize>,
     nodes: usize,
+    child_slots: usize,
     active: HashSet<ObjId>,
+    pub(crate) geometry_budget: crate::geometry::Budget,
+    /// Decoded pixels still available ([`Limits::max_pixel_bytes`] less what the layers read so
+    /// far hold).
+    pixels_left: usize,
 }
 
 impl<'s, 'a, 'b> Reader<'s, 'a, 'b> {
-    fn new(s: &'s Stream, archive: &'b mut Archive<'a>) -> Self {
-        Self { s, archive, dpi: 72.0, warnings: BTreeMap::new(), nodes: 0, active: HashSet::new() }
+    fn new(s: &'s Stream, archive: &'b mut Archive<'a>, limits: Limits) -> Self {
+        Self {
+            s,
+            archive,
+            dpi: 72.0,
+            warnings: BTreeMap::new(),
+            nodes: 0,
+            child_slots: 0,
+            active: HashSet::new(),
+            geometry_budget: crate::geometry::Budget::default(),
+            pixels_left: limits.max_pixel_bytes,
+        }
+    }
+
+    /// Admit a layer's decoded pixels before they are allocated (#4960). `rgba` is the layer's
+    /// output, which stays with the document; `planes` is the working set it decodes through and
+    /// releases. Every layer read so far is still live while this one decodes, so the peak is all
+    /// three together.
+    pub(crate) fn admit_pixels(&mut self, rgba: usize, planes: usize) -> Result<(), Error> {
+        let peak = rgba.saturating_add(planes);
+        if peak > self.pixels_left {
+            return Err(Error::Limit("decoded pixel layers exceed the pixel budget"));
+        }
+        self.pixels_left -= rgba;
+        Ok(())
     }
 
     pub(crate) fn warn(&mut self, what: impl Into<String>) {
@@ -357,6 +391,13 @@ impl<'s, 'a, 'b> Reader<'s, 'a, 'b> {
         let s = self.s;
         let mut out = Vec::new();
         let mut mask = None;
+        // Charge every raw child slot (null slots included) against a document-wide budget
+        // before filtering. A shared group with a large null-filled Chld array could otherwise
+        // be rescanned through each reference without the node limit noticing.
+        self.child_slots = self.child_slots.saturating_add(s.array_len(parent, b"Chld").unwrap_or(0));
+        if self.child_slots > MAX_CHILD_SLOTS {
+            return Err(Error::Limit("too many child slots in the layer tree"));
+        }
         for c in s.objs(parent, b"Chld") {
             if s.is(c, b"MRst") {
                 // A mask layer inside a group or layer masks that container.

@@ -37,7 +37,7 @@ fn get(ctx: &egui::Context) -> Option<Transfer> {
     ctx.data(|d| d.get_temp::<Transfer>(key()))
 }
 
-fn clear(ctx: &egui::Context) {
+pub(crate) fn clear(ctx: &egui::Context) {
     ctx.data_mut(|d| d.remove::<Transfer>(key()));
 }
 

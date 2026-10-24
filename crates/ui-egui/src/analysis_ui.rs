@@ -281,7 +281,8 @@ pub fn pointer(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers) ->
             set_ruler(app, r);
         }
         (Tool::Ruler, ToolEvent::Up { .. }) => {
-            if app.ui.analysis.drag.take() == Some(Drag::RulerNew) && doc.measurement.ruler.is_some_and(|r| dist(r.start, r.end) < 0.5) {
+            let drag = app.ui.analysis.drag.take();
+            if drag == Some(Drag::RulerNew) && doc.measurement.ruler.is_some_and(|r| dist(r.start, r.end) < 0.5) {
                 let _ = app.run("image.analysis.rulerTool", json!({"clear": true}));
             }
         }
@@ -313,6 +314,7 @@ pub fn pointer(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers) ->
                 Some(i) => {
                     app.ui.analysis.note_selected = Some(i);
                     app.ui.analysis.notes = true;
+                    show_note_options(app, i);
                     app.ui.analysis.drag = Some(Drag::Note(i, [x - doc.notes[i].position[0], y - doc.notes[i].position[1]]));
                 }
                 None => {
@@ -565,7 +567,7 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bo
                 ui.label(RichText::new(tl!("Label Size")).color(t.text_dim).size(11.0));
                 let b = crate::widgets::value_field(ui, &mut ls, 8.0..=72.0, "", 44.0).changed();
                 if a || b {
-                    let _ = app.run("count.setGroup", json!({"markerSize": ms.round(), "labelSize": ls.round()}));
+                    let _ = app.run("count.setGroup", count_size_params(ms, ls));
                 }
             }
             true
@@ -612,6 +614,13 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bo
 }
 
 // ------------------------------------------------------------------ panels and dialogs
+
+/// `count.setGroup` params for the options bar's Marker Size and Label Size fields, sent as JSON
+/// integers (the fields edit `f32`s; `8.0` is a float on the wire).
+fn count_size_params(marker: f32, label: f32) -> Value {
+    let whole = |v: f32, lo: f32, hi: f32| if v.is_finite() { v.round().clamp(lo, hi) as u32 } else { lo as u32 };
+    json!({"markerSize": whole(marker, 1.0, 10.0), "labelSize": whole(label, 8.0, 72.0)})
+}
 
 fn float_frame(t: &Tokens) -> egui::Frame {
     egui::Frame::NONE
@@ -736,7 +745,8 @@ pub fn windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
                 }
             }
             Some((id, p)) => {
-                if app.run(id, p).is_ok() {
+                let result = app.run(id, p);
+                if result.is_ok() {
                     app.ui.analysis.log_selected.clear();
                 }
             }
@@ -751,6 +761,15 @@ pub fn windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
     }
 }
 
+/// Selecting note `i` shows its author and colour in the Note tool's options bar, as Photoshop
+/// does (#7940); a new note then takes them unless they are changed.
+fn show_note_options(app: &mut PhotocraftApp, i: usize) {
+    let Some(note) = app.session.active().and_then(|d| d.doc.notes.get(i)) else { return };
+    let (author, color) = (note.author.clone(), note.color.to_rgb());
+    app.ui.analysis.note_author = author;
+    app.ui.analysis.note_color = color;
+}
+
 fn notes_panel(app: &mut PhotocraftApp, ctx: &egui::Context) {
     let notes = app.session.active().map(|d| d.doc.notes.clone()).unwrap_or_default();
     let n = notes.len();
@@ -758,6 +777,7 @@ fn notes_panel(app: &mut PhotocraftApp, ctx: &egui::Context) {
     let mut close = false;
     let mut edit: Option<Value> = None;
     let mut delete = false;
+    let mut navigated = false;
     let t = Tokens::get(ctx);
     panel_window(app, ctx, "notes-panel", tl!("Notes"), vec2(-40.0, 300.0), 260.0, |ui| {
         close = title_row(ui, tl!("Notes"));
@@ -778,9 +798,11 @@ fn notes_panel(app: &mut PhotocraftApp, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             if ui.add_enabled_ui(n > 1, |ui| crate::icons::button(ui, "chevrons-left", 22.0, false, tl!("Previous note"))).inner.clicked() {
                 sel = sel.map(|i| (i + n - 1) % n);
+                navigated = true;
             }
             if ui.add_enabled_ui(n > 1, |ui| crate::icons::button(ui, "chevrons-right", 22.0, false, tl!("Next note"))).inner.clicked() {
                 sel = sel.map(|i| (i + 1) % n);
+                navigated = true;
             }
             let template = "{index} of {total}";
             let position = crate::i18n::fmt(tl!(template), &[("index", &sel.map_or(0, |i| i + 1).to_string()), ("total", &n.to_string())]);
@@ -793,6 +815,9 @@ fn notes_panel(app: &mut PhotocraftApp, ctx: &egui::Context) {
         });
     });
     app.ui.analysis.note_selected = sel;
+    if navigated && let Some(i) = sel {
+        show_note_options(app, i);
+    }
     if let Some(p) = edit {
         let _ = app.run("notes.set", p);
     }
@@ -1102,6 +1127,30 @@ pub(crate) mod tests {
         render(&mut app, &ctx, windows);
     }
 
+    /// Clicking a note with the Note tool shows its author and colour in the options bar (#7940),
+    /// so a note from a PSD reads as itself, not as the next note's defaults.
+    #[test]
+    fn clicking_a_note_shows_its_author_and_color() {
+        let (mut app, _ctx) = app();
+        app.run("notes.add", json!({"x": 20, "y": 20, "author": "Ann", "color": [1.0, 0.5, 0.75]})).unwrap();
+        app.run("notes.add", json!({"x": 120, "y": 80, "author": "Bob", "color": [0.25, 0.5, 1.0]})).unwrap();
+        app.ui.tool = Tool::Note;
+        app.ui.analysis.note_author = "Me".into();
+        app.ui.analysis.note_color = [1.0, 1.0, 0.51];
+        down(&mut app, 22.0, 22.0, egui::Modifiers::NONE);
+        up(&mut app, 22.0, 22.0);
+        assert_eq!(app.ui.analysis.note_selected, Some(0));
+        assert_eq!((app.ui.analysis.note_author.as_str(), app.ui.analysis.note_color), ("Ann", [1.0, 0.5, 0.75]));
+        down(&mut app, 122.0, 82.0, egui::Modifiers::NONE);
+        up(&mut app, 122.0, 82.0);
+        assert_eq!((app.ui.analysis.note_author.as_str(), app.ui.analysis.note_color), ("Bob", [0.25, 0.5, 1.0]));
+        // A click off the notes adds one with what the bar now shows, and leaves the notes as they were.
+        down(&mut app, 170.0, 40.0, egui::Modifiers::NONE);
+        up(&mut app, 170.0, 40.0);
+        let notes = app.session.active().unwrap().doc.notes.clone();
+        assert_eq!(notes.iter().map(|n| n.author.as_str()).collect::<Vec<_>>(), ["Ann", "Bob", "Bob"]);
+    }
+
     #[test]
     fn dialogs_open_and_run_their_commands() {
         let (mut app, ctx) = app();
@@ -1222,5 +1271,18 @@ pub(crate) mod tests {
         assert!(!empty.ui.status_error);
         assert!(empty.run("view.colorSamplers.add", json!({"x": 1, "y": 1})).is_err());
         assert!(empty.run("view.colorSamplers.list", json!({})).is_err());
+    }
+
+    #[test]
+    fn count_size_fields_send_whole_numbers_the_engine_applies() {
+        let p = count_size_params(7.6, 20.0);
+        assert_eq!(p, json!({"markerSize": 8, "labelSize": 20}));
+        assert!(p["markerSize"].is_u64() && p["labelSize"].is_u64());
+        assert_eq!(count_size_params(f32::NAN, 500.0), json!({"markerSize": 1, "labelSize": 72}));
+        let (mut app, _ctx) = app();
+        app.run("count.add", json!({"x": 10, "y": 10})).unwrap();
+        app.run("count.setGroup", count_size_params(8.0, 20.0)).unwrap();
+        let g = &app.session.active().unwrap().doc.measurement.count_groups[0];
+        assert_eq!((g.marker_size, g.label_size), (8, 20));
     }
 }

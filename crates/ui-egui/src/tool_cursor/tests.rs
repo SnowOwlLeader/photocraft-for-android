@@ -48,14 +48,17 @@ fn precise_and_tip_centre_crosshairs_have_distinct_hotspots() {
     assert!(alpha(&solid, solid.hotspot[0], solid.hotspot[1]) > 230);
 }
 
-/// Off Windows a tip stays within what X servers and hardware cursor planes take (256 px); a
-/// larger one falls back to the painted outline. Windows takes far larger cursors.
+/// On Linux a tip stays within what X servers and hardware cursor planes take (256 px); a larger
+/// one falls back to the painted outline. Windows and macOS take far larger cursors.
 #[test]
 fn cursor_bitmaps_stay_within_the_platform_limit() {
     let fits = |radius: f32| rasterize(&Shape::Circle { radius, centre: false }, 1.0).map(|i| i.size[0]);
+    let large = cfg!(any(target_os = "windows", target_os = "macos"));
     assert!(fits(100.0).is_some_and(|side| side <= 255));
-    assert_eq!(fits(200.0).is_some(), cfg!(target_os = "windows"));
+    assert_eq!(fits(200.0).is_some(), large);
+    assert_eq!(fits(1000.0).is_some(), large, "a 2000 px brush at 100 % still has a native outline");
     assert!(fits(200.0).is_none_or(|side| side <= 2048));
+    assert!(fits(1100.0).is_none(), "nothing past 2048 px");
 }
 
 #[test]
@@ -154,6 +157,65 @@ fn the_hand_is_a_bitmap_only_where_the_os_has_none() {
 }
 
 #[test]
+fn zoom_bitmaps_are_outlined_magnifiers_centred_on_the_lens_at_each_dpi() {
+    for scale in [1.0, 1.25, 1.5, 2.0, 3.0] {
+        let plus = rasterize(&Shape::Zoom { out: false }, scale).unwrap();
+        let minus = rasterize(&Shape::Zoom { out: true }, scale).unwrap();
+        for image in [&plus, &minus] {
+            let [x, y] = image.hotspot;
+            assert_eq!(image.size, [2 * x + 1, 2 * y + 1]);
+            assert_eq!(image.rgba.len(), usize::from(image.size[0]).pow(2) * 4);
+            assert!(image.size[0] <= (34.0 * scale) as u16, "no bigger than a stock cursor at {scale}: {:?}", image.size);
+            assert_eq!(alpha(image, 0, 0), 0, "nothing at the corners");
+            let handle = (9.0 * scale) as u16;
+            assert!(alpha(image, x + handle, y + handle) > 230, "the handle reaches down and right");
+            assert_eq!(alpha(image, x - handle, y - handle), 0, "and only that way");
+            let pixels = image.rgba.as_chunks::<4>().0;
+            assert!(pixels.iter().any(|p| p[3] > 230 && p[0] > 230), "a white lens");
+            assert!(pixels.iter().any(|p| p[3] > 100 && p[0] < 25), "with a black outline, readable on white");
+        }
+        let side = usize::from(plus.size[0]);
+        let red = |image: &CustomCursorImage, x: u16, y: u16| image.rgba[(usize::from(y) * side + usize::from(x)) * 4];
+        let [x, y] = plus.hotspot;
+        let up = y - (2.5 * scale) as u16;
+        assert!(red(&plus, x, y) < 60 && red(&minus, x, y) < 60, "both glyphs cross the hotspot");
+        assert!(red(&plus, x, up) < 60, "the plus has a vertical arm");
+        assert!(red(&minus, x, up) > 200, "the minus does not");
+    }
+}
+
+#[test]
+fn hostile_scales_get_no_zoom_bitmap() {
+    for scale in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0, 0.0, f32::MAX, 500.0] {
+        assert!(rasterize(&Shape::Zoom { out: false }, scale).is_none(), "{scale}");
+        assert!(rasterize(&Shape::Zoom { out: true }, scale).is_none(), "{scale}");
+    }
+}
+
+/// winit shows the plain arrow for `ZoomIn` and `ZoomOut` on Windows (#3735).
+#[test]
+fn the_magnifier_is_a_bitmap_only_where_the_os_has_none() {
+    let ctx = egui::Context::default();
+    ctx.add_plugin(CursorLifecycle);
+    for out in [false, true] {
+        let native = frame(&ctx, |ui| {
+            let icon = zoom_with(ui.ctx(), out, false);
+            ui.ctx().set_cursor_icon(icon);
+        });
+        assert_eq!(native.platform_output.cursor_icon, if out { CursorIcon::ZoomOut } else { CursorIcon::ZoomIn });
+        assert!(native.platform_output.cursor_image.is_none(), "macOS and the Linux themes draw their own magnifiers");
+
+        let bitmap = frame(&ctx, |ui| {
+            let icon = zoom_with(ui.ctx(), out, true);
+            ui.ctx().set_cursor_icon(icon);
+        });
+        let image = bitmap.platform_output.cursor_image.expect("Windows has no stock magnifier");
+        assert_eq!(image.rgba, rasterize(&Shape::Zoom { out }, 1.0).unwrap().rgba);
+        assert_eq!(bitmap.platform_output.cursor_icon, CursorIcon::Crosshair, "visible fallback if the OS rejects a bitmap");
+    }
+}
+
+#[test]
 fn unchanged_geometry_reuses_the_os_upload_and_dpi_invalidates_it() {
     let ctx = egui::Context::default();
     let shape = Shape::Circle { radius: 20.0, centre: false };
@@ -210,6 +272,40 @@ fn ordinary_brush_cursor_is_not_part_of_the_canvas_draw_list() {
     assert!(output.shapes.iter().any(|s| matches!(s.shape, egui::Shape::Circle(_))), "the full tip is not silently shrunk");
 }
 
+#[test]
+#[cfg(target_os = "linux")]
+fn scaled_wayland_paints_the_brush_outline_instead_of_an_os_bitmap() {
+    // Hyprland ignores the viewport winit sizes cursor bitmaps with: at 1.25 the outline was
+    // 1.25× too large and its centre 0.2 × its half-width right of and below where the brush
+    // painted. Off scale 1 on Wayland the outline is painted at the pointer, at its true size.
+    let run = |ctx: &egui::Context, native_ppp: f32| {
+        let mut input = egui::RawInput::default();
+        input.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(native_ppp);
+        let mut output = ctx.run_ui(input, |ui| {
+            let icon = circle(ui.painter(), pos2(100.0, 100.0), 20.0, false);
+            ui.ctx().set_cursor_icon(icon);
+        });
+        output.textures_delta.clear();
+        let circles: Vec<_> =
+            output.shapes.iter().filter_map(|s| if let egui::Shape::Circle(c) = &s.shape { Some((c.center, c.radius)) } else { None }).collect();
+        (output.platform_output.cursor_image.is_some(), output.platform_output.cursor_icon, circles)
+    };
+    let ctx = egui::Context::default();
+    ctx.add_plugin(CursorLifecycle);
+    set_wayland(&ctx, true);
+    for ppp in [1.25, 1.5, 2.0] {
+        let (bitmap, icon, circles) = run(&ctx, ppp);
+        assert!(!bitmap, "{ppp}: no OS bitmap");
+        assert_eq!(icon, CursorIcon::None, "{ppp}: the painted outline is the pointer");
+        assert!(!circles.is_empty() && circles.iter().all(|&(c, r)| c == pos2(100.0, 100.0) && r == 20.0), "{ppp}: {circles:?}");
+    }
+    let (bitmap, _, circles) = run(&ctx, 1.0);
+    assert!(bitmap && circles.is_empty(), "Wayland at scale 1 keeps the low-latency bitmap");
+    set_wayland(&ctx, false);
+    let (bitmap, _, circles) = run(&ctx, 1.25);
+    assert!(bitmap && circles.is_empty(), "X11 at 1.25 keeps the bitmap");
+}
+
 /// Run explicitly for visual QA: native cursors are absent from GPU screenshots.
 #[test]
 #[ignore = "writes target/tool-cursor-preview.png for visual inspection"]
@@ -224,6 +320,9 @@ fn write_cursor_preview() {
         (Shape::Hand { closed: true }, 1.0),
         (Shape::Hand { closed: false }, 1.5),
         (Shape::Hand { closed: true }, 2.0),
+        (Shape::Zoom { out: false }, 1.0),
+        (Shape::Zoom { out: true }, 1.0),
+        (Shape::Zoom { out: false }, 2.0),
     ];
     let (width, height) = (600_usize, cases.len() * 100);
     let mut rgba = vec![255; width * height * 4];
@@ -283,6 +382,80 @@ fn harness() -> Harness<'static, crate::PhotocraftApp> {
 
 #[test]
 #[cfg(not(target_arch = "wasm32"))]
+fn brush_cursor_follows_pen_orientation_6350() {
+    for control in ["penTilt", "rotation"] {
+        let mut h = harness();
+        h.state_mut()
+            .run(
+                "tools.setBrush",
+                json!({"brush": {
+                    "size": 60, "hardness": 1.0, "roundness": 0.25,
+                    "shapeDynamics": {"enabled": true, "angle": {"control": control}}
+                }}),
+            )
+            .unwrap();
+        h.state_mut().stylus.feed.set(Some(crate::stylus::PenSample { tilt_x: 45.0, ..Default::default() }));
+        h.run_steps(3);
+        let initial = h.output().platform_output.cursor_image.clone().expect("initial brush cursor");
+        h.state_mut().stylus.feed.set(Some(crate::stylus::PenSample { tilt_y: -45.0, rotation: 90.0, ..Default::default() }));
+        h.run_steps(3);
+        let turned = h.output().platform_output.cursor_image.clone().expect("turned brush cursor");
+        save_pen_cursor_image(&format!("{control}-initial"), &initial);
+        save_pen_cursor_image(&format!("{control}-turned"), &turned);
+        let pen = h.state().stylus.sample().expect("simulated pen reaches the canvas");
+        assert_eq!((pen.tilt_y, pen.rotation), (-45.0, 90.0));
+        let point = photocraft_paint::StrokePoint { tilt_y: pen.tilt_y, rotation: pen.rotation, ..Default::default() };
+        let step = photocraft_paint::dynamics::StepInput { point, direction: 0.0, initial_direction: 0.0, step: 0 };
+        let mut dabs = Vec::new();
+        photocraft_paint::dynamics::DabBuilder::new(&h.state().session.tools.brush).build(&step, &mut dabs);
+        assert_eq!(dabs.len(), 1);
+        assert!((dabs[0].angle.to_degrees() - 90.0).abs() < 0.001, "painted dab turns: {control}");
+        assert_ne!(initial.rgba, turned.rgba, "cursor must follow pen orientation: {control}");
+        // The dynamically rotated cursor must match the same tip set to that angle directly.
+        h.state_mut().session.tools.brush.shape_dynamics.enabled = false;
+        h.state_mut().session.tools.brush.angle = 90.0;
+        h.run_steps(3);
+        let reference = h.output().platform_output.cursor_image.clone().expect("static rotated reference");
+        assert_eq!(turned.size, reference.size);
+        assert_eq!(turned.hotspot, reference.hotspot);
+        assert_eq!(turned.rgba, reference.rgba, "dynamic cursor matches the dab angle: {control}");
+    }
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn round_cursor_shows_brush_projection_6350() {
+    let mut h = harness();
+    h.state_mut().session.tools.brush.shape_dynamics.enabled = true;
+    h.state_mut().session.tools.brush.shape_dynamics.brush_projection = true;
+    h.state_mut().stylus.feed.set(Some(crate::stylus::PenSample::default()));
+    h.run_steps(3);
+    let upright = h.output().platform_output.cursor_image.clone().unwrap();
+    h.state_mut().stylus.feed.set(Some(crate::stylus::PenSample { tilt_x: 60.0, ..Default::default() }));
+    h.run_steps(3);
+    let tilted = h.output().platform_output.cursor_image.clone().unwrap();
+    save_pen_cursor_image("projection-upright", &upright);
+    save_pen_cursor_image("projection-tilted", &tilted);
+    assert_ne!(upright.rgba, tilted.rgba, "a projected round brush must not keep a circular cursor");
+    h.state_mut().stylus.feed.set(None);
+    h.run_steps(3);
+    assert_eq!(upright.rgba, h.output().platform_output.cursor_image.clone().unwrap().rgba, "mouse restores the unprojected tip");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn save_pen_cursor_image(name: &str, cursor: &egui::CustomCursorImage) {
+    let Some(dir) = std::env::var_os("PHOTOCRAFT_CURSOR_OUTPUT") else { return };
+    let dir = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let image =
+        photocraft_codecs::Image::from_u8(u32::from(cursor.size[0]), u32::from(cursor.size[1]), photocraft_codecs::ChannelLayout::Rgba, cursor.rgba.to_vec())
+            .unwrap();
+    let png = photocraft_codecs::encode(&image, photocraft_codecs::Format::Png, &Default::default()).unwrap();
+    std::fs::write(dir.join(format!("{name}.png")), png).unwrap();
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
 fn brush_hover_uses_an_os_bitmap_that_survives_motion_but_not_tool_or_panel_changes() {
     let mut h = harness();
     let initial = h.output().platform_output.cursor_image.clone().expect("brush hover must reach the OS, not the painter");
@@ -312,6 +485,24 @@ fn brush_hover_uses_an_os_bitmap_that_survives_motion_but_not_tool_or_panel_chan
         assert_eq!(h.output().platform_output.cursor_icon, CursorIcon::Grab);
     }
 
+    // Likewise the Zoom tool's magnifier, a minus while ⌥ is held (#3735).
+    h.state_mut().ui.tool = crate::Tool::Zoom;
+    for out in [false, true] {
+        let modifiers = if out { Modifiers::ALT } else { Modifiers::NONE };
+        h.event(Event::ModifiersChanged(modifiers));
+        h.event(Event::PointerMoved(p + vec2(1.0, 0.0)));
+        h.run_steps(2);
+        let image = h.output().platform_output.cursor_image.clone();
+        if cfg!(target_os = "windows") {
+            let image = image.expect("the magnifier reaches the OS as a bitmap");
+            assert_eq!(image.rgba, rasterize(&Shape::Zoom { out }, h.ctx.pixels_per_point()).unwrap().rgba, "out: {out}");
+        } else {
+            assert!(image.is_none(), "the OS draws the magnifier");
+            assert_eq!(h.output().platform_output.cursor_icon, if out { CursorIcon::ZoomOut } else { CursorIcon::ZoomIn });
+        }
+    }
+    h.event(Event::ModifiersChanged(Modifiers::NONE));
+
     h.state_mut().ui.tool = crate::Tool::Brush;
     h.state_mut().run("prefs.set", json!({"path": "cursors.painting", "value": "standard"})).unwrap();
     h.run_steps(2);
@@ -339,4 +530,62 @@ fn painting_preference_and_zoom_change_the_native_cursor_without_changing_pointe
     h.event(Event::PointerButton { pos: pos + vec2(20.0, 0.0), button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
     h.run_steps(2);
     assert!(h.output().platform_output.cursor_image.as_ref().unwrap().size[0] > cross_size);
+}
+
+/// #4596: the close-path pointer is the centre cross with a ring below right.
+#[test]
+fn close_path_bitmap_has_the_centre_cross_and_a_ring_beside_it() {
+    for scale in [1.0, 2.0] {
+        let image = rasterize(&Shape::Outline { rings: vec![close_ring()].into(), centre: true }, scale).unwrap();
+        let [x, y] = image.hotspot;
+        let at = |dx: f32, dy: f32| alpha(&image, x + (dx * scale) as u16, y + (dy * scale) as u16);
+        assert!(at(0.0, 0.0) > 230 && at(2.0, 0.0) > 0, "the centre cross");
+        assert!(at(12.5, 9.0) > 0 && at(9.0, 12.5) > 0, "the ring around (9, 9)");
+        assert_eq!(at(9.0, 9.0), 0, "open in the middle");
+        assert_eq!(at(0.0, 9.0), 0, "and apart from the cross");
+    }
+}
+
+/// A big tip's outline is a thin ring in a large square: only the ring (and the centre mark) is
+/// evaluated, and the bitmap is exactly what evaluating every pixel gives.
+#[test]
+fn circle_bitmaps_evaluate_only_the_ring_and_match_every_pixel() {
+    let [dark, light] = crate::theme::Tokens::cursor_outline();
+    for (radius, scale, centre) in [(0.4, 1.0, true), (3.0, 1.0, false), (20.0, 1.25, true), (57.3, 2.0, false), (90.0, 1.0, true)] {
+        let shape = Shape::Circle { radius, centre };
+        let image = rasterize(&shape, scale).unwrap();
+        let [hot, _] = image.hotspot;
+        let side = usize::from(image.size[0]);
+        for row in 0..side {
+            for col in 0..side {
+                let (dx, dy) = (col as f32 - f32::from(hot), row as f32 - f32::from(hot));
+                let want = stroke_pixel(coverage(&shape, dx, dy, scale), dark, light);
+                let i = (row * side + col) * 4;
+                assert_eq!(image.rgba[i..i + 4], want, "radius {radius} at {scale}×, pixel ({col}, {row})");
+            }
+        }
+    }
+}
+
+/// The arrow is the handle's direction as the view shows it: turned with a rotated view and
+/// mirrored with a flipped one.
+#[test]
+fn resize_follows_the_view() {
+    use CursorIcon::{ResizeHorizontal as H, ResizeNeSw as NeSw, ResizeNwSe as NwSe, ResizeVertical as V};
+    let view = |rotation: f32, flip: bool| ViewXform {
+        rect: egui::Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0)),
+        zoom: 1.0,
+        center: [0.0, 0.0],
+        flip,
+        rotation,
+        aspect: 1.0,
+    };
+    // Right, down-right, down and down-left in the document.
+    let directions = [[1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [-1.0, 1.0]];
+    for (rotation, flip, want) in
+        [(0.0, false, [H, NwSe, V, NeSw]), (90.0, false, [V, NeSw, H, NwSe]), (45.0, false, [NwSe, V, NeSw, H]), (0.0, true, [H, NeSw, V, NwSe])]
+    {
+        let got = directions.map(|d| resize(d, &view(rotation, flip)));
+        assert_eq!(got, want, "view turned {rotation}°, flip {flip}");
+    }
 }

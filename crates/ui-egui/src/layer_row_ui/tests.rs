@@ -3,7 +3,7 @@
 
 use egui::{Modifiers, PointerButton, Pos2, Rect, pos2, vec2};
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use photocraft_doc::{Effect, LayerContent};
 use serde_json::json;
 
@@ -37,6 +37,8 @@ fn busy() -> photocraft_engine::Session {
         s.execute("layer.layerStyle.dropShadow", json!({"layer": g})).unwrap();
         prev = Some(g);
     }
+    // Group Layers creates collapsed groups (#5571); these tests start with every group open.
+    s.execute("layer.setExpanded", json!({"all": true, "expanded": true})).unwrap();
     s
 }
 
@@ -106,6 +108,26 @@ fn long_names_never_run_under_the_indicators() {
     }
 }
 
+/// A layer inside a group sits one step right of the group's row, so the hierarchy shows: its
+/// name used to start where the group's did. Top-level layers stay where they were.
+#[test]
+fn a_groups_layers_indent_past_the_group() {
+    let mut s = photocraft_engine::Session::new();
+    s.execute("file.new", json!({"width": 64, "height": 48})).unwrap();
+    let child = s.execute("layer.new.layer", json!({"name": "Child"})).unwrap()["layer"].as_u64().unwrap();
+    let group = s.execute("layer.groupLayers", json!({"name": "Group"})).unwrap()["layer"].as_u64().unwrap();
+    // Group Layers creates the group collapsed; open it so the panel lists its layers.
+    s.execute("layer.setExpanded", json!({"layer": group, "expanded": true})).unwrap();
+    let top = s.execute("layer.new.layer", json!({"name": "Top"})).unwrap()["layer"].as_u64().unwrap();
+    let h = harness(s, 1.0, "promedium", 290.0);
+    let rows = recorded(&h.ctx);
+    let left = |id: u64| rows.iter().find(|r| r.layer == id).and_then(|r| r.name).map(|n| n.left()).unwrap_or_else(|| panic!("layer {id} drawn"));
+    let step = crate::layer_tree_ui::TRIANGLE_W;
+    assert!((left(child) - left(group) - step).abs() < 0.5, "child {} vs group {}", left(child), left(group));
+    assert!((left(group) - left(top) - step).abs() < 0.5, "a top-level layer keeps its place: {} vs group {}", left(top), left(group));
+}
+
+/// A primary click at `at`: hover, press and release a frame apart, then let the panel settle.
 fn click(h: &mut Harness<'_, PhotocraftApp>, at: Pos2) {
     h.hover_at(at);
     h.run_steps(1);
@@ -171,7 +193,7 @@ fn the_eyes_on_the_effects_rows_hide_and_show_effects() {
     let steps = |h: &Harness<'_, PhotocraftApp>| h.state().session.active().unwrap().history.past_len();
     let eye = |h: &Harness<'_, PhotocraftApp>, row: &str| {
         let r = h.get_by_label(row).rect();
-        pos2(r.left() + 15.0, r.center().y)
+        pos2(r.left() + 45.0, r.center().y)
     };
     let (settings, n) = (h.state().session.active().unwrap().doc.layer(photocraft_doc::LayerId(id)).unwrap().effects.items.clone(), steps(&h));
     assert_eq!(fx(&h), (true, vec![true, true]));
@@ -564,4 +586,104 @@ fn mobile_swipe_scrolls_layers_without_reordering() {
     let after = recorded(&h.ctx).iter().find(|r| r.layer == id).unwrap().row.top();
     assert!(after < before - 40.0, "layer swipe must scroll: {before} -> {after}");
     assert_eq!(h.state().session.active().unwrap().revision, revision);
+}
+
+/// Integration regression: a display preference must resize the *actual painted*
+/// thumbnails and row hitboxes, not only its Preview dialog.
+#[test]
+fn panel_thumbnail_sizes_change_real_row_geometry() {
+    use crate::state::LayerThumbnailSize;
+    let mut session = photocraft_engine::Session::new();
+    session.execute("file.new", json!({"width": 64, "height": 48})).unwrap();
+    session.execute("layer.new.layer", json!({"name": "Photo"})).unwrap();
+    session.execute("edit.fill", json!({"color": "#9acb32"})).unwrap();
+    let layer = session.active().unwrap().active_layer.unwrap();
+    let mut h = harness(session, 1.0, "promedium", 290.0);
+    for (size, expected_thumb, expected_row) in [
+        (LayerThumbnailSize::None, 0.0, 23.0),
+        (LayerThumbnailSize::Small, 18.0, 32.0),
+        (LayerThumbnailSize::Medium, 24.0, 32.0),
+        (LayerThumbnailSize::Large, 48.0, 56.0),
+    ] {
+        h.state_mut().ui.layers_panel_options.thumbnail_size = size;
+        h.run_steps(5);
+        let found = recorded(&h.ctx).into_iter().find(|r| r.layer == layer.0).expect("visible layer row");
+        assert!((found.row.height() - expected_row).abs() < 0.1, "{size:?}: row {}", found.row.height());
+        match found.thumbnail {
+            Some(rect) => assert!((rect.width() - expected_thumb).abs() < 0.1, "{size:?}: thumbnail {}", rect.width()),
+            None => assert_eq!(expected_thumb, 0.0, "{size:?} should display a thumbnail"),
+        }
+        assert!(found.name.is_some(), "{size:?}: layer name still visible");
+    }
+}
+
+/// One layer per lock, each with only that lock set (#4158).
+fn one_lock_each() -> (photocraft_engine::Session, Vec<(&'static str, u64)>) {
+    let mut s = photocraft_engine::Session::new();
+    s.execute("file.new", json!({"width": 64, "height": 48})).unwrap();
+    let mut ids = Vec::new();
+    for key in ["transparency", "pixels", "position", "artboard", "all"] {
+        let id = s.execute("layer.new.layer", json!({"name": key})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("layer.setProps", json!({"layer": id, "locks": {key: true}})).unwrap();
+        ids.push((key, id));
+    }
+    (s, ids)
+}
+
+#[test]
+fn every_lock_shows_the_lock_icon_on_the_row() {
+    // #4158: "Lock image pixels" and the artboard lock left the row without its lock icon.
+    // Photoshop shows it whenever any lock is set.
+    let (s, ids) = one_lock_each();
+    let doc = &s.active().unwrap().doc;
+    for &(key, id) in &ids {
+        let l = doc.layers.iter().find(|l| l.id.0 == id).unwrap();
+        assert_eq!(super::reserved_width(l), super::RIGHT_PAD + super::ICON_W + super::GAP, "{key}: room for the lock icon");
+    }
+    let h = harness(s, 1.0, "promedium", 290.0);
+    let rows = recorded(&h.ctx);
+    for &(key, id) in &ids {
+        let r = rows.iter().find(|r| r.layer == id).unwrap_or_else(|| panic!("{key}: row drawn"));
+        assert!(r.indicators.iter().any(|(k, _)| *k == Indicator::Lock), "{key}: lock icon drawn ({:?})", r.indicators);
+    }
+}
+
+#[test]
+fn the_studio_lock_button_shows_every_lock() {
+    // #4158: the simple themes' lock button drew "unlocked" for a pixels or artboard lock, though
+    // clicking it then unlocked the layer.
+    for key in ["transparency", "pixels", "position", "artboard", "all"] {
+        let mut s = photocraft_engine::Session::new();
+        s.execute("file.new", json!({"width": 64, "height": 48})).unwrap();
+        s.execute("layer.new.layer", json!({"name": key})).unwrap();
+        s.execute("layer.setProps", json!({"locks": {key: true}})).unwrap();
+        let h = harness(s, 1.0, "studio", 290.0);
+        assert_eq!(h.get_by_label("Lock layer").accesskit_node().toggled(), Some(egui::accesskit::Toggled::True), "{key}");
+    }
+}
+
+#[test]
+fn clicking_the_lock_icon_on_a_row_unlocks_the_layer() {
+    // #4723: the row's lock icon was only painted. In Photoshop a click on it clears every lock,
+    // and on the Background makes it a normal layer.
+    let (s, ids) = one_lock_each();
+    let bg = s.active().unwrap().doc.background().unwrap().id;
+    let mut h = harness(s, 1.0, "promedium", 290.0);
+    let active = h.state().session.active().unwrap().active_layer;
+    let lock_icon = |h: &Harness<'_, PhotocraftApp>, id: u64| {
+        let row = recorded(&h.ctx).into_iter().find(|r| r.layer == id).unwrap();
+        row.indicators.into_iter().find(|(k, _)| *k == Indicator::Lock).unwrap_or_else(|| panic!("lock icon on {id}")).1.center()
+    };
+    for &(key, id) in &ids {
+        let p = lock_icon(&h, id);
+        click(&mut h, p);
+        let d = h.state().session.active().unwrap();
+        assert!(!d.doc.layer(photocraft_doc::LayerId(id)).unwrap().locks.any(), "{key}: unlocked");
+        assert_eq!(d.active_layer, active, "{key}: the lock icon doesn't select");
+    }
+    let p = lock_icon(&h, bg.0);
+    click(&mut h, p);
+    let doc = &h.state().session.active().unwrap().doc;
+    assert!(doc.background().is_none(), "the Background became a normal layer");
+    assert!(!doc.layer(bg).unwrap().locks.any());
 }

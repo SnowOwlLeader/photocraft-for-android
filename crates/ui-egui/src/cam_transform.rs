@@ -59,6 +59,7 @@ pub(crate) fn begin(app: &mut PhotocraftApp, offset: [i32; 2]) -> bool {
         made: None,
         mode: Default::default(),
         content_aware: None,
+        skew_v: 0.0,
     };
     app.ui.cam_transform = Some(CamTransform { document, revision, offset, frame, gesture: None });
     app.ui.status = crate::i18n::fmt(tl!("Scale or rotate the moved area, then press {key}"), &[("key", &crate::shortcuts::pretty("Enter"))]);
@@ -112,6 +113,17 @@ pub(crate) fn cancel_stale(app: &mut PhotocraftApp) {
     }
 }
 
+/// `paint.contentAwareMove`'s params for the box's placement and the options bar.
+pub(crate) fn params(app: &PhotocraftApp, place: &Placement) -> serde_json::Value {
+    let mut p = crate::retouch_ui::content_aware_move_params(app, place.offset);
+    if !place.is_plain_move() {
+        p["scaleX"] = place.scale[0].into();
+        p["scaleY"] = place.scale[1].into();
+        p["rotate"] = place.rotate.into();
+    }
+    p
+}
+
 /// ↩ / ✓: the move with the transformed patch, as one background job and History step.
 pub(crate) fn commit(app: &mut PhotocraftApp) {
     cancel_stale(app);
@@ -122,12 +134,7 @@ pub(crate) fn commit(app: &mut PhotocraftApp) {
         crate::retouch_ui::patch_hint(app);
         return;
     }
-    let mut p = crate::retouch_ui::content_aware_move_params(app, place.offset);
-    if !place.is_plain_move() {
-        p["scaleX"] = place.scale[0].into();
-        p["scaleY"] = place.scale[1].into();
-        p["rotate"] = place.rotate.into();
-    }
+    let p = params(app, &place);
     if let Err(e) = app.run("paint.contentAwareMove", p) {
         app.ui.status = e;
         app.ui.status_error = true;
@@ -203,13 +210,10 @@ pub(crate) fn cursor(app: &PhotocraftApp, ctx: &egui::Context, xf: &ViewXform, p
         Some([(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0])
     };
     Some(match h {
-        Hit::Corner(i) => {
-            let (a, b) = (q.get(i)?, q.get((i + 2) % 4)?);
-            crate::type_transform::resize_cursor([a[0] - b[0], a[1] - b[1]], xf.flip)
-        }
+        Hit::Corner(i) => crate::tool_cursor::corner_resize(&q, i, xf),
         Hit::Edge(i) => {
             let (a, b) = (mid(i)?, mid(i + 2)?);
-            crate::type_transform::resize_cursor([a[0] - b[0], a[1] - b[1]], xf.flip)
+            crate::tool_cursor::resize([a[0] - b[0], a[1] - b[1]], xf)
         }
         Hit::Outside => {
             crate::type_transform::rotation_cursor(ctx, p);

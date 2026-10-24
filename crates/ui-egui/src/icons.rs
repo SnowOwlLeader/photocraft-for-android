@@ -87,7 +87,7 @@ pub fn tool_icon(t: Tool) -> &'static str {
         Tool::Move => "move",
         Tool::Artboard => "artboard",
         Tool::RectMarquee => "square-dashed",
-        Tool::EllipseMarquee => "circle-dashed",
+        Tool::EllipseMarquee => "ellipse-dashed",
         Tool::SingleRowMarquee => "marquee-row",
         Tool::SingleColumnMarquee => "marquee-column",
         Tool::Brush => "brush",
@@ -109,9 +109,9 @@ pub fn tool_icon(t: Tool) -> &'static str {
         Tool::Crop => "crop",
         Tool::PerspectiveCrop => "perspective-crop",
         Tool::Slice => "slice-knife",
-        Tool::SliceSelect => "square-dashed-mouse-pointer",
+        Tool::SliceSelect => "slice-select",
         Tool::Frame => "frame-placeholder",
-        Tool::Gradient => "blend",
+        Tool::Gradient => "gradient",
         Tool::PaintBucket => "paint-bucket",
         Tool::Type | Tool::VerticalType => "type",
         Tool::HorizontalTypeMask => "type-mask",
@@ -133,7 +133,7 @@ pub fn tool_icon(t: Tool) -> &'static str {
         Tool::Dodge => "lollipop",
         Tool::Burn => "flame",
         Tool::Sponge => "cloud",
-        Tool::QuickSelection => "circle-dashed",
+        Tool::QuickSelection => "quick-selection",
         Tool::ObjectSelection => "square-dashed-mouse-pointer",
         Tool::Pen => "pen-tool",
         Tool::FreeformPen => "pen-freeform",
@@ -177,6 +177,12 @@ pub fn button(ui: &mut egui::Ui, name: &str, box_size: f32, selected: bool, tool
 
 /// Square icon button with an explicit glyph size, independent of its hit area.
 pub fn button_with_icon_size(ui: &mut egui::Ui, name: &str, box_size: f32, icon_size: f32, selected: bool, tooltip: &str) -> Response {
+    button_with_icon_size_tip(ui, name, box_size, icon_size, selected, tooltip, true)
+}
+
+/// [`button_with_icon_size`] whose tooltip shows only when `show_tip`; the tooltip text still
+/// names the button (for screen readers and tests) when it is hidden.
+pub fn button_with_icon_size_tip(ui: &mut egui::Ui, name: &str, box_size: f32, icon_size: f32, selected: bool, tooltip: &str, show_tip: bool) -> Response {
     let t = Tokens::get(ui.ctx());
     let style = IconButtonStyle {
         normal: ButtonVisuals { fill: Color32::TRANSPARENT, stroke: egui::Stroke::NONE, icon: t.icon },
@@ -190,7 +196,7 @@ pub fn button_with_icon_size(ui: &mut egui::Ui, name: &str, box_size: f32, icon_
     let resp = IconButton::new(label, Vec2::splat(box_size), &style).selected(selected).show(ui, |ui, rect, tint| {
         paint(ui, rect, name, icon_size, tint);
     });
-    if tooltip.is_empty() { resp } else { resp.on_hover_text(label) }
+    if tooltip.is_empty() || !show_tip { resp } else { resp.on_hover_text(label) }
 }
 
 /// Rail toggle: "on" gets a quiet filled background and full-strength icon (no accent).
@@ -218,6 +224,110 @@ mod tests {
         for t in Tool::ALL {
             assert!(exists(tool_icon(t)), "{t:?}");
         }
+        assert_eq!(tool_icon(Tool::Gradient), "gradient");
+        assert_ne!(tool_icon(Tool::Gradient), tool_icon(Tool::PaintBucket));
+    }
+
+    #[test]
+    fn gradient_tool_icon_rasterizes_left_to_right_ramp() {
+        let egui::ImageSource::Bytes { bytes, .. } = white_icons().source(tool_icon(Tool::Gradient)) else {
+            panic!("icon source must be embedded bytes");
+        };
+        let image = egui_extras::image::load_svg_bytes_with_size(
+            bytes.as_ref(),
+            egui::load::SizeHint::Size { width: 24, height: 24, maintain_aspect_ratio: true },
+            &Default::default(),
+        )
+        .unwrap();
+        let left_alpha = image[(6, 12)].a();
+        let mid_alpha = image[(12, 12)].a();
+        let right_alpha = image[(18, 12)].a();
+        assert!(
+            left_alpha > mid_alpha && mid_alpha > right_alpha,
+            "interior ramp should fade from left ({left_alpha}) through middle ({mid_alpha}) to right ({right_alpha})"
+        );
+    }
+
+    /// Rasterize an icon to its ink mask at `size` px.
+    fn ink(name: &str, size: u32) -> Vec<bool> {
+        let egui::ImageSource::Bytes { bytes, .. } = white_icons().source(name) else { panic!("icon must be embedded bytes") };
+        let image = egui_extras::image::load_svg_bytes_with_size(
+            bytes.as_ref(),
+            egui::load::SizeHint::Size { width: size, height: size, maintain_aspect_ratio: true },
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(image.size, [size as usize; 2]);
+        image.pixels.iter().map(|p| p.a() > 16).collect()
+    }
+
+    #[test]
+    fn quick_selection_icon_differs_from_ellipse_marquee() {
+        // #5116: Quick Selection used to reuse the Ellipse Marquee's dashed circle.
+        assert_ne!(tool_icon(Tool::QuickSelection), tool_icon(Tool::EllipseMarquee));
+        for size in [14_u32, 28] {
+            let (quick, ellipse) = (ink(tool_icon(Tool::QuickSelection), size), ink(tool_icon(Tool::EllipseMarquee), size));
+            let shared = quick.iter().zip(&ellipse).filter(|(a, b)| **a && **b).count();
+            let union = quick.iter().zip(&ellipse).filter(|(a, b)| **a || **b).count();
+            assert!(union > 0, "icons must have ink at {size}px");
+            let overlap = shared as f32 / union as f32;
+            assert!(overlap < 0.5, "the two glyphs must read as distinct: {overlap:.2} of their ink overlaps at {size}px");
+            // The dashed selection "C" must actually rasterize down the left edge, where the brush has no ink.
+            let s = size as usize;
+            assert!(quick.iter().enumerate().any(|(i, a)| *a && i % s < s / 5), "the dashed selection edge is missing at {size}px");
+        }
+    }
+
+    #[test]
+    fn slice_select_icon_is_its_own() {
+        // #7859: Slice Select reused Object Selection's dashed square with a pointer. As in
+        // Photoshop it is the Slice knife with a pointer: unlike Object Selection, and the Slice
+        // tool's knife plus ink of its own (the pointer).
+        assert_ne!(tool_icon(Tool::SliceSelect), tool_icon(Tool::ObjectSelection));
+        assert_ne!(tool_icon(Tool::SliceSelect), tool_icon(Tool::Slice));
+        for size in [14_u32, 28] {
+            let select = ink(tool_icon(Tool::SliceSelect), size);
+            assert!(select.iter().any(|&pixel| pixel), "Slice Select must have ink at {size}px");
+            let object = ink(tool_icon(Tool::ObjectSelection), size);
+            let shared = select.iter().zip(&object).filter(|(a, b)| **a && **b).count();
+            let union = select.iter().zip(&object).filter(|(a, b)| **a || **b).count();
+            assert!(union > 0, "icons must have ink at {size}px");
+            let overlap = shared as f32 / union as f32;
+            assert!(overlap < 0.5, "Slice Select and Object Selection must read as distinct: {overlap:.2} of their ink overlaps at {size}px");
+            let slice = ink(tool_icon(Tool::Slice), size);
+            let own = select.iter().zip(&slice).filter(|(a, b)| **a && !**b).count();
+            let total = select.iter().filter(|a| **a).count();
+            assert!(own as f32 >= 0.3 * total as f32, "the pointer sets Slice Select apart from Slice: {own} of {total} pixels at {size}px");
+        }
+    }
+
+    /// Ink bounding box `(width, height)` of a rasterized mask.
+    fn ink_extent(mask: &[bool], size: u32) -> (usize, usize) {
+        let s = size as usize;
+        let (xs, ys): (Vec<usize>, Vec<usize>) = mask.iter().enumerate().filter(|(_, a)| **a).map(|(i, _)| (i % s, i / s)).unzip();
+        let span = |v: &[usize]| v.iter().max().zip(v.iter().min()).map_or(0, |(hi, lo)| hi - lo + 1);
+        (span(&xs), span(&ys))
+    }
+
+    #[test]
+    fn ellipse_marquee_icon_is_a_wide_ellipse() {
+        // #6875: Photoshop's Elliptical Marquee glyph is a horizontal ellipse, not a circle.
+        assert_ne!(tool_icon(Tool::EllipseMarquee), "circle-dashed");
+        for size in [14_u32, 28] {
+            let (w, h) = ink_extent(&ink(tool_icon(Tool::EllipseMarquee), size), size);
+            assert!(w as f32 >= h as f32 * 1.15, "ellipse marquee ink is {w}x{h} at {size}px: not wider than tall");
+        }
+    }
+
+    #[test]
+    fn quick_selection_icon_is_a_tall_selection_with_a_brush() {
+        // #6875: Photoshop's Quick Selection glyph is a dashed, upright rounded "C" with a brush.
+        let size = 28_u32;
+        let s = size as usize;
+        let quick = ink(tool_icon(Tool::QuickSelection), size);
+        // The left edge of the selection runs most of the icon's height.
+        let left_rows = (0..s).filter(|y| (0..s / 5).any(|x| quick.get(y * s + x).copied().unwrap_or(false))).count();
+        assert!(left_rows * 5 > s * 2, "left selection edge covers only {left_rows} of {s} rows");
     }
 
     #[test]

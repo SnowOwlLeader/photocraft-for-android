@@ -1,4 +1,4 @@
-//! Custom widgets for the Photocraft look: cards with pill tabs, thin sliders with round knobs,
+//! Custom widgets for the PhotoCraft look: cards with pill tabs, thin sliders with round knobs,
 //! monospace value fields with dimmed units, toggle switches, primary/secondary buttons.
 
 use egui::{Align2, Color32, CornerRadius, Pos2, Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2};
@@ -17,6 +17,9 @@ pub use type_ahead::list_open as dropdown_list_open;
 /// The setting is local to this popup's Ui and leaves other themes unchanged.
 pub fn style_spectrum_popup_menu(ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
+    // The 6 pt gap between rows was outside both buttons, so a drag across a menu
+    // dropped the highlight (#4602). Padding stays inside the row, which is the hit target.
+    ui.spacing_mut().item_spacing.y = 0.0;
     if !t.pro {
         return;
     }
@@ -26,7 +29,9 @@ pub fn style_spectrum_popup_menu(ui: &mut Ui) {
     v.widgets.hovered.bg_fill = t.accent;
     v.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
     v.widgets.hovered.bg_stroke = Stroke::NONE;
-    v.widgets.hovered.corner_radius = CornerRadius::same(3);
+    v.widgets.inactive.corner_radius = CornerRadius::ZERO;
+    v.widgets.hovered.corner_radius = CornerRadius::ZERO;
+    v.widgets.active.corner_radius = CornerRadius::ZERO;
 }
 
 /// An accent insertion line on one edge of `r` while a drag hovers it (vertical: on its left or,
@@ -178,6 +183,9 @@ pub fn panel_footer<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     ui.painter().line_segment([pos2(r.left() - m.left as f32, y), pos2(r.right() + m.right as f32, y)], Stroke::new(1.0, t.separator));
     let bar = Rect::from_min_size(pos2(r.left(), r.top() + 1.0), vec2(r.width(), FOOTER_BAR));
     let mut bar_ui = ui.new_child(egui::UiBuilder::new().max_rect(bar).layout(egui::Layout::right_to_left(egui::Align::Center)));
+    // The bar runs on over the body's bottom margin, past where the body's own clip ends: without
+    // this its buttons were cut off there, a 26 px hover highlight drawn about 21 px tall.
+    bar_ui.set_clip_rect(bar_ui.clip_rect().union(bar));
     bar_ui.spacing_mut().item_spacing.x = 2.0;
     add(&mut bar_ui)
 }
@@ -220,10 +228,30 @@ fn pro_panel(
     CardResponse::new(strip_resp, mresp, tabs_out)
 }
 
+/// The panel menu button (hamburger in Pro, ellipsis in Studio), matching the dock and cards.
+pub fn panel_menu_button(ui: &mut Ui) -> Response {
+    let t = Tokens::get(ui.ctx());
+    let size = vec2(20.0, 20.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let tint = crate::icons::button_chrome(ui, rect, false, resp.hovered());
+    if t.pro {
+        for k in 0..3 {
+            let y = rect.center().y - 3.5 + k as f32 * 3.5;
+            ui.painter().line_segment([pos2(rect.center().x - 5.0, y), pos2(rect.center().x + 5.0, y)], Stroke::new(1.0, tint));
+        }
+    } else {
+        crate::icons::paint(ui, rect, "ellipsis", 14.0, tint);
+    }
+    let tip = tl!("Panel menu");
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tip));
+    resp.on_hover_text(tip)
+}
+
 pub fn pill_tab(ui: &mut Ui, label: &str, selected: bool) -> Response {
     let t = Tokens::get(ui.ctx());
+    let translated = tl!(label);
     let font = theme::medium(12.5);
-    let galley = ui.painter().layout_no_wrap(tl!(label).to_owned(), font, t.text);
+    let galley = ui.painter().layout_no_wrap(translated.to_string(), font, t.text);
     let size = vec2(galley.size().x + 20.0, 24.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     if selected {
@@ -236,6 +264,7 @@ pub fn pill_tab(ui: &mut Ui, label: &str, selected: bool) -> Response {
     }
     let color = if selected { t.text } else { t.text_dim };
     ui.painter().galley_with_override_text_color(rect.center() - galley.size() / 2.0, galley, color);
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, translated));
     resp
 }
 
@@ -276,6 +305,11 @@ pub fn compact_value_field(ui: &mut Ui, value: &mut f32, range: std::ops::RangeI
     value_field_box(ui, value, range, suffix, vec2(width, height), 0.0, FieldOpts::default()).0
 }
 
+/// A compact field whose mouse scrub wraps at the native fullscreen viewport's horizontal edges.
+pub(crate) fn compact_wrapping_value_field(ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, suffix: &str, size: Vec2) -> Response {
+    value_field_box(ui, value, range, suffix, size, 0.0, FieldOpts { wrap_drag: true, ..Default::default() }).0
+}
+
 /// A size dialog's unit key (`px`, `in`, `cm`, `mm`, `pt`, `pica`, `percent`) as a unit.
 pub fn unit_of_key(key: &str) -> photocraft_engine::prefs::Unit {
     use photocraft_engine::prefs::Unit;
@@ -300,7 +334,7 @@ pub fn unit_decimals(key: &str) -> u32 {
 /// A [`value_field`] showing `decimals` decimal places instead of the one (or two, for a small
 /// range) it picks itself: the ruler units need their own precision (#2434).
 pub fn value_field_prec(ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, suffix: &str, width: f32, decimals: u32) -> Response {
-    value_field_in(ui, value, range, suffix, width, 0.0, FieldOpts { decimals: Some(decimals), units: None }).0
+    value_field_in(ui, value, range, suffix, width, 0.0, FieldOpts { decimals: Some(decimals), ..Default::default() }).0
 }
 
 /// A field's unit and the resolution a typed unit converts at (`1in` in a px field).
@@ -316,7 +350,26 @@ pub struct FieldUnits {
 /// A [`value_field_prec`] without a suffix, whose unit is chosen beside it (Image Size and New
 /// Document's unit menus) and converts typed units at that dialog's own resolution.
 pub fn value_field_units(ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, width: f32, decimals: u32, units: FieldUnits) -> Response {
-    value_field_in(ui, value, range, "", width, 0.0, FieldOpts { decimals: Some(decimals), units: Some(units) }).0
+    value_field_in(ui, value, range, "", width, 0.0, FieldOpts { decimals: Some(decimals), units: Some(units), ..Default::default() }).0
+}
+
+/// A [`value_field_prec`] in `units` whose 100 % is a length of `extent` px (Free Transform's W
+/// and H): a length typed while it shows percent becomes that share of `extent` (`40px`, `2in`),
+/// and a percentage typed while it shows a length becomes that share of `extent` (`50%`), at
+/// `units`' resolution (#6284). The field keeps its own unit.
+#[allow(clippy::too_many_arguments)]
+pub fn value_field_extent(
+    ui: &mut Ui,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    suffix: &str,
+    width: f32,
+    decimals: u32,
+    units: FieldUnits,
+    extent: f64,
+) -> Response {
+    let opts = FieldOpts { decimals: Some(decimals), units: Some(units), extent: Some(extent), ..Default::default() };
+    value_field_in(ui, value, range, suffix, width, 0.0, opts).0
 }
 
 fn field_resolution_id() -> egui::Id {
@@ -353,6 +406,10 @@ struct LabelScrub {
     rect: Rect,
     /// How far right of the label the field may start (the whole row for a slider row).
     max_gap: f32,
+    /// Options captions defer interaction until the adjacent field bounds are known.
+    option_area: bool,
+    /// An options icon's tooltip, shown by the drag area laid over it (which takes its hover).
+    tip: Option<&'static str>,
     /// Whole steps to move the value (left negative; Shift ×10, Alt a tenth as fast).
     steps: f32,
     started: bool,
@@ -371,9 +428,46 @@ pub fn scrub_label(ui: &Ui, label: &Response) -> Response {
     scrub_label_within(ui, label, 24.0)
 }
 
+/// A tool-options caption whose scrub target includes the adjacent field's outer box.
+/// Keep the original label bounds for linking; register the hit area before the numeric editor.
+pub fn scrub_option_label(ui: &Ui, label: &Response) {
+    scrub_option_area(ui, label, None);
+}
+
+/// [`scrub_option_label`] for an icon with tooltip `tip`. The field's drag area is laid over the
+/// icon after it, so egui hovers the area and not the icon: `on_hover_text` on the icon never shows.
+pub fn scrub_option_icon(ui: &Ui, icon: &Response, tip: &'static str) {
+    scrub_option_area(ui, icon, Some(tip));
+}
+
+fn scrub_option_area(ui: &Ui, label: &Response, tip: Option<&'static str>) {
+    let scrub = LabelScrub {
+        pass: ui.ctx().cumulative_pass_nr(),
+        label: label.id.with("pc-option-scrub"),
+        rect: label.rect,
+        max_gap: 24.0,
+        option_area: true,
+        tip,
+        steps: 0.0,
+        started: false,
+        dragging: false,
+        stopped: false,
+    };
+    ui.data_mut(|d| d.insert_temp(label_scrub_id(), scrub));
+}
+
 fn scrub_label_within(ui: &Ui, label: &Response, max_gap: f32) -> Response {
     // Drag only, not focusable: Tab goes to the value field, not to its label as well.
     let resp = label.interact(Sense::DRAG);
+    let scrub = label_scrub_response(ui, &resp, label.rect, max_gap);
+    ui.data_mut(|d| {
+        d.insert_temp(label_scrub_id(), scrub);
+        d.insert_temp(resp.id.with("pc-scrub-linked"), false);
+    });
+    resp
+}
+
+fn label_scrub_response(ui: &Ui, resp: &Response, original_rect: Rect, max_gap: f32) -> LabelScrub {
     // Whether a field took this label's drags last frame: only then is it scrubby.
     let linked = ui.data(|d| d.get_temp::<bool>(resp.id.with("pc-scrub-linked"))).unwrap_or(false);
     if linked && resp.enabled() && (resp.hovered() || resp.dragged()) {
@@ -403,21 +497,18 @@ fn scrub_label_within(ui: &Ui, label: &Response, max_gap: f32) -> Response {
         steps = acc.trunc();
         ui.data_mut(|d| d.insert_temp(acc_id, acc - steps));
     }
-    let scrub = LabelScrub {
+    LabelScrub {
         pass: ui.ctx().cumulative_pass_nr(),
         label: resp.id,
-        rect: resp.rect,
+        rect: original_rect,
         max_gap,
+        option_area: false,
+        tip: None,
         steps,
         started: resp.drag_started(),
         dragging: resp.dragged(),
         stopped: resp.drag_stopped(),
-    };
-    ui.data_mut(|d| {
-        d.insert_temp(label_scrub_id(), scrub);
-        d.insert_temp(resp.id.with("pc-scrub-linked"), false);
-    });
-    resp
+    }
 }
 
 /// The label drag left for the field at `rect` this frame, if its label is just left of it on
@@ -442,8 +533,26 @@ fn take_label_scrub(ui: &Ui, rect: Rect) -> Option<LabelScrub> {
 struct FieldOpts {
     /// Decimal places shown (default: one, or two for a small range).
     decimals: Option<u32>,
+    /// Arrow-key and scrub step follow `decimals` (adjustment rows via [`slider_row_prec`], #5914).
+    step_from_decimals: bool,
     /// The unit typed units convert into (default: the suffix's, at [`set_field_resolution`]).
     units: Option<FieldUnits>,
+    /// The length (px) 100 % stands for, so lengths and percentages convert into each other.
+    extent: Option<f64>,
+    wrap_drag: bool,
+}
+
+/// Arrow-key and drag step for a value field: [`FieldOpts::step_from_decimals`] uses `decimals`;
+/// otherwise the range width picks 0.01 (≤10) or 1.0.
+fn field_step(range: &std::ops::RangeInclusive<f32>, decimals: Option<u32>, step_from_decimals: bool) -> f32 {
+    if step_from_decimals && let Some(d) = decimals {
+        return 10f32.powi(-(d.min(6) as i32));
+    }
+    if *range.end() - *range.start() <= 10.0 { 0.01 } else { 1.0 }
+}
+
+fn field_fine(range: &std::ops::RangeInclusive<f32>, decimals: Option<u32>, step_from_decimals: bool) -> bool {
+    if step_from_decimals { decimals.is_some_and(|d| d > 0) || *range.end() - *range.start() <= 10.0 } else { *range.end() - *range.start() <= 10.0 }
 }
 
 /// A [`value_field`] that leaves `trailing` points free inside its box, right of the suffix, and
@@ -470,16 +579,31 @@ fn value_field_box(
     trailing: f32,
     opts: FieldOpts,
 ) -> (Response, Rect) {
-    let FieldOpts { decimals, units } = opts;
+    let FieldOpts { decimals, step_from_decimals, units, extent, wrap_drag } = opts;
     let t = Tokens::get(ui.ctx());
     let (rect, slot) = ui.allocate_exact_size(size, Sense::hover());
-    let scrub = take_label_scrub(ui, rect);
+    let scrub = take_label_scrub(ui, rect).map(|s| {
+        if !s.option_area {
+            return s;
+        }
+        // A direct click+drag target avoids egui snapping the padding/suffix to the nearby
+        // numeric button. It is not focusable; the editor drawn next wins inside its bounds.
+        // Preserve a popup field's trailing arrow, and never extend outside the UI clip.
+        let hit = Rect::from_min_max(pos2(s.rect.left(), rect.top()), pos2(rect.right() - trailing, rect.bottom())).intersect(ui.clip_rect());
+        let mut resp = ui.interact(hit, s.label, Sense::CLICK | Sense::DRAG);
+        if let Some(tip) = s.tip
+            && resp.hover_pos().is_some_and(|p| s.rect.contains(p))
+        {
+            resp = resp.on_hover_text(tip);
+        }
+        label_scrub_response(ui, &resp, s.rect, s.max_gap)
+    });
     let (dpi, ppi) = ui.data(|d| d.get_temp::<(f64, f64)>(field_resolution_id())).unwrap_or((72.0, 72.0));
     // Typed text loses its spaces before parsing, so a " pt" suffix reads as "pt".
     let typed_suffix = suffix.trim();
     let units = match units {
-        Some(u) => crate::numeric_expression::Units { unit: Some(u.unit), suffix: typed_suffix, dpi: u.dpi, ppi: u.ppi },
-        None => crate::numeric_expression::Units { unit: unit_of_suffix(typed_suffix), suffix: typed_suffix, dpi, ppi },
+        Some(u) => crate::numeric_expression::Units { unit: Some(u.unit), suffix: typed_suffix, dpi: u.dpi, ppi: u.ppi, extent },
+        None => crate::numeric_expression::Units { unit: unit_of_suffix(typed_suffix), suffix: typed_suffix, dpi, ppi, extent },
     };
     surface(ui, rect, t.field, false);
     if !t.bevel {
@@ -489,17 +613,31 @@ fn value_field_box(
     // 6 pt from the right edge), so a one-character unit like `%` leaves the number room (#3040).
     let suffix_font = theme::mono(11.0);
     let suffix_w = if suffix.is_empty() { 0.0 } else { ui.painter().layout_no_wrap(suffix.to_owned(), suffix_font.clone(), t.text_faint).size().x + 3.0 };
-    // 1 pt higher than centred: digits have no descenders, so centred text looks low. The slot
-    // is at least one text row tall, so a slim box's number isn't pushed out of it (#2823).
+    // Centred: the digits' ink then sits within 0.2 pt of the box's centre, where a 1 pt lift
+    // (#1322) put it 0.9 pt high and the focus outline off-centre (#5150). The slot is at least
+    // one text row tall, so a slim box's number isn't pushed out of it (#2823).
     let font = theme::mono(12.0);
     let row_h = ui.painter().layout_no_wrap("0".into(), font.clone(), t.text).size().y;
     let slot_h = (rect.height() - 4.0).max(row_h).min(rect.height() - 2.0);
-    let cy = rect.center().y - 1.0;
+    let cy = rect.center().y;
     let field = Rect::from_min_max(pos2(rect.left() + 4.0, cy - slot_h / 2.0), pos2(rect.right() - 4.0 - suffix_w - trailing, cy + slot_h / 2.0));
     // Small ranges (gamma 0.01–9.99, 0–1 centres) need two decimals and a finer drag, like Photoshop.
-    let fine = range.end() - range.start() <= 10.0;
+    let fine = field_fine(&range, decimals, step_from_decimals);
+    let unit = field_step(&range, decimals, step_from_decimals);
     let (lo, hi) = (*range.start(), *range.end());
-    let (step, grid) = arrow_step(ui, slot.id, if fine { 0.01 } else { 1.0 });
+    // The field's id is only known once it's drawn: last frame's, saved under `slot` below.
+    let focused = ui.data(|d| d.get_temp::<egui::Id>(slot.id)).filter(|id| ui.memory(|m| m.has_focus(*id)));
+    let (step, grid) = arrow_step(ui, slot.id, unit);
+    // The wheel steps it as the arrow keys do (#5473), focused or under the pointer.
+    let notches = crate::field_wheel::notches(ui, slot.id, focused.is_some(), rect);
+    if notches != 0.0
+        && let Some(id) = focused
+        && ui.data(|d| d.get_temp(id.with("arithmetic"))).unwrap_or(false)
+    {
+        // A typed sum works itself out first, as before an arrow step.
+        ui.memory_mut(|m| m.surrender_focus(id));
+    }
+    let step = step + notches * unit;
     // new_child (not scope_builder): a scope would move the parent cursor back to the child rect.
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(field));
     let mut resp = {
@@ -518,7 +656,7 @@ fn value_field_box(
             ui.spacing_mut().button_padding = Vec2::ZERO;
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let layout = egui::Layout::centered_and_justified(ui.layout().main_dir());
-                ui.allocate_ui_with_layout(field.size(), layout, |ui| number_edit(ui, value, range, fine, decimals, units)).inner
+                ui.allocate_ui_with_layout(field.size(), layout, |ui| number_edit(ui, value, range, fine, decimals, units, wrap_drag)).inner
             })
             .inner
         }
@@ -529,7 +667,6 @@ fn value_field_box(
             ui.memory_mut(|m| m.surrender_focus(resp.id));
         }
         if s.steps != 0.0 {
-            let unit = if fine { 0.01 } else { 1.0 };
             // Onto the step grid first, so a whole-number field drops its decimals (55.4 + 1 = 56).
             let v = ((*value / unit).round() + s.steps) * unit;
             let v = (v * 1e4).round() / 1e4;
@@ -555,11 +692,25 @@ fn value_field_box(
         // Round to 4 decimal places, so repeated 0.1 steps don't leave float errors.
         let v = (v * 1e4).round() / 1e4;
         // `f32::clamp` panics on a reversed or NaN range, which `DragValue::range` accepts.
-        *value = if lo <= hi { v.clamp(lo, hi) } else { v };
-        ui.memory_mut(|m| m.request_focus(resp.id));
-        // The text stays selected, as in Photoshop: typing after a step replaces the value.
-        crate::field_tab::select_all(ui.ctx(), resp.id, &if fine { fmt_num2(f64::from(*value)) } else { fmt_num(f64::from(*value)) });
+        let v = if lo <= hi { v.clamp(lo, hi) } else { v };
+        // A wild wheel delta must not leave infinity in the field.
+        if v.is_finite() {
+            *value = v;
+        }
+        // A wheel step over a field without focus leaves the focus where it is.
+        if focused.is_some() {
+            // Only take focus back after a typed sum gave it up: re-requesting it while held resets
+            // the field's arrow-key filter next frame, and a held arrow then moves focus away (#5474).
+            if !ui.memory(|m| m.has_focus(resp.id)) {
+                ui.memory_mut(|m| m.request_focus(resp.id));
+            }
+            // The text stays selected, as in Photoshop: typing after a step replaces the value.
+            crate::field_tab::select_all(ui.ctx(), resp.id, &if fine { fmt_num2(f64::from(*value)) } else { fmt_num(f64::from(*value)) });
+        }
         resp.mark_changed();
+    }
+    if ui.memory(|m| m.has_focus(resp.id)) {
+        crate::field_wheel::set_focused(ui.ctx(), resp.id, slot.id);
     }
     (resp, rect)
 }
@@ -645,7 +796,9 @@ pub fn popup_value_field(ui: &mut Ui, name: &str, value: &mut f32, range: std::o
         ui.painter().rect_filled(arrow, t.radius_sm, t.field_border.gamma_multiply(0.6));
     }
     chevron_icon(ui, arrow, ui.style().interact(&resp), open);
+    let parent_layer = resp.layer_id;
     popup.show(|ui| {
+        crate::press_menu::above_parent_ui(parent_layer, ui);
         ui.set_width(POPUP_SLIDER_W);
         let s = slider(ui, value, range, None);
         s.widget_info(|| egui::WidgetInfo::slider(ui.is_enabled(), f64::from(*value), &name));
@@ -688,14 +841,20 @@ pub fn text_field_ex(ui: &mut Ui, id: egui::Id, text: &mut String, hint: &str, w
         ui.painter().rect_stroke(rect, t.radius_sm, Stroke::new(1.0, t.field_border), StrokeKind::Inside);
     }
     let font = if mono { theme::mono(12.0) } else { egui::FontId::proportional(12.5) };
-    let mut edit = egui::TextEdit::singleline(text).id(id).hint_text(hint).frame(egui::Frame::NONE).font(font);
+    let inner = rect.shrink2(TEXT_FIELD_PAD);
+    // TextEdit draws its text at the top of its rect; fill the box and centre the line in it, so
+    // the text sits on the field's middle like a dropdown's or value field's.
+    let mut edit =
+        egui::TextEdit::singleline(text).id(id).hint_text(hint).frame(egui::Frame::NONE).font(font).min_size(inner.size()).vertical_align(egui::Align::Center);
     if let Some(limit) = char_limit {
         edit = edit.char_limit(limit);
     }
     // A child Ui keeps the field's selection colour local: `Visuals::selection` also fills selected
     // list rows and slider trails, which must keep the theme's.
     let layout = egui::Layout::centered_and_justified(egui::Direction::TopDown);
-    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(TEXT_FIELD_PAD)).layout(layout));
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(layout));
+    // The theme's 24 pt interact height would make the edit taller than the box's inside.
+    child.spacing_mut().interact_size.y = inner.height();
     child.style_mut().visuals.selection.bg_fill = t.field_selection();
     child.add(edit)
 }
@@ -716,6 +875,8 @@ pub fn focus_first_field(ctx: &egui::Context, on: bool) {
     });
 }
 
+const NUMERIC_INPUT_LIMIT: usize = 128;
+
 /// The number in a [`value_field`]. A typed number applies as it's typed; arithmetic waits for
 /// Enter, Tab or click-away, because per keystroke `5/2` would land first and a caller that
 /// rounds it would cut `5/2*2` short. `changed()` means a new value, not just a keystroke.
@@ -726,6 +887,7 @@ fn number_edit(
     fine: bool,
     decimals: Option<u32>,
     units: crate::numeric_expression::Units,
+    wrap_drag: bool,
 ) -> Response {
     let (id, ctx) = (ui.next_auto_id(), ui.ctx().clone());
     // Focused before the DragValue is drawn, so it gains focus this frame and selects its text.
@@ -736,14 +898,40 @@ fn number_edit(
     if ui.is_enabled() {
         crate::field_tab::register(&ctx, id);
     }
+    // Use DragValue's focus check before it builds its TextEdit: oversized events must never
+    // reach text layout. Registering interest also handles focus arriving by Tab this frame.
+    let editing = ui.is_enabled()
+        && ui.memory_mut(|m| {
+            m.interested_in_focus(id, ui.layer_id());
+            m.has_focus(id)
+        });
+    if editing {
+        ui.input_mut(|input| {
+            input.events.retain(|event| {
+                let text = match event {
+                    egui::Event::Text(text) | egui::Event::Paste(text) | egui::Event::Ime(egui::ImeEvent::Commit(text)) => text,
+                    egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) => text,
+                    _ => return true,
+                };
+                text.chars().nth(NUMERIC_INPUT_LIMIT).is_none()
+            });
+        });
+    }
     let held = id.with("arithmetic");
     let math = ui.memory(|m| m.has_focus(id)) && ui.data(|d| d.get_temp(held)).unwrap_or(false);
     ui.data_mut(|d| d.insert_temp(held, math));
     let before = *value;
+    let speed = if fine { 0.01 } else { 0.5 };
+    let wrapping = wrap_drag && crate::scrub_wrap::active(ui);
+    let wrapped_drag = wrapping && ui.input(|i| i.pointer.primary_down());
     let mut resp = ui.add(
         egui::DragValue::new(value)
-            .range(range)
-            .speed(if fine { 0.01 } else { 0.5 })
+            .range(range.clone())
+            // Only edits are clamped (below): showing a value past the range, such as a type layer
+            // scaled to 2400 pt in a 1296 pt field, must not change it (#5717).
+            .clamp_existing_to_range(false)
+            // A warp is an absolute-position jump. The scoped scrub below removes that jump.
+            .speed(if wrapped_drag { 0.0 } else { speed })
             .custom_formatter(move |v, _| match decimals {
                 Some(d) => fmt_num_prec(v, d),
                 None if fine => fmt_num2(v),
@@ -752,6 +940,10 @@ fn number_edit(
             .update_while_editing(!math)
             // Focus is read when parsing, not above: Tab hands it on inside `ui.add`.
             .custom_parser(move |s| {
+                // Short events can accumulate: reject before either parser normalizes the text.
+                if s.chars().nth(NUMERIC_INPUT_LIMIT).is_some() {
+                    return None;
+                }
                 let v = parse_num_in(s, units);
                 if ctx.memory(|m| m.has_focus(id)) && plain(s).is_none() {
                     // Still typing arithmetic: hold it, and stop applying keystrokes once it parses.
@@ -761,6 +953,14 @@ fn number_edit(
                 v
             }),
     );
+    if wrap_drag {
+        crate::scrub_wrap::update(ui, &resp, value, before, range.clone(), speed, wrapping);
+    }
+    let (lo, hi) = (*range.start(), *range.end());
+    // `f32::clamp` panics on a reversed or NaN range, which `DragValue::range` accepts.
+    if *value != before && lo <= hi {
+        *value = value.clamp(lo, hi);
+    }
     resp.flags.set(egui::response::Flags::CHANGED, *value != before);
     resp
 }
@@ -808,6 +1008,34 @@ pub struct RowGestures {
     /// Each wheel notch over the slider moves the value by this step (up = higher; ×10 with
     /// Shift). Photoshop does this in dialogs, not in the Properties panel.
     pub wheel_step: Option<f32>,
+    /// A curved track: the knob at fraction f of the track is `lo + (hi - lo) * f^k`, so small
+    /// values get fine steps (Photoshop's mask Feather, #6545). Typed, scrubbed and stepped
+    /// values stay linear; only the track maps through the curve.
+    pub curve: Option<f32>,
+}
+
+/// The value at fraction `f` of a track over `lo..=hi`, through `curve` (see [`RowGestures`]).
+pub(crate) fn curve_value(f: f32, lo: f32, hi: f32, curve: Option<f32>) -> f32 {
+    match curve {
+        Some(k) if k.is_finite() && k > 0.0 => lo + f.clamp(0.0, 1.0).powf(k) * (hi - lo),
+        _ => lo + f * (hi - lo),
+    }
+}
+
+/// Where `v` sits on a track over `lo..=hi`, as a fraction: the inverse of [`curve_value`].
+pub(crate) fn curve_fraction(v: f32, lo: f32, hi: f32, curve: Option<f32>) -> f32 {
+    let f = ((v - lo) / (hi - lo)).clamp(0.0, 1.0);
+    match curve {
+        // An unset (NaN) value draws the knob at the start rather than nowhere.
+        Some(k) if k.is_finite() && k > 0.0 => {
+            if f.is_finite() {
+                f.powf(1.0 / k)
+            } else {
+                0.0
+            }
+        }
+        _ => f,
+    }
 }
 
 /// Wheel notches this frame while the pointer is over `resp` (Shift ×10). Wheel lines add up in
@@ -818,15 +1046,10 @@ fn wheel_notches(ui: &Ui, resp: &Response) -> f32 {
 }
 
 /// [`wheel_notches`] of widget `id` while `hovered`, a notch with Shift counting `shift_notches`.
-fn wheel_notches_of(ui: &Ui, id: egui::Id, hovered: bool, shift_notches: f32) -> f32 {
+pub(crate) fn wheel_notches_of(ui: &Ui, id: egui::Id, hovered: bool, shift_notches: f32) -> f32 {
     if !hovered {
         return 0.0;
     }
-    let acc_id = id.with("wheel-acc");
-    let mut acc: f32 = ui.data(|d| d.get_temp(acc_id)).unwrap_or(0.0);
-    let per_line = ui.ctx().options(|o| o.input_options.line_scroll_speed);
-    let per_line = if per_line.is_finite() && per_line > 0.0 { per_line } else { 40.0 };
-    let mut notches = 0.0;
     let wheel: Vec<(egui::MouseWheelUnit, Vec2, bool)> = ui.input(|i| {
         i.events
             .iter()
@@ -836,7 +1059,17 @@ fn wheel_notches_of(ui: &Ui, id: egui::Id, hovered: bool, shift_notches: f32) ->
             })
             .collect()
     });
-    for (unit, delta, shift) in wheel {
+    count_notches(ui, id.with("wheel-acc"), &wheel, shift_notches)
+}
+
+/// Whole notches in `wheel` (unit, delta, Shift held), a notch with Shift counting
+/// `shift_notches`; fractions carry over in egui memory under `acc_id`.
+pub(crate) fn count_notches(ui: &Ui, acc_id: egui::Id, wheel: &[(egui::MouseWheelUnit, Vec2, bool)], shift_notches: f32) -> f32 {
+    let mut acc: f32 = ui.data(|d| d.get_temp(acc_id)).unwrap_or(0.0);
+    let per_line = ui.ctx().options(|o| o.input_options.line_scroll_speed);
+    let per_line = if per_line.is_finite() && per_line > 0.0 { per_line } else { 40.0 };
+    let mut notches = 0.0;
+    for &(unit, delta, shift) in wheel {
         // Some systems turn Shift+wheel into a horizontal scroll.
         let d = if delta.y != 0.0 { delta.y } else { delta.x };
         acc += match unit {
@@ -857,26 +1090,39 @@ fn wheel_notches_of(ui: &Ui, id: egui::Id, hovered: bool, shift_notches: f32) ->
 /// Windows' default double-click time (Photoshop's; egui's own default is 0.3 s).
 const DOUBLE_CLICK_S: f64 = 0.5;
 
-/// Whether this click on `resp` completes a double-click, counted the Windows way (Photoshop):
-/// a click soon after a lone click at the same spot; the click after a double-click starts over.
-/// (egui would call a third quick click a triple-click even when the first two weren't a double.)
-fn second_click(ui: &Ui, resp: &Response) -> bool {
+/// Finger jitter between taps easily exceeds egui's 6 px `max_click_dist`; 64 px is about two-thirds of an inch at 96 DPI (roughly a fingertip pad). 32 px still rejected casual Framework double-taps; Windows' mouse SM_CXDOUBLECLK is only 4 px and is not used for touch.
+const TOUCH_MAX_CLICK_DIST: f32 = 64.0;
+
+/// True when this frame's pointer work came from a touch contact (still down, or a Touch event including End on the click frame).
+fn pointer_from_touch(ui: &Ui) -> bool {
+    ui.input(|i| i.any_touches() || i.events.iter().any(|e| matches!(e, egui::Event::Touch { .. })))
+}
+
+/// Whether this click on `resp` completes a double-click / double-tap, counted the Windows way (Photoshop): a click soon after a lone click near the same spot; the click after a double starts over.
+///
+/// Time window is 0.5 s (Windows / Photoshop; egui's default is 0.3 s). Mouse uses egui's `max_click_dist` (6 px); touch uses [`TOUCH_MAX_CLICK_DIST`] so finger jitter between taps still counts. Call on every click for that widget so the first tap is remembered.
+pub fn second_click(ui: &Ui, resp: &Response) -> bool {
     if !resp.clicked() {
         return false;
     }
     let key = resp.id.with("pc-last-click");
-    let (time, pos) = ui.input(|i| (i.time, i.pointer.interact_pos()));
-    let dist = ui.ctx().options(|o| o.input_options.max_click_dist);
-    let last: Option<(f64, Pos2)> = ui.data(|d| d.get_temp(key));
+    // Prefer the response's hit pos: raw `pointer.interact_pos` can be unset on a release-only frame.
+    let pos = resp.interact_pointer_pos().or_else(|| ui.input(|i| i.pointer.interact_pos()));
+    let time = ui.input(|i| i.time);
+    let touch = pointer_from_touch(ui);
+    let mouse_dist = ui.ctx().options(|o| o.input_options.max_click_dist);
+    let last: Option<(f64, Pos2, bool)> = ui.data(|d| d.get_temp(key));
+    // Looser distance if either tap in the pair was touch (End clears `any_touches` but leaves Touch in `events`).
+    let dist = if touch || last.is_some_and(|(_, _, t)| t) { TOUCH_MAX_CLICK_DIST.max(mouse_dist) } else { mouse_dist };
     let double = match (last, pos) {
-        (Some((t, p)), Some(q)) => time - t < DOUBLE_CLICK_S && p.distance(q) < dist,
+        (Some((t, p, _)), Some(q)) => time - t < DOUBLE_CLICK_S && p.distance(q) < dist,
         _ => false,
     };
     ui.data_mut(|d| {
         if let (false, Some(q)) = (double, pos) {
-            d.insert_temp(key, (time, q));
+            d.insert_temp(key, (time, q, touch));
         } else {
-            d.remove::<(f64, Pos2)>(key);
+            d.remove::<(f64, Pos2, bool)>(key);
         }
     });
     double
@@ -892,7 +1138,7 @@ fn slider_with(ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32
         && (resp.dragged() || resp.clicked())
     {
         let f = ((p.x - track.left()) / track.width()).clamp(0.0, 1.0);
-        let nv = lo + f * (hi - lo);
+        let nv = curve_value(f, lo, hi, g.curve);
         if (nv - *value).abs() > f32::EPSILON {
             *value = nv;
             resp.mark_changed();
@@ -915,7 +1161,7 @@ fn slider_with(ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32
             }
         }
     }
-    let f = ((*value - lo) / (hi - lo)).clamp(0.0, 1.0);
+    let f = curve_fraction(*value, lo, hi, g.curve);
     let knob_x = track.left() + f * track.width();
     let painter = ui.painter();
     match gradient {
@@ -949,8 +1195,8 @@ fn slider_with(ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32
         let kr = if t.pro { 6.0 } else { 7.0 };
         painter.circle_filled(knob + vec2(0.0, 1.0), kr + 0.5, Color32::from_black_alpha(90));
         painter.circle_filled(knob, kr, if t.pro { Color32::from_gray(236) } else { Color32::WHITE });
-        if t.pro {
-            painter.circle_stroke(knob, kr, Stroke::new(1.0, Color32::from_gray(40)));
+        if let Some(outline) = t.knob_outline() {
+            painter.circle_stroke(knob, kr, Stroke::new(1.0, outline));
         }
         if resp.hovered() || resp.dragged() {
             painter.circle_stroke(knob, 9.5, Stroke::new(2.0, t.accent_soft));
@@ -974,6 +1220,22 @@ pub fn slider_row_with(
     gradient: Option<&[Color32]>,
     g: RowGestures,
 ) -> Response {
+    slider_row_prec(ui, label, value, range, suffix, gradient, g, None)
+}
+
+/// [`slider_row_with`] whose field shows `decimals` places instead of the one (or two, for a
+/// small range) it picks itself: Exposure's ±20 stops show two, its Offset four (#4164).
+#[allow(clippy::too_many_arguments)]
+pub fn slider_row_prec(
+    ui: &mut Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    suffix: &str,
+    gradient: Option<&[Color32]>,
+    g: RowGestures,
+    decimals: Option<u32>,
+) -> Response {
     let t = Tokens::get(ui.ctx());
     let mut changed_resp = None;
     ui.horizontal(|ui| {
@@ -981,7 +1243,18 @@ pub fn slider_row_with(
         let l = ui.label(egui::RichText::new(tl!(label)).color(t.text_dim));
         scrub_label_within(ui, &l, f32::INFINITY);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            changed_resp = Some(value_field(ui, value, range.clone(), suffix, 74.0));
+            changed_resp = Some(
+                value_field_in(
+                    ui,
+                    value,
+                    range.clone(),
+                    suffix,
+                    74.0,
+                    0.0,
+                    FieldOpts { decimals, step_from_decimals: decimals.is_some(), ..Default::default() },
+                )
+                .0,
+            );
         });
     });
     let s = slider_with(ui, value, range, gradient, g);
@@ -1084,15 +1357,23 @@ pub struct DialogButton<'a> {
     pub label: &'a str,
     pub min_width: f32,
     pub enabled: bool,
+    /// Take keyboard focus this frame (see [`DialogButton::focus`]).
+    pub focus: bool,
 }
 
 impl<'a> DialogButton<'a> {
     pub fn new(role: ButtonRole, label: &'a str, min_width: f32) -> Self {
-        Self { role, label, min_width, enabled: true }
+        Self { role, label, min_width, enabled: true, focus: false }
     }
 
     pub fn enabled(self, enabled: bool) -> Self {
         Self { enabled, ..self }
+    }
+
+    /// Asks for keyboard focus for this button: from there the arrow keys move between the row's
+    /// buttons and Enter or Space presses the focused one.
+    pub fn focus(self, focus: bool) -> Self {
+        Self { focus, ..self }
     }
 }
 
@@ -1116,6 +1397,9 @@ pub fn dialog_buttons(ui: &mut Ui, buttons: &[DialogButton]) -> Option<ButtonRol
                         if b.role == ButtonRole::Default { primary_button(ui, b.label, b.min_width) } else { secondary_button(ui, b.label, b.min_width) }
                     })
                     .inner;
+                if b.focus && b.enabled {
+                    r.request_focus();
+                }
                 if r.clicked() {
                     hit = Some(b.role);
                 }
@@ -1131,9 +1415,14 @@ fn button_size(ui: &Ui, label: &str, min_width: f32) -> Vec2 {
     button_layout(ui, label, min_width, None, Tokens::get(ui.ctx()).text).1
 }
 
+/// The height of a primary or secondary button (and so of a dialog's button row).
+pub fn button_height(ctx: &egui::Context) -> f32 {
+    if Tokens::get(ctx).pro { 28.0 } else { 30.0 }
+}
+
 fn button_layout(ui: &Ui, label: &str, min_width: f32, height: Option<f32>, fg: Color32) -> (std::sync::Arc<egui::Galley>, Vec2) {
     let galley = ui.painter().layout_no_wrap(tl!(label).to_owned(), theme::medium(13.0), fg);
-    let h = height.unwrap_or(if Tokens::get(ui.ctx()).pro { 28.0 } else { 30.0 });
+    let h = height.unwrap_or(button_height(ui.ctx()));
     let size = vec2((galley.size().x + 28.0).max(min_width), h);
     (galley, size)
 }
@@ -1223,15 +1512,17 @@ pub fn vline(ui: &mut Ui, height: f32) {
     ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, t.separator));
 }
 
-/// Hue spectrum stops for colour sliders.
+/// The fully saturated colour at hue `deg` (degrees), built on sRGB values as Photoshop's hue
+/// tracks are: 0 is (255,0,0), 60 is (255,255,0), 120 is (0,255,0) and so on (#6540).
+pub fn hue_color(deg: f32) -> Color32 {
+    let [r, g, b] = photocraft_color::convert::hsb_to_rgb([deg, 1.0, 1.0]);
+    let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    Color32::from_rgb(q(r), q(g), q(b))
+}
+
+/// Hue spectrum stops for colour sliders: red, yellow, green, cyan, blue, magenta, red.
 pub fn hue_stops() -> Vec<Color32> {
-    (0..=12)
-        .map(|i| {
-            let h = i as f32 / 12.0;
-            let rgb = egui::ecolor::Hsva::new(h, 0.85, 1.0, 1.0).to_srgb();
-            Color32::from_rgb(rgb[0], rgb[1], rgb[2])
-        })
-        .collect()
+    (0..=12).map(|i| hue_color(i as f32 * 30.0)).collect()
 }
 
 /// A compact labelled dropdown in the studio style.
@@ -1239,9 +1530,16 @@ pub fn dropdown<T: PartialEq + Clone>(ui: &mut Ui, id: &str, current: &mut T, op
     dropdown_hovered(ui, id, current, options, width).0
 }
 
+/// [`dropdown`] whose option labels are shown exactly as given: names the user typed (a channel
+/// or layer name) must not be translated, unlike the built-in labels [`dropdown`] translates (#5335).
+pub fn dropdown_literal<T: PartialEq + Clone>(ui: &mut Ui, id: &str, current: &mut T, options: &[(T, &str)], width: f32) -> bool {
+    let (chosen, _) = dropdown_with(ui, id, current, options, width, false, false);
+    !chosen.is_empty()
+}
+
 /// [`dropdown`], also returning the option under the pointer in its open list (live previews).
 pub fn dropdown_hovered<T: PartialEq + Clone>(ui: &mut Ui, id: &str, current: &mut T, options: &[(T, &str)], width: f32) -> (bool, Option<T>) {
-    let (chosen, hovered) = dropdown_with(ui, id, current, options, width, false);
+    let (chosen, hovered) = dropdown_with(ui, id, current, options, width, false, true);
     (!chosen.is_empty(), hovered)
 }
 
@@ -1252,11 +1550,21 @@ pub fn dropdown_hovered<T: PartialEq + Clone>(ui: &mut Ui, id: &str, current: &m
 /// in order (one per notch; the last is `current`) and the option under the pointer in the open
 /// list, none while the pointer rests where the wheel last stepped.
 pub fn dropdown_wheel_hovered<T: PartialEq + Clone>(ui: &mut Ui, id: &str, current: &mut T, options: &[(T, &str)], width: f32) -> (Vec<T>, Option<T>) {
-    dropdown_with(ui, id, current, options, width, true)
+    dropdown_with(ui, id, current, options, width, true, true)
 }
 
-fn dropdown_with<T: PartialEq + Clone>(ui: &mut Ui, id: &str, current: &mut T, options: &[(T, &str)], width: f32, wheel: bool) -> (Vec<T>, Option<T>) {
-    let label = options.iter().find(|(v, _)| v == current).map(|(_, l)| tl!(l)).unwrap_or("—");
+#[allow(clippy::too_many_arguments)]
+fn dropdown_with<T: PartialEq + Clone>(
+    ui: &mut Ui,
+    id: &str,
+    current: &mut T,
+    options: &[(T, &str)],
+    width: f32,
+    wheel: bool,
+    translate: bool,
+) -> (Vec<T>, Option<T>) {
+    let shown = |l: &str| if translate { tl!(l).to_string() } else { l.to_string() };
+    let label = options.iter().find(|(v, _)| v == current).map(|(_, l)| shown(l)).unwrap_or_else(|| "—".into());
     let (mut chosen, mut hovered) = (Vec::new(), None);
     // The wheel's notches add up over the button and the open list alike.
     let wheel_id = ui.make_persistent_id(id).with("wheel");
@@ -1268,11 +1576,12 @@ fn dropdown_with<T: PartialEq + Clone>(ui: &mut Ui, id: &str, current: &mut T, o
     let mut reveal = wheel && ui.data_mut(|d| d.remove_temp::<bool>(reveal_id)).unwrap_or(false);
     // The list opens on the press: press, drag onto an option and release to choose it (#2735).
     let (press, close) = crate::press_menu::PressCombo::before(ui, id);
+    let texts: Vec<String> = options.iter().map(|(_, l)| shown(l)).collect();
     let response =
         egui::ComboBox::from_id_salt(id).selected_text(label).width(width).height(420.0).icon(chevron_icon).close_behavior(close).show_ui(ui, |ui| {
-            fit_widest_option(ui, options.iter().map(|(_, l)| tl!(l)));
+            fit_widest_option(ui, texts.iter().map(|l| l.as_str()));
             // A typed letter jumps to the next option starting with it, ↩ closes the list (#1481).
-            let labels: Vec<&str> = options.iter().map(|(_, l)| tl!(l)).collect();
+            let labels: Vec<&str> = texts.iter().map(|l| l.as_str()).collect();
             let shown = options.iter().position(|(v, _)| v == current);
             if let Some((v, _)) = type_ahead::keys(ui, ui.make_persistent_id(id), shown, &labels).and_then(|i| options.get(i)) {
                 *current = v.clone();
@@ -1291,8 +1600,8 @@ fn dropdown_with<T: PartialEq + Clone>(ui: &mut Ui, id: &str, current: &mut T, o
             // The row nearest the pointer, by its distance to each row.
             let pointer = ui.ctx().pointer_hover_pos().filter(|_| ui.rect_contains_pointer(ui.clip_rect()));
             let mut nearest: Option<(f32, &T)> = None;
-            for (v, l) in options {
-                let item = ui.selectable_label(v == current, tl!(l));
+            for ((v, _), text) in options.iter().zip(texts.iter()) {
+                let item = ui.selectable_label(v == current, text.as_str());
                 if reveal && v == current {
                     item.scroll_to_me(None);
                 }
@@ -1446,6 +1755,7 @@ pub fn swatch_popup(swatch: &Response) -> egui::Popup<'static> {
         ctx.data_mut(|d| d.remove::<f32>(key));
         return popup;
     }
+    crate::press_menu::above_parent(ctx, swatch.layer_id, egui::LayerId::new(egui::Order::Foreground, popup.get_id()));
     // Its width is known from the frame after it opened (egui sizes it unseen first).
     let left = ctx.data(|d| d.get_temp::<f32>(key)).or_else(|| {
         let width = popup.get_expected_size()?.x;
@@ -1544,34 +1854,56 @@ fn checker_tile(ctx: &egui::Context) -> egui::TextureHandle {
 /// Spectrum-style checkbox (blue when checked).
 pub fn checkbox(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
     let t = Tokens::get(ui.ctx());
-    let mut resp = ui
+    let (mut resp, label_resp) = ui
         .horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            let (rect, resp) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::click());
+            let (rect, resp) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::CLICK);
             let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-            let p = ui.painter();
-            if *on {
-                p.rect_filled(rect, 2.0, t.accent);
-                let a = rect.left_center() + vec2(3.0, 0.5);
-                let b = rect.center_bottom() + vec2(-1.0, -3.5);
-                let c = rect.right_top() + vec2(-3.0, 3.5);
-                p.line_segment([a, b], Stroke::new(1.8, Color32::WHITE));
-                p.line_segment([b, c], Stroke::new(1.8, Color32::WHITE));
-            } else {
-                p.rect_filled(rect, 2.0, t.field);
-                p.rect_stroke(rect, 2.0, Stroke::new(1.5, if resp.hovered() { t.text_dim } else { t.text_faint }), StrokeKind::Inside);
-            }
             let l = ui
                 .add(egui::Label::new(egui::RichText::new(tl!(label)).color(t.text_dim)).selectable(false).sense(Sense::click()))
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
-            resp.union(l)
+            // Pressing the label presses the box (#4476).
+            let pressed = resp.is_pointer_button_down_on() || l.is_pointer_button_down_on();
+            check_box(ui.painter(), rect, *on, resp.hovered() || l.hovered(), pressed, &t);
+            (resp.union(l.clone()), l)
         })
         .inner;
     if resp.clicked() {
         *on = !*on;
         resp.mark_changed();
     }
+    // The label is the single named, focusable checkbox; the box is a mouse target.
+    // Override Label's metadata instead of creating a second node with the same name.
+    label_resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, tl!(label)));
     resp
+}
+
+/// The fill of a check box: the accent when `on`, else the field colour. While it's pressed
+/// (the mouse is down on it or on its label) Photoshop shows that a release will act: an
+/// unchecked box darkens a little and a checked one turns a little less opaque (#4476).
+pub fn check_box_fill(on: bool, pressed: bool, t: &Tokens) -> Color32 {
+    match (on, pressed) {
+        (true, false) => t.accent,
+        (true, true) => t.accent.gamma_multiply(0.75),
+        (false, false) => t.field,
+        (false, true) => t.field.lerp_to_gamma(Color32::BLACK, 0.18),
+    }
+}
+
+/// Paint a check box in `rect`: [`check_box_fill`] with a white tick when `on`, else an
+/// outline that brightens while `hovered` or `pressed`.
+pub fn check_box(p: &egui::Painter, rect: Rect, on: bool, hovered: bool, pressed: bool, t: &Tokens) {
+    p.rect_filled(rect, 2.0, check_box_fill(on, pressed, t));
+    if on {
+        let a = rect.left_center() + vec2(3.0, 0.5);
+        let b = rect.center_bottom() + vec2(-1.0, -3.5);
+        let c = rect.right_top() + vec2(-3.0, 3.5);
+        let tick = Stroke::new(rect.width() * 0.125, Color32::WHITE);
+        p.line_segment([a, b], tick);
+        p.line_segment([b, c], tick);
+    } else {
+        p.rect_stroke(rect, 2.0, Stroke::new(1.5, if hovered || pressed { t.text_dim } else { t.text_faint }), StrokeKind::Inside);
+    }
 }
 
 /// Small chevron for dropdowns (replaces egui's filled triangle).
@@ -1629,12 +1961,55 @@ fn clean(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use egui::{Key, Modifiers};
+    use super::{hue_color, hue_stops};
+    use egui::{Color32, Key, Modifiers};
+
+    #[test]
+    fn hue_stops_are_pure_and_evenly_spaced() {
+        let c = |r, g, b| Color32::from_rgb(r, g, b);
+        let want = [c(255, 0, 0), c(255, 255, 0), c(0, 255, 0), c(0, 255, 255), c(0, 0, 255), c(255, 0, 255), c(255, 0, 0)];
+        let stops = hue_stops();
+        assert_eq!(stops.len(), 13);
+        for (k, w) in want.iter().enumerate() {
+            assert_eq!(stops[k * 2], *w, "stop at {} degrees", k * 60);
+            assert_eq!(hue_color(k as f32 * 60.0), *w);
+        }
+    }
+
+    /// A light theme rings the slider knob with its outline token; a dark Studio-layout one draws
+    /// the plain knob (#7927).
+    #[test]
+    fn light_themes_draw_the_slider_knob_outline() {
+        use crate::theme::{ThemeKind, Tokens};
+        fn rings(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| rings(s, out)),
+                egui::Shape::Circle(c) if c.radius == 7.0 && c.stroke.width == 1.0 => out.push(c.stroke.color),
+                _ => {}
+            }
+        }
+        for kind in [ThemeKind::StudioLight, ThemeKind::Adwaita, ThemeKind::BreezeLight, ThemeKind::SoftLight, ThemeKind::Studio] {
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx, kind);
+            let mut v = 50.0;
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                super::slider(ui, &mut v, 0.0..=100.0, None);
+            });
+            out.textures_delta.clear();
+            let mut found = Vec::new();
+            out.shapes.iter().for_each(|c| rings(&c.shape, &mut found));
+            let want: Vec<_> = Tokens::for_kind(kind).knob_outline().into_iter().collect();
+            assert_eq!(found, want, "{kind:?}");
+        }
+    }
 
     #[test]
     fn checkbox_label_is_a_button_target_not_selectable_text() {
         use egui::CursorIcon;
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::{
+            Harness,
+            kittest::{NodeT, Queryable},
+        };
 
         let mut h = Harness::builder().with_size(egui::vec2(300.0, 80.0)).build_ui_state(
             |ui, on: &mut bool| {
@@ -1650,6 +2025,13 @@ mod tests {
         h.get_by_label("Show Transform Controls").click();
         h.run_steps(2);
         assert!(*h.state());
+        let checkbox = h.get_by_role_and_label(egui::accesskit::Role::CheckBox, "Show Transform Controls");
+        assert_eq!(checkbox.accesskit_node().toggled(), Some(egui::accesskit::Toggled::True));
+        checkbox.focus();
+        h.run_steps(1);
+        h.key_press(egui::Key::Space);
+        h.run_steps(2);
+        assert!(!*h.state(), "the same named checkbox supports Space");
     }
 
     /// #3208: a rounded swatch's checker is one shared, repeating, unblurred two-by-two tile on
@@ -1702,6 +2084,7 @@ mod tests {
                 let original_padding = ui.spacing().button_padding;
                 let original_hover = ui.visuals().widgets.hovered.fg_stroke;
                 super::style_spectrum_popup_menu(ui);
+                assert_eq!(ui.spacing().item_spacing.y, 0.0, "{kind:?}: menu rows meet so the gap is selectable");
                 if tokens.pro {
                     assert_eq!(ui.spacing().button_padding, egui::vec2(10.0, 4.0));
                     assert_eq!(ui.visuals().widgets.hovered.bg_fill, tokens.accent);
@@ -1714,7 +2097,108 @@ mod tests {
             out.textures_delta.clear();
         }
     }
+
+    /// One primary press+release at `pos`. When `touch`, emit Touch Start/End with the pointer events (as egui-winit does) so [`super::second_click`] uses the touch distance.
+    fn pointer_click(ctx: &egui::Context, time: f64, pos: egui::Pos2, touch: bool) -> bool {
+        let area = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 200.0));
+        let button = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        let touch_ev = |phase| egui::Event::Touch { device_id: egui::TouchDeviceId(1), id: egui::TouchId(1), phase, pos, force: None };
+        let mut saw = false;
+        for (t, mut events) in [
+            (time, {
+                let mut v = vec![egui::Event::PointerMoved(pos), button(true)];
+                if touch {
+                    v.insert(0, touch_ev(egui::TouchPhase::Start));
+                }
+                v
+            }),
+            (time + 0.02, {
+                let mut v = vec![button(false)];
+                if touch {
+                    v.insert(0, touch_ev(egui::TouchPhase::End));
+                }
+                v
+            }),
+        ] {
+            let mut raw = egui::RawInput { time: Some(t), screen_rect: Some(area), ..Default::default() };
+            raw.events.append(&mut events);
+            let mut out = ctx.run_ui(raw, |ui| {
+                let r = ui.allocate_rect(area, egui::Sense::click());
+                saw |= super::second_click(ui, &r);
+            });
+            out.textures_delta.clear();
+        }
+        saw
+    }
+
+    /// #2274 touch: taps past egui's 6 px mouse limit (and past the old 32 px touch slop) within 0.5 s still count as a double; the same mouse path does not.
+    #[test]
+    fn second_click_tolerates_touch_jitter_but_keeps_mouse_tight() {
+        let area = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 200.0));
+        let a = egui::pos2(50.0, 50.0);
+        let mild = egui::pos2(70.0, 50.0); // 20 px — past mouse max_click_dist (6)
+        let wide = egui::pos2(50.0 + 48.0, 50.0); // past the old 32 px slop, inside TOUCH_MAX_CLICK_DIST (64)
+        for touch in [false, true] {
+            let ctx = egui::Context::default();
+            let mut out = ctx.run_ui(egui::RawInput { time: Some(0.0), screen_rect: Some(area), ..Default::default() }, |ui| {
+                ui.allocate_rect(area, egui::Sense::click());
+            });
+            out.textures_delta.clear();
+            assert!(!pointer_click(&ctx, 0.1, a, touch), "first click only arms the pair");
+            let second = pointer_click(&ctx, 0.25, mild, touch);
+            assert_eq!(second, touch, "touch={touch}: 20 px jitter is a double only for touch");
+        }
+        // Touch-only: casual Framework-style drift beyond the previous 32 px budget.
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput { time: Some(0.0), screen_rect: Some(area), ..Default::default() }, |ui| {
+            ui.allocate_rect(area, egui::Sense::click());
+        });
+        out.textures_delta.clear();
+        assert!(!pointer_click(&ctx, 0.1, a, true));
+        assert!(pointer_click(&ctx, 0.25, wide, true), "48 px touch jitter is still a double");
+    }
+
+    /// A mouse double past the time window is not a double, even at the same pixel.
+    #[test]
+    fn second_click_respects_the_half_second_window() {
+        let area = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 200.0));
+        let p = egui::pos2(40.0, 40.0);
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput { time: Some(0.0), screen_rect: Some(area), ..Default::default() }, |ui| {
+            ui.allocate_rect(area, egui::Sense::click());
+        });
+        out.textures_delta.clear();
+        assert!(!pointer_click(&ctx, 0.1, p, false));
+        assert!(!pointer_click(&ctx, 0.1 + super::DOUBLE_CLICK_S + 0.05, p, false), "past Windows' 0.5 s window");
+    }
+
     use egui_kittest::{Harness, kittest::Queryable};
+
+    /// A panel footer's buttons are drawn whole. The bar runs on over the body's bottom margin, so a
+    /// body that clips where its content ends (as the panels do) cut the bottom off every button:
+    /// the hover highlight of a 26 px button was about 21 px tall in the Paths, Layers and Channels
+    /// panels (#6238).
+    #[test]
+    fn panel_footer_buttons_are_not_clipped_by_the_body() {
+        let mut h = Harness::new_ui_state(
+            |ui, s: &mut Option<(egui::Rect, egui::Rect, egui::Rect)>| {
+                // A body exactly as tall as the footer takes, clipped there.
+                let body = egui::Rect::from_min_size(ui.max_rect().min, egui::vec2(220.0, super::footer_height(ui)));
+                let mut body_ui = ui.new_child(egui::UiBuilder::new().max_rect(body));
+                body_ui.set_clip_rect(body);
+                super::panel_footer(&mut body_ui, |bar| {
+                    let b = crate::icons::button(bar, "square", 26.0, false, "Button");
+                    *s = Some((b.rect, bar.clip_rect(), body));
+                });
+            },
+            None,
+        );
+        crate::PhotocraftApp::setup_context(&h.ctx, crate::theme::ThemeKind::Studio);
+        h.run();
+        let (button, clip, body) = h.state().expect("the footer drew its button");
+        assert!(button.bottom() > body.bottom(), "the bar really overruns the body, or this test proves nothing: {button:?} vs {body:?}");
+        assert!(clip.contains_rect(button), "the whole button is inside the clip: {button:?} not in {clip:?}");
+    }
 
     /// #3789: a plain text field is one boxed, outline-free input whose text-selection colour stays
     /// local, so it isn't recoloured for the rest of the frame (selected rows, slider trails).
@@ -1768,9 +2252,9 @@ mod tests {
         h
     }
 
-    /// Digits have no descenders, so the number sits 1 pt above the box's centre to look centred.
+    /// The number's slot (and its focus outline) is centred in the box (#5150).
     #[test]
-    fn value_field_digits_sit_one_point_above_centre() {
+    fn value_field_number_slot_is_centred_in_its_box() {
         let mut h = Harness::new_ui_state(
             |ui, s: &mut (f32, egui::Rect)| {
                 s.1 = super::value_field_in(ui, &mut s.0, 0.0..=100.0, "px", 80.0, 0.0, super::FieldOpts::default()).1;
@@ -1780,11 +2264,47 @@ mod tests {
         h.run();
         let number = h.get_by_role(egui::accesskit::Role::SpinButton).rect();
         let field = h.state().1;
-        assert!((field.center().y - number.center().y - 1.0).abs() < 0.01, "field {field:?}, number {number:?}");
+        assert!((field.center().y - number.center().y).abs() < 0.01, "field {field:?}, number {number:?}");
+    }
+
+    /// The digits' ink, not just their slot, is centred in the box, and starts level with the
+    /// `%`'s, so the number lines up with the box and its unit (#5150).
+    #[test]
+    fn value_field_digits_ink_is_centred_and_level_with_the_unit() {
+        let _gpu = photocraft_testkit::gpu_lock();
+        let scale = 4.0;
+        for kind in [crate::theme::ThemeKind::Pro, crate::theme::ThemeKind::Studio] {
+            let mut h = Harness::builder().with_size(egui::vec2(100.0, 40.0)).with_pixels_per_point(scale).wgpu().build_ui_state(
+                |ui, s: &mut (f32, egui::Rect)| {
+                    s.1 = super::value_field_in(ui, &mut s.0, 0.0..=100.0, "%", 80.0, 0.0, super::FieldOpts::default()).1;
+                },
+                (100.0, egui::Rect::NOTHING),
+            );
+            crate::PhotocraftApp::setup_context(&h.ctx, kind);
+            h.run_steps(3);
+            let image = h.render().expect("render value field");
+            let (field, suffix_left) = (h.state().1, h.state().1.right() - 14.0);
+            let px = |v: f32| (v * scale) as u32;
+            let bg = image.get_pixel(px(field.left() + 2.0), px(field.center().y)).0;
+            let lum = |p: [u8; 4]| u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2]);
+            // Top and bottom of the ink (pt) between x0 and x1.
+            let ink = |x0: f32, x1: f32| {
+                let rows: Vec<u32> = (px(field.top() + 2.0)..px(field.bottom() - 2.0))
+                    .filter(|&y| (px(x0)..px(x1)).any(|x| lum(image.get_pixel(x, y).0) > lum(bg) + 150))
+                    .collect();
+                let (top, bottom) = (rows.first().copied().unwrap_or(0), rows.last().copied().unwrap_or(0) + 1);
+                (top as f32 / scale, bottom as f32 / scale)
+            };
+            let digits = ink(field.left() + 4.0, suffix_left - 2.0);
+            let unit = ink(suffix_left, field.right() - 2.0);
+            let what = format!("{kind:?}: field {field:?}, digits {digits:?}, unit {unit:?}");
+            assert!(((digits.0 + digits.1) / 2.0 - field.center().y).abs() <= 0.25, "{what}");
+            assert!((digits.0 - unit.0).abs() <= 0.25, "{what}");
+        }
     }
 
     /// With the app's theme (its 24 pt interact height and 4 pt button padding), in a full-size
-    /// box and a slim status-bar box alike, the number stays inside the box, 1 pt above its centre,
+    /// box and a slim status-bar box alike, the number stays inside the box, centred in it,
     /// and a long number doesn't spill out of the box's left edge (#2823).
     #[test]
     fn themed_value_field_number_sits_inside_its_box_in_every_size() {
@@ -1804,7 +2324,7 @@ mod tests {
                 let field = harness.state().1;
                 let what = format!("{kind:?} {w}x{h}: field {field:?}, number {number:?}");
                 assert!(field.contains_rect(number), "{what}");
-                assert!((field.center().y - number.center().y - 1.0).abs() < 0.51, "{what}");
+                assert!((field.center().y - number.center().y).abs() < 0.51, "{what}");
             }
         }
     }
@@ -1853,6 +2373,29 @@ mod tests {
         let _ = press(&mut h, Modifiers::NONE, Key::ArrowDown);
     }
 
+    /// #5914: Exposure's ±20 stops keep 0.01 arrow steps when the field shows two decimals.
+    #[test]
+    fn arrow_keys_step_fractional_stops_when_decimals_are_set() {
+        let mut h = Harness::new_ui_state(
+            |ui, v: &mut f32| {
+                super::slider_row_prec(ui, "Exposure", v, -20.0..=20.0, "", None, super::RowGestures::default(), Some(2));
+            },
+            0.0,
+        );
+        h.run();
+        h.get_by_role(egui::accesskit::Role::SpinButton).click();
+        h.run();
+        h.key_press_modifiers(Modifiers::NONE, Key::ArrowUp);
+        h.run();
+        assert!((*h.state() - 0.01).abs() < 1e-6);
+        h.key_press_modifiers(Modifiers::NONE, Key::ArrowUp);
+        h.run();
+        assert!((*h.state() - 0.02).abs() < 1e-6);
+        h.key_press_modifiers(Modifiers::SHIFT, Key::ArrowUp);
+        h.run();
+        assert!((*h.state() - 0.12).abs() < 1e-6);
+    }
+
     #[test]
     fn arrow_keys_round_decimals_step_fine_fields_and_clamp() {
         for (start, mods, key, want) in [
@@ -1874,6 +2417,28 @@ mod tests {
         assert_eq!(press(&mut h, Modifiers::SHIFT, Key::ArrowUp), 1000.0);
     }
 
+    /// #6545: a curved track (the mask Feather) has fine steps at the left and coarse ones toward
+    /// the right end, and the knob drawn for a value lands where that value is picked.
+    #[test]
+    fn curved_track_maps_ends_middle_and_round_trips() {
+        use super::{curve_fraction, curve_value};
+        for (f, want) in [(0.0, 0.0), (0.1, 1.0), (0.2, 8.0), (0.5, 125.0), (1.0, 1000.0)] {
+            assert!((curve_value(f, 0.0, 1000.0, Some(3.0)) - want).abs() < 1e-3, "{f}: {}", curve_value(f, 0.0, 1000.0, Some(3.0)));
+        }
+        assert_eq!(curve_value(0.25, 0.0, 1000.0, None), 250.0, "no curve is the linear track");
+        assert_eq!(curve_value(0.5, 10.0, 20.0, Some(3.0)), 11.25, "the curve starts at the range's low end");
+        for i in 0..=100 {
+            let f = i as f32 / 100.0;
+            let back = curve_fraction(curve_value(f, 0.0, 1000.0, Some(3.0)), 0.0, 1000.0, Some(3.0));
+            assert!((back - f).abs() < 1e-4, "{f} -> {back}");
+            let v = i as f32 * 10.0;
+            let again = curve_value(curve_fraction(v, 0.0, 1000.0, Some(3.0)), 0.0, 1000.0, Some(3.0));
+            assert!((again - v).abs() < 1e-3, "{v} -> {again}");
+        }
+        assert_eq!(curve_fraction(-5.0, 0.0, 1000.0, Some(3.0)), 0.0);
+        assert_eq!(curve_fraction(f32::NAN, 0.0, 1000.0, Some(3.0)), 0.0);
+    }
+
     #[test]
     fn arrow_keys_work_out_a_typed_sum_then_step_it() {
         let mut h = focused(100.0, 0.0..=1000.0);
@@ -1882,6 +2447,30 @@ mod tests {
         h.run();
         assert_eq!(press(&mut h, Modifiers::NONE, Key::ArrowUp), 11.0);
         assert_eq!(press(&mut h, Modifiers::NONE, Key::ArrowDown), 10.0, "the field keeps focus");
+    }
+
+    /// #5474: a held arrow repeats on consecutive frames; every repeat steps the focused field
+    /// and none of them moves focus to the field above.
+    #[test]
+    fn held_arrow_keeps_stepping_the_focused_field() {
+        let mut h = Harness::new_ui_state(
+            |ui, s: &mut (f32, f32)| {
+                super::value_field(ui, &mut s.0, 0.0..=1000.0, "", 80.0);
+                super::value_field(ui, &mut s.1, 0.0..=1000.0, "", 80.0);
+            },
+            (10.0, 59.0),
+        );
+        h.run();
+        h.get_all_by_role(egui::accesskit::Role::SpinButton).nth(1).expect("second field").click();
+        h.run();
+        // Held down: key-down repeats on consecutive frames, no key-up in between.
+        for repeat in [false, true, true, true, true, true] {
+            h.event(egui::Event::Key { key: Key::ArrowUp, physical_key: None, pressed: true, repeat, modifiers: Modifiers::NONE });
+            h.step();
+        }
+        h.event(egui::Event::Key { key: Key::ArrowUp, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE });
+        h.run();
+        assert_eq!(*h.state(), (10.0, 65.0));
     }
 
     #[test]
@@ -2080,6 +2669,29 @@ mod tests {
         h.key_press(egui::Key::Enter);
         h.run();
         assert_eq!(*h.state(), (25.0, 3));
+    }
+
+    /// #5717: a value past the range shows as it is without reporting a change; an edit is clamped.
+    #[test]
+    fn value_field_keeps_a_shown_value_past_its_range_and_clamps_edits() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let mut h = Harness::builder().with_size(egui::vec2(300.0, 100.0)).build_ui_state(
+            |ui, (v, changes): &mut (f32, u32)| {
+                if super::value_field(ui, v, 0.1..=1296.0, "pt", 90.0).changed() {
+                    *changes += 1;
+                }
+            },
+            (2400.0, 0),
+        );
+        h.run_steps(3);
+        assert_eq!(*h.state(), (2400.0, 0), "showing it changes nothing");
+        h.get_by_role(egui::accesskit::Role::SpinButton).click();
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        h.event(egui::Event::Text("5000".into()));
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(h.state().0, 1296.0, "a typed value is clamped");
     }
 
     #[test]
@@ -2413,3 +3025,7 @@ mod screen_color_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "widgets/numeric_input_tests.rs"]
+mod numeric_input_tests;

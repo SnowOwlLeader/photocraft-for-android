@@ -19,7 +19,7 @@ use photocraft_geom::Rect;
 use serde_json::{Value, json};
 
 use crate::commands::CommandSpec;
-use crate::file_cmds::{join, native_doc, stem, write_file};
+use crate::file_cmds::{is_windows_device_name, join, native_doc, portable_device_name, stem, write_file};
 use crate::{EngineError, Result, Session};
 
 fn bad(cmd: &str, msg: impl Into<String>) -> EngineError {
@@ -70,6 +70,9 @@ pub enum WebMetadata {
     None,
     Copyright,
     CopyrightAndContact,
+    /// All the XMP, none of the photo's EXIF (camera, date taken, GPS).
+    AllExceptCameraInfo,
+    /// All the XMP and the photo's EXIF.
     All,
 }
 
@@ -79,6 +82,10 @@ pub struct WebSettings {
     pub format: WebFormat,
     pub palette: PaletteKind,
     pub colors: usize,
+    /// Fixed opaque source palette in index order.
+    pub color_table: Option<Vec<[u8; 3]>>,
+    /// Replacements applied after quantization, preserving pixel indices.
+    pub color_table_edits: std::collections::BTreeMap<usize, [u8; 3]>,
     pub dither: Dither,
     /// 0..=1.
     pub dither_amount: f32,
@@ -104,6 +111,8 @@ impl Default for WebSettings {
             format: WebFormat::Png24,
             palette: PaletteKind::Selective,
             colors: 256,
+            color_table: None,
+            color_table_edits: Default::default(),
             dither: Dither::Diffusion,
             dither_amount: 0.88,
             transparency: true,
@@ -130,8 +139,13 @@ fn hex3(s: &str) -> Option<[f32; 3]> {
 impl WebSettings {
     /// Settings from command parameters (missing keys keep the defaults; Photoshop's preset
     /// names such as "GIF 128 Dithered" or "JPEG High" are accepted as `"preset"`).
+    ///
+    /// Without a preset there is no matte, as in Photoshop's scripted Save for Web
+    /// (`ExportOptionsSaveForWeb` left at its defaults): a GIF or PNG-8 keeps the colour of its
+    /// partly transparent pixels instead of lightening them towards white (#4115). Formats
+    /// without transparency still go over white.
     pub fn from_params(p: &Value, cmd: &str) -> Result<Self> {
-        let mut st = WebSettings::default();
+        let mut st = WebSettings { matte: None, ..WebSettings::default() };
         if let Some(preset) = p.get("preset").and_then(Value::as_str) {
             st = preset_settings(preset).ok_or_else(|| bad(cmd, format!("unknown preset `{preset}`")))?;
         }
@@ -192,9 +206,31 @@ impl WebSettings {
                 "none" => WebMetadata::None,
                 "copyright" => WebMetadata::Copyright,
                 "copyrightAndContact" | "contact" => WebMetadata::CopyrightAndContact,
-                "all" | "allExceptCameraInfo" => WebMetadata::All,
-                m => return Err(bad(cmd, format!("unknown metadata `{m}` (none|copyright|copyrightAndContact|all)"))),
+                "allExceptCameraInfo" => WebMetadata::AllExceptCameraInfo,
+                "all" => WebMetadata::All,
+                m => return Err(bad(cmd, format!("unknown metadata `{m}` (none|copyright|copyrightAndContact|allExceptCameraInfo|all)"))),
             };
+        }
+        if let Some(table) = p.get("colorTable") {
+            let table = table.as_array().filter(|a| (1..=256).contains(&a.len())).ok_or_else(|| bad(cmd, "colorTable must contain 1–256 #rrggbb colours"))?;
+            st.color_table = Some(
+                table
+                    .iter()
+                    .map(|v| v.as_str().and_then(hex3).map(|c| c.map(to8)).ok_or_else(|| bad(cmd, "colorTable entries must be #rrggbb colours")))
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
+        if let Some(edits) = p.get("colorTableEdits") {
+            let edits = edits
+                .as_object()
+                .filter(|m| m.len() <= 256)
+                .ok_or_else(|| bad(cmd, "colorTableEdits must be an object of palette indices to #rrggbb colours"))?;
+            let table = st.color_table.as_ref().ok_or_else(|| bad(cmd, "colorTableEdits requires colorTable"))?;
+            for (index, value) in edits {
+                let index = index.parse::<usize>().ok().filter(|i| *i < table.len()).ok_or_else(|| bad(cmd, "colorTableEdits index is outside colorTable"))?;
+                let color = value.as_str().and_then(hex3).map(|c| c.map(to8)).ok_or_else(|| bad(cmd, "colorTableEdits values must be #rrggbb colours"))?;
+                st.color_table_edits.insert(index, color);
+            }
         }
         Ok(st)
     }
@@ -230,11 +266,25 @@ impl WebSettings {
             WebMetadata::None => "none",
             WebMetadata::Copyright => "copyright",
             WebMetadata::CopyrightAndContact => "copyrightAndContact",
+            WebMetadata::AllExceptCameraInfo => "allExceptCameraInfo",
             WebMetadata::All => "all",
         };
         let matte = self.matte.map_or("none".to_string(), |c| format!("#{:02x}{:02x}{:02x}", to8(c[0]), to8(c[1]), to8(c[2])));
-        json!({"format": format, "palette": palette, "colors": self.colors, "dither": dither, "ditherAmount": (self.dither_amount * 100.0).round(), "transparency": self.transparency, "matte": matte, "interlaced": self.interlaced, "webSnap": (self.web_snap * 100.0).round(), "quality": self.quality, "progressive": self.progressive, "optimized": self.optimized, "embedIcc": self.embed_icc, "metadata": metadata, "convertToSrgb": self.convert_to_srgb})
+        let mut p = json!({"format": format, "palette": palette, "colors": self.colors, "dither": dither, "ditherAmount": (self.dither_amount * 100.0).round(), "transparency": self.transparency, "matte": matte, "interlaced": self.interlaced, "webSnap": (self.web_snap * 100.0).round(), "quality": self.quality, "progressive": self.progressive, "optimized": self.optimized, "embedIcc": self.embed_icc, "metadata": metadata, "convertToSrgb": self.convert_to_srgb});
+        if let Some(table) = &self.color_table {
+            p["colorTable"] = json!(table.iter().map(|c| rgb_hex(*c)).collect::<Vec<_>>());
+        }
+        if !self.color_table_edits.is_empty() {
+            p["colorTableEdits"] =
+                json!(self.color_table_edits.iter().map(|(i, c)| (i.to_string(), rgb_hex(*c))).collect::<std::collections::BTreeMap<_, _>>());
+        }
+        p
     }
+}
+
+/// A palette colour in command/control-channel notation.
+pub fn rgb_hex(c: [u8; 3]) -> String {
+    format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
 }
 
 /// Save for Web's named presets.
@@ -324,6 +374,11 @@ pub struct Optimized {
     pub height: u32,
     /// Colours in the palette (indexed formats).
     pub colors: Option<usize>,
+    /// Opaque source palette before replacements (empty for non-indexed formats).
+    pub color_table: Vec<[u8; 3]>,
+    pub transparent_index: Option<usize>,
+    /// Indexed pixels for previews; empty for non-indexed formats or when preview is disabled.
+    pub indices: Vec<u8>,
     /// What the optimised file looks like, straight RGBA8 (for the dialog's previews).
     pub preview: Vec<u8>,
 }
@@ -337,7 +392,7 @@ pub fn web_xmp(doc: &Document, m: WebMetadata) -> Option<String> {
     let xmp = doc.metadata.xmp.as_deref()?;
     match m {
         WebMetadata::None => None,
-        WebMetadata::All => Some(xmp.to_string()),
+        WebMetadata::All | WebMetadata::AllExceptCameraInfo => Some(xmp.to_string()),
         WebMetadata::Copyright | WebMetadata::CopyrightAndContact => {
             let info = crate::file_cmds::read_file_info(Some(xmp));
             let mut keep = serde_json::Map::new();
@@ -355,17 +410,41 @@ pub fn web_xmp(doc: &Document, m: WebMetadata) -> Option<String> {
     }
 }
 
+/// The photo's EXIF to embed for the metadata choice: only "All" carries it (#7436).
+pub fn web_exif(doc: &Document, m: WebMetadata) -> Option<&[u8]> {
+    doc.metadata.exif.as_deref().map(Vec::as_slice).filter(|_| m == WebMetadata::All)
+}
+
+/// The response's warnings: EXIF that a JPEG couldn't hold (one segment, about 64 KB).
+fn web_warnings(st: &WebSettings, exif: Option<&[u8]>, dpi: f32) -> Vec<String> {
+    exif.filter(|x| st.format == WebFormat::Jpeg && !photocraft_codecs::web::jpeg_exif_fits(x, Some(dpi)))
+        .map(|x| photocraft_codecs::FidelityWarning::MetadataTooLarge { what: "EXIF", bytes: x.len() }.to_string())
+        .into_iter()
+        .collect()
+}
+
 /// Optimises `rect` of `px` (straight RGBA, `bw` wide) with `st`. `preview` also returns what
 /// the file looks like (the dialog's panes); exports skip it.
 #[allow(clippy::too_many_arguments)]
-pub fn optimize(px: &[[f32; 4]], bw: usize, rect: Rect, st: &WebSettings, icc: Option<&[u8]>, xmp: Option<&str>, dpi: f32, preview: bool) -> Result<Optimized> {
-    let (w, h) = (rect.width() as usize, rect.height() as usize);
-    if w == 0 || h == 0 {
-        return Err(other("empty slice"));
+pub fn optimize(
+    px: &[[f32; 4]],
+    bw: usize,
+    rect: Rect,
+    st: &WebSettings,
+    icc: Option<&[u8]>,
+    exif: Option<&[u8]>,
+    xmp: Option<&str>,
+    dpi: f32,
+    preview: bool,
+) -> Result<Optimized> {
+    if bw == 0 || rect.x0 < 0 || rect.y0 < 0 || rect.is_empty() || rect.x1 as usize > bw || (rect.y1 as usize).checked_mul(bw).is_none_or(|end| end > px.len())
+    {
+        return Err(other("slice is outside the pixel buffer"));
     }
+    let (w, h) = (rect.width() as usize, rect.height() as usize);
     let row = |y: i32| {
         let o = y as usize * bw;
-        &px[o + rect.x0 as usize..o + rect.x1 as usize]
+        px.get(o + rect.x0 as usize..o + rect.x1 as usize).unwrap_or(&[])
     };
     let region = || (rect.y0..rect.y1).flat_map(row);
     let matte = st.matte.unwrap_or([1.0, 1.0, 1.0]);
@@ -375,6 +454,9 @@ pub fn optimize(px: &[[f32; 4]], bw: usize, rect: Rect, st: &WebSettings, icc: O
     let (ww, hh) = (w as u32, h as u32);
     let e = |e: photocraft_codecs::CodecError| other(e);
     let mut look: Vec<u8> = Vec::new();
+    let mut color_table = Vec::new();
+    let mut transparent_index = None;
+    let mut indices = Vec::new();
     let (bytes, colors) = match st.format {
         WebFormat::Png24 => {
             let alpha = st.transparency && region().any(|p| p[3] < 1.0);
@@ -406,8 +488,9 @@ pub fn optimize(px: &[[f32; 4]], bw: usize, rect: Rect, st: &WebSettings, icc: O
             }
             // Save for Web's 0–100 quality → encoder 1–100.
             let q = st.quality.max(1);
-            let bytes = photocraft_codecs::web::encode_jpeg_rgb8(ww, hh, &rgb, q, st.progressive, st.optimized, icc.filter(|_| st.embed_icc), Some(dpi), xmp)
-                .map_err(e)?;
+            let bytes =
+                photocraft_codecs::web::encode_jpeg_rgb8(ww, hh, &rgb, q, st.progressive, st.optimized, icc.filter(|_| st.embed_icc), Some(dpi), exif, xmp)
+                    .map_err(e)?;
             if preview {
                 // The preview shows the compression artefacts.
                 look = match photocraft_codecs::decode(&bytes) {
@@ -451,16 +534,22 @@ pub fn optimize(px: &[[f32; 4]], bw: usize, rect: Rect, st: &WebSettings, icc: O
                 })
                 .collect();
             let room = if transparent { st.colors.saturating_sub(1).max(2) } else { st.colors };
-            // Large images: build adaptive palettes from an even ~1 MP sample (Exact needs all).
-            let n_opaque = work.iter().filter(|p| p[3] >= 0.5).count();
-            let step = if n_opaque > 1 << 20 && st.palette != PaletteKind::Exact { n_opaque / (1 << 20) + 1 } else { 1 };
-            let mut src: Vec<[f32; 4]> = work.iter().filter(|p| p[3] >= 0.5).step_by(step).copied().collect();
-            if src.is_empty() {
-                src = work.clone();
-            }
-            let mut pal = quantize::build_palette(&src, st.palette, room, Forced::None).map_err(other)?;
-            drop(src);
-            if st.web_snap > 0.0 {
+            let mut pal = if let Some(table) = &st.color_table {
+                if table.is_empty() || table.len() > if transparent { 255 } else { 256 } {
+                    return Err(other("colorTable has too many entries for this image's transparency"));
+                }
+                table.clone()
+            } else {
+                // Large images: build adaptive palettes from an even ~1 MP sample (Exact needs all).
+                let n_opaque = work.iter().filter(|p| p[3] >= 0.5).count();
+                let step = if n_opaque > 1 << 20 && st.palette != PaletteKind::Exact { n_opaque / (1 << 20) + 1 } else { 1 };
+                let mut src: Vec<[f32; 4]> = work.iter().filter(|p| p[3] >= 0.5).step_by(step).copied().collect();
+                if src.is_empty() {
+                    src = work.clone();
+                }
+                quantize::build_palette(&src, st.palette, room, Forced::None).map_err(other)?
+            };
+            if st.web_snap > 0.0 && st.color_table.is_none() {
                 let tol = (st.web_snap * 255.0) as u8;
                 for c in &mut pal {
                     let snap = c.map(|x| ((f32::from(x) / 51.0).round() * 51.0) as u8);
@@ -472,16 +561,23 @@ pub fn optimize(px: &[[f32; 4]], bw: usize, rect: Rect, st: &WebSettings, icc: O
             if transparent {
                 pal.truncate(255);
             }
+            let first = pal.first().copied().ok_or_else(|| other("empty colour table"))?;
+            color_table = pal.clone();
             let t = transparent.then(|| {
-                pal.push(pal[0]);
+                pal.push(first);
                 pal.len() - 1
             });
+            transparent_index = t;
             let idx = quantize_rows(&mut work, w, &pal, st.dither, st.dither_amount, t);
+            for (index, color) in &st.color_table_edits {
+                let slot = pal.get_mut(*index).filter(|_| Some(*index) != t).ok_or_else(|| other("colour edit is outside the opaque palette"))?;
+                *slot = *color;
+            }
             if preview {
                 look = idx
                     .iter()
                     .flat_map(|k| {
-                        let c = pal[*k as usize];
+                        let c = pal.get(*k as usize).copied().unwrap_or(first);
                         [c[0], c[1], c[2], if Some(*k as usize) == t { 0 } else { 255 }]
                     })
                     .collect();
@@ -490,12 +586,15 @@ pub fn optimize(px: &[[f32; 4]], bw: usize, rect: Rect, st: &WebSettings, icc: O
             let bytes = if st.format == WebFormat::Gif {
                 photocraft_codecs::web::encode_gif_indexed(ww, hh, &idx, &pal, tt, st.interlaced).map_err(e)?
             } else {
-                photocraft_codecs::encode_png_indexed(ww, hh, &idx, &pal, tt, None).map_err(e)?
+                photocraft_codecs::encode_png_indexed(ww, hh, &idx, &pal, tt, None, None).map_err(e)?
             };
+            if preview {
+                indices = idx;
+            }
             (bytes, Some(pal.len()))
         }
     };
-    Ok(Optimized { bytes, ext: st.format.ext(), width: ww, height: hh, colors, preview: look })
+    Ok(Optimized { bytes, ext: st.format.ext(), width: ww, height: hh, colors, color_table, transparent_index, indices, preview: look })
 }
 
 /// Nearest palette entry through a lazily filled 6-bit-per-channel inverse colour map: each
@@ -633,7 +732,7 @@ fn slice_file(name: &str) -> String {
 /// Generated filenames should remain usable on Windows even when a document or slice is named
 /// after a reserved device. Caller-supplied path components are still rejected below.
 fn portable_generated_stem(stem: String) -> String {
-    if is_windows_device_asset_name(&stem) { format!("{stem}_") } else { stem }
+    portable_device_name(stem)
 }
 
 fn html_escape(s: &str) -> String {
@@ -772,6 +871,21 @@ pub fn save_for_web_with_writer(s: &mut Session, p: &Value, write: &mut dyn FnMu
     save_for_web_impl(s, p, write, false)
 }
 
+/// Settings to seed the Save for Web dialog from on the next launch: `file_menu` is session
+/// state, so a complete export also writes the preferences' remembered dialog settings (like
+/// Fill, Liquify and the filter dialogs). The destination is per export, never remembered.
+fn remember_web_settings(s: &mut Session, cmd: &str, settings: &Value) {
+    let mut m = settings.clone();
+    if let Some(o) = m.as_object_mut() {
+        for k in ["path", "dir", "trustedSliceHtml"] {
+            o.remove(k);
+        }
+    }
+    s.prefs.edit(|p| {
+        p.dialogs.insert(cmd.to_string(), m);
+    });
+}
+
 fn save_for_web_impl(s: &mut Session, p: &Value, write: &mut dyn FnMut(&str, &[u8]) -> Result<()>, native_paths: bool) -> Result<Value> {
     let cmd = "file.export.saveForWebLegacy";
     if let Some(authorize) = s.authorize {
@@ -788,7 +902,9 @@ fn save_for_web_impl(s: &mut Session, p: &Value, write: &mut dyn FnMut(&str, &[u
     let bw = wdoc.size.width as usize;
     let icc = wdoc.icc_profile.as_deref().map(|v| v.as_slice());
     let xmp = web_xmp(&doc, st.metadata);
+    let exif = web_exif(&doc, st.metadata);
     let dpi = wdoc.resolution_dpi;
+    let warnings = web_warnings(&st, exif, dpi);
     let all = slices::resolve(&doc);
     let pick = p.get("slices").and_then(Value::as_str).unwrap_or("all");
     let numbers: Option<Vec<u64>> = p.get("numbers").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).collect());
@@ -810,15 +926,18 @@ fn save_for_web_impl(s: &mut Session, p: &Value, write: &mut dyn FnMut(&str, &[u
     }
     // Estimate only (the dialog's annotations): the whole image, or each chosen slice.
     if single.is_none() && dir.is_none() {
-        let o = optimize(&buf.px, bw, wdoc.bounds(), &st, icc, xmp.as_deref(), dpi, false)?;
-        return Ok(json!({"format": o.ext, "bytes": o.bytes.len(), "width": o.width, "height": o.height, "colors": o.colors}));
+        let o = optimize(&buf.px, bw, wdoc.bounds(), &st, icc, exif, xmp.as_deref(), dpi, false)?;
+        return Ok(
+            json!({"format": o.ext, "bytes": o.bytes.len(), "width": o.width, "height": o.height, "colors": o.colors, "colorTable": o.color_table.iter().map(|c| rgb_hex(*c)).collect::<Vec<_>>(), "transparentIndex": o.transparent_index}),
+        );
     }
     if let Some(path) = single.filter(|_| dir.is_none() && (all.len() == 1 || p.get("slices").is_none())) {
-        let o = optimize(&buf.px, bw, wdoc.bounds(), &st, icc, xmp.as_deref(), dpi, false)?;
+        let o = optimize(&buf.px, bw, wdoc.bounds(), &st, icc, exif, xmp.as_deref(), dpi, false)?;
         write(path, &o.bytes)?;
+        remember_web_settings(s, cmd, &last_web);
         s.file_menu.last_web = Some(last_web);
         crate::automate_cmds::fire_event(s, "export");
-        return Ok(json!({"files": [path], "bytes": o.bytes.len(), "width": o.width, "height": o.height, "colors": o.colors}));
+        return Ok(json!({"files": [path], "bytes": o.bytes.len(), "width": o.width, "height": o.height, "colors": o.colors, "warnings": warnings}));
     }
     let dir =
         dir.map(str::to_string).or_else(|| single.and_then(|f| std::path::Path::new(f).parent().map(|d| d.to_string_lossy().into_owned()))).unwrap_or_default();
@@ -845,53 +964,42 @@ fn save_for_web_impl(s: &mut Session, p: &Value, write: &mut dyn FnMut(&str, &[u
         }
         name
     };
-    // Stacking order: later stored slices are on top (auto slices never overlap anything).
-    let z = |r: &ResolvedSlice| r.id.and_then(|id| doc.slices.list.iter().position(|sl| sl.id == id));
+    // Slices never overlap here: one covered by later slices comes as its visible pieces (see
+    // `slices::resolve`), each its own image and cell, as Photoshop's subslices. A no-image cell's
+    // text goes into its first piece only.
+    let mut texted = std::collections::HashSet::new();
     for r in &chosen {
-        let rect = scale_rect(r.rect, sx, sy).intersect(&wdoc.bounds());
-        if rect.is_empty() {
+        let piece = scale_rect(r.rect, sx, sy).intersect(&wdoc.bounds());
+        if piece.is_empty() {
             continue;
         }
-        // In the HTML table a slice shows only where no slice above covers it; that visible part
-        // is cut into rectangles, each its own cell (and image), as Photoshop's subslices.
-        let pieces = if html {
-            let above: Vec<Rect> = chosen.iter().filter(|o| z(o) > z(r)).map(|o| scale_rect(o.rect, sx, sy).intersect(&wdoc.bounds())).collect();
-            slices::auto_slices(rect, &above)
-        } else {
-            vec![rect]
-        };
-        let split = pieces.len() > 1;
         let stored = r.id.and_then(|id| doc.slices.get(id));
-        for (k, piece) in pieces.into_iter().enumerate() {
-            if r.kind == SliceKind::NoImage {
-                let text = if k > 0 {
-                    String::new()
-                } else {
-                    stored.map(|s| if trusted_slice_html && s.cell_text_is_html { s.cell_text.clone() } else { html_escape(&s.cell_text) }).unwrap_or_default()
-                };
-                let bg = stored.and_then(|s| s.background).map(|c| format!(" bgcolor=\"#{:02X}{:02X}{:02X}\"", c[1], c[2], c[3])).unwrap_or_default();
-                cells.push((piece, bg, text));
-                continue;
-            }
-            let o = optimize(&buf.px, bw, piece, &st, icc, xmp.as_deref(), dpi, false)?;
-            let stem = if split { format!("{}_{:02}", slice_file(&r.name), k + 1) } else { slice_file(&r.name) };
-            let name = unique(&stem, o.ext);
-            let rel = if images.is_empty() { name.clone() } else { format!("{images}/{name}") };
-            let out = join(&dir, &rel);
-            write(&web_derived_path(&dir, &rel, native_paths)?, &o.bytes)?;
-            total += o.bytes.len();
-            files.push(out);
-            let alt = stored.map_or(String::new(), |s| html_escape(&s.alt));
-            let img = format!("\n\t\t\t<img src=\"{}\" width=\"{}\" height=\"{}\" alt=\"{alt}\">", html_escape(&rel), piece.width(), piece.height());
-            let body = match stored.filter(|s| safe_slice_url(&s.url)) {
-                Some(s) => {
-                    let target = if s.target.is_empty() { String::new() } else { format!(" target=\"{}\"", html_escape(&s.target)) };
-                    format!("\n\t\t\t<a href=\"{}\"{target}>{img}</a>", html_escape(&s.url))
-                }
-                None => img,
-            };
-            cells.push((piece, String::new(), body));
+        if r.kind == SliceKind::NoImage {
+            let text = stored
+                .filter(|s| texted.insert(s.id))
+                .map(|s| if trusted_slice_html && s.cell_text_is_html { s.cell_text.clone() } else { html_escape(&s.cell_text) })
+                .unwrap_or_default();
+            let bg = stored.and_then(|s| s.background).map(|c| format!(" bgcolor=\"#{:02X}{:02X}{:02X}\"", c[1], c[2], c[3])).unwrap_or_default();
+            cells.push((piece, bg, text));
+            continue;
         }
+        let o = optimize(&buf.px, bw, piece, &st, icc, exif, xmp.as_deref(), dpi, false)?;
+        let name = unique(&slice_file(&r.name), o.ext);
+        let rel = if images.is_empty() { name.clone() } else { format!("{images}/{name}") };
+        let out = join(&dir, &rel);
+        write(&web_derived_path(&dir, &rel, native_paths)?, &o.bytes)?;
+        total += o.bytes.len();
+        files.push(out);
+        let alt = stored.map_or(String::new(), |s| html_escape(&s.alt));
+        let img = format!("\n\t\t\t<img src=\"{}\" width=\"{}\" height=\"{}\" alt=\"{alt}\">", html_escape(&rel), piece.width(), piece.height());
+        let body = match stored.filter(|s| safe_slice_url(&s.url)) {
+            Some(s) => {
+                let target = if s.target.is_empty() { String::new() } else { format!(" target=\"{}\"", html_escape(&s.target)) };
+                format!("\n\t\t\t<a href=\"{}\"{target}>{img}</a>", html_escape(&s.url))
+            }
+            None => img,
+        };
+        cells.push((piece, String::new(), body));
     }
     let mut html_path = None;
     if html {
@@ -906,9 +1014,12 @@ fn save_for_web_impl(s: &mut Session, p: &Value, write: &mut dyn FnMut(&str, &[u
         write(&web_derived_path(&dir, &format!("{base}.html"), native_paths)?, page.as_bytes())?;
         html_path = Some(hp);
     }
+    remember_web_settings(s, cmd, &last_web);
     s.file_menu.last_web = Some(last_web);
     crate::automate_cmds::fire_event(s, "export");
-    Ok(json!({"files": files, "html": html_path, "bytes": total, "slices": chosen.len(), "width": wdoc.size.width, "height": wdoc.size.height}))
+    Ok(
+        json!({"files": files, "html": html_path, "bytes": total, "slices": chosen.len(), "width": wdoc.size.width, "height": wdoc.size.height, "warnings": warnings}),
+    )
 }
 
 // ---------- Export Preferences / Quick Export ----------
@@ -935,27 +1046,65 @@ fn export_preferences(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"section": "export", "values": s.prefs().get("export").unwrap_or(Value::Null)}))
 }
 
+/// The Quick Export format's extension (Export Preferences › Format).
+fn quick_export_ext(s: &Session) -> String {
+    serde_json::to_value(s.prefs().export.quick_export_format).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "png".into())
+}
+
+/// Where Quick Export writes the active document with no `path` given: `<name>.<format>` beside
+/// its file, when Export Preferences › Location is Same Folder and the document has a file.
+pub fn quick_export_target(s: &Session) -> Option<String> {
+    let same = s.prefs().export.quick_export_location == crate::prefs::ExportLocation::SameFolder;
+    let dp = s.active()?.path.as_deref().filter(|_| same)?;
+    let dir = std::path::Path::new(dp).parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
+    Some(join(&dir, &format!("{}.{}", stem(dp), quick_export_ext(s))))
+}
+
+/// Whether [`quick_export_target`] is the active document's own file (a document opened from
+/// `photo.png` and exported as PNG), which Quick Export must not replace without asking (#6599).
+pub fn quick_export_target_is_own_file(s: &Session) -> bool {
+    let own = s.active().and_then(|d| d.path.as_deref());
+    quick_export_target(s).zip(own).is_some_and(|(target, own)| crate::file_cmds::same_file(&target, own))
+}
+
 /// File › Export › Quick Export as <format>: the format, quality, metadata, colour space and
 /// location from Export Preferences. `path` overrides the location ("ask" needs one).
 fn quick_export(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "file.export.quickExport";
     let prefs = s.prefs().export.clone();
-    let fmt = serde_json::to_value(prefs.quick_export_format).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "png".into());
-    let d = s.active().ok_or(EngineError::NoDocument)?;
-    let doc = d.doc.clone();
+    let fmt = quick_export_ext(s);
     let path = match p.get("path").and_then(Value::as_str).filter(|v| !v.is_empty()) {
         Some(v) => v.to_string(),
         None => {
-            let same = serde_json::to_value(prefs.quick_export_location).ok().and_then(|v| v.as_str().map(str::to_string)).is_some_and(|v| v == "sameFolder");
-            match (&d.path, same) {
-                (Some(dp), true) => {
-                    let dir = std::path::Path::new(dp).parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
-                    join(&dir, &format!("{}.{fmt}", stem(dp)))
-                }
-                _ => return Err(bad(cmd, "missing `path` (Export Preferences › Location is \"ask\", or the document was never saved)")),
+            let Some(target) = quick_export_target(s) else {
+                return Err(bad(cmd, "missing `path` (Export Preferences › Location is \"ask\", or the document was never saved)"));
+            };
+            // The document's own file is never replaced by an export the user didn't name (#6599).
+            if quick_export_target_is_own_file(s) {
+                return Err(bad(cmd, format!("the export would replace the document's own file {target}; give a `path`")));
             }
+            target
         }
     };
+    // The name typed in the save dialog wins over Export Preferences' format: Quick Export as PNG
+    // renamed to `photo.jpeg` must write a JPEG, not PNG bytes upload checks refuse (#8519).
+    let fmt = match crate::file_cmds::extension(&path).as_deref() {
+        None => fmt,
+        Some("jpg" | "jpeg") => "jpg".into(),
+        Some(e @ ("png" | "gif" | "webp" | "exr")) => e.into(),
+        Some(e) => return Err(bad(cmd, format!("Quick Export writes PNG, JPEG, GIF, WebP or EXR, not .{e}; use Export As"))),
+    };
+    let d = s.active().ok_or(EngineError::NoDocument)?;
+    let doc = d.doc.clone();
+    if fmt == "exr" {
+        // EXR keeps floating-point scene values. The ordinary exporter converts to linear
+        // light; the web/sRGB pipeline would instead clamp HDR and negative values.
+        let opts = photocraft_io::ExportOptions { xmp: photocraft_io::XmpEmbed::None, ..Default::default() };
+        let out = photocraft_io::export(&doc, "exr", &opts).map_err(other)?;
+        write_file(&path, &out.bytes)?;
+        crate::automate_cmds::fire_event(s, "export");
+        return Ok(json!({"path": path, "format": fmt, "bytes": out.bytes.len(), "warnings": out.warnings}));
+    }
     let metadata = serde_json::to_value(prefs.metadata).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
     let mut o = serde_json::Map::new();
     o.insert(
@@ -970,6 +1119,7 @@ fn quick_export(s: &mut Session, p: &Value) -> Result<Value> {
     );
     o.insert("convertToSrgb".into(), json!(prefs.convert_to_srgb));
     o.insert("transparency".into(), json!(true));
+    o.insert("matte".into(), json!("#ffffff"));
     match fmt.as_str() {
         "jpg" => {
             o.insert("format".into(), json!("jpeg"));
@@ -997,19 +1147,21 @@ fn quick_export(s: &mut Session, p: &Value) -> Result<Value> {
     let (wdoc, _, _) = web_document(&doc, &json!({}), &st)?;
     let buf = photocraft_compose::flatten(&wdoc);
     let xmp = web_xmp(&doc, st.metadata);
+    let exif = web_exif(&doc, st.metadata);
     let opt = optimize(
         &buf.px,
         wdoc.size.width as usize,
         wdoc.bounds(),
         &st,
         wdoc.icc_profile.as_deref().map(|v| v.as_slice()),
+        exif,
         xmp.as_deref(),
         wdoc.resolution_dpi,
         false,
     )?;
     write_file(&path, &opt.bytes)?;
     crate::automate_cmds::fire_event(s, "export");
-    Ok(json!({"path": path, "format": fmt, "bytes": opt.bytes.len()}))
+    Ok(json!({"path": path, "format": fmt, "bytes": opt.bytes.len(), "warnings": web_warnings(&st, exif, wdoc.resolution_dpi)}))
 }
 
 // ---------- Generate › Image Assets ----------
@@ -1078,8 +1230,12 @@ fn parse_size(item: &str, dpi: f64) -> (Option<f64>, Option<f64>, Option<f64>, &
         && toks[1].eq_ignore_ascii_case("x")
         && let (Some(w), Some(h)) = (unit_px(toks[0], dpi), unit_px(toks[2], dpi))
     {
-        let pos = item.find(toks[3]).unwrap_or(item.len());
-        return (None, w, h, &item[pos..]);
+        // Skip exactly the three size tokens; searching for the name's first word could match inside the size.
+        let mut rest = item;
+        for _ in 0..3 {
+            rest = rest.trim_start().trim_start_matches(|c: char| !c.is_whitespace());
+        }
+        return (None, w, h, rest.trim_start());
     }
     (None, None, None, item)
 }
@@ -1157,13 +1313,6 @@ fn asset_settings(spec: &AssetSpec) -> WebSettings {
     }
 }
 
-fn is_windows_device_asset_name(component: &str) -> bool {
-    let stem = component.split('.').next().unwrap_or(component).trim_end_matches(' ').to_ascii_uppercase();
-    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$")
-        || stem.strip_prefix("COM").is_some_and(|n| matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"))
-        || stem.strip_prefix("LPT").is_some_and(|n| matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"))
-}
-
 /// Layer names and `default` folders are document data, so reject unsafe output components.
 fn asset_path_components(relative: &str) -> Result<Vec<&str>> {
     // Split both separator styles even on Unix, where a backslash would otherwise be a legal
@@ -1177,7 +1326,7 @@ fn asset_path_components(relative: &str) -> Result<Vec<&str>> {
             || part.ends_with(' ')
             || part.contains(':')
             || part.contains('\0')
-            || is_windows_device_asset_name(part)
+            || is_windows_device_name(part)
         {
             return Err(other(format!("asset path {relative:?} has an unsafe component {part:?}")));
         }
@@ -1247,10 +1396,15 @@ fn asset_output_path(dir: &str, relative: &str) -> Result<(String, String)> {
 }
 
 /// Exports every asset named by `doc`'s layers into `dir`. Returns (files, errors).
+///
+/// Each file is written once per run (#6614): when two layers (or two default variants) name the
+/// same file, the one higher in the Layers panel keeps it and the other is reported in `errors`.
+/// Names are compared ignoring case, as `Logo.png` and `logo.png` are one file on Windows and
+/// macOS.
 pub fn generate_assets(doc: &Document, dir: &str) -> (Vec<String>, Vec<Value>) {
     let dpi = f64::from(doc.resolution_dpi.max(1.0));
     let mut defaults: Option<Vec<AssetDefault>> = None;
-    let mut jobs: Vec<(LayerId, AssetSpec)> = Vec::new();
+    let mut by_layer: Vec<Vec<(LayerId, AssetSpec)>> = Vec::new();
     for (_, _, l) in doc.walk() {
         if let Some(d) = parse_defaults(&l.name, dpi) {
             defaults = Some(d);
@@ -1259,22 +1413,26 @@ pub fn generate_assets(doc: &Document, dir: &str) -> (Vec<String>, Vec<Value>) {
         if matches!(l.content, LayerContent::Adjustment(_)) {
             continue;
         }
-        for spec in parse_asset_name(&l.name, dpi) {
-            jobs.push((l.id, spec));
-        }
+        by_layer.push(parse_asset_name(&l.name, dpi).into_iter().map(|spec| (l.id, spec)).collect());
     }
+    // Top layer first, as the Layers panel lists them (`walk` goes bottom to top).
+    let jobs: Vec<(LayerId, AssetSpec)> = by_layer.into_iter().rev().flatten().collect();
     let variants: Vec<AssetDefault> = match defaults {
         Some(d) if !d.is_empty() => d,
         _ => vec![AssetDefault::default()],
     };
     let mut files = Vec::new();
     let mut errors = Vec::new();
+    let mut written = std::collections::HashSet::new();
     for (id, spec) in &jobs {
         for v in &variants {
             let r = (|| -> Result<String> {
                 let (name_stem, ext) = spec.file.rsplit_once('.').unwrap_or((spec.file.as_str(), "png"));
                 let rel = format!("{}{}{}.{ext}", v.folder, name_stem, v.suffix);
-                asset_path_components(&rel)?;
+                let key = asset_path_components(&rel)?.join("/").to_lowercase();
+                if written.contains(&key) {
+                    return Err(other(format!("{rel}: another layer already writes this file; rename one of the layers")));
+                }
                 let mut one = crate::layer_menu_cmds::layer_document(doc, *id)?;
                 one.metadata = Default::default();
                 let (w0, h0) = (f64::from(one.size.width), f64::from(one.size.height));
@@ -1302,12 +1460,14 @@ pub fn generate_assets(doc: &Document, dir: &str) -> (Vec<String>, Vec<Value>) {
                 if spec.format == "webp" {
                     let (out, reported) = asset_output_path(dir, &rel)?;
                     crate::file_cmds::save_doc(&wdoc, &out, None)?;
+                    written.insert(key);
                     return Ok(reported);
                 }
                 let buf = photocraft_compose::flatten(&wdoc);
-                let o = optimize(&buf.px, wdoc.size.width as usize, wdoc.bounds(), &st, None, None, wdoc.resolution_dpi, false)?;
+                let o = optimize(&buf.px, wdoc.size.width as usize, wdoc.bounds(), &st, None, None, None, wdoc.resolution_dpi, false)?;
                 let (out, reported) = asset_output_path(dir, &rel)?;
                 write_file(&out, &o.bytes)?;
+                written.insert(key);
                 Ok(reported)
             })();
             match r {
@@ -1378,7 +1538,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Save for Web (Legacy)…",
             &["File", "Export"],
             Some("Cmd+Alt+Shift+S"),
-            r##"{"preset":"GIF 128 Dithered|JPEG High|PNG-24|…"?,"format":"gif|png8|png24|jpeg|wbmp"="png24","palette":"perceptual|selective|adaptive|restrictive|exact|systemMac|systemWindows|uniform"="selective","colors":2..256=256,"dither":"none|diffusion|pattern|noise"="diffusion","ditherAmount":0..100=88,"transparency":bool=true,"matte":"#rrggbb|none"="#ffffff","interlaced":bool=false,"webSnap":0..100=0,"quality":0..100=60,"progressive":bool=false,"optimized":bool=true,"embedIcc":bool=false,"metadata":"none|copyright|copyrightAndContact|all"="copyright","convertToSrgb":bool=true,"width"|"height"|"percent"? (image size),"resample":"bicubic|bilinear|nearest"?,"path":file? (whole image),"dir":folder? (one file per slice in images/),"imagesFolder":relative-folder?="images","html":bool=false,"trustedSliceHtml":bool=false (only for trusted documents; emit raw no-image cell HTML),"slices":"all|user"="all","numbers":[n]?} → no path/dir: {bytes,width,height,colors} estimate; else {files, html, bytes}"##,
+            r##"{"preset":"GIF 128 Dithered|JPEG High|PNG-24|…"?,"format":"gif|png8|png24|jpeg|wbmp"="png24","palette":"perceptual|selective|adaptive|restrictive|exact|systemMac|systemWindows|uniform"="selective","colors":2..256=256,"colorTable":["#rrggbb",…]? (fixed opaque source palette, 1–256 entries; 255 with transparency),"colorTableEdits":{"0":"#rrggbb",…}? (replace entries after indexing; requires colorTable),"dither":"none|diffusion|pattern|noise"="diffusion","ditherAmount":0..100=88,"transparency":bool=true,"matte":"#rrggbb|none"="none" (a preset's own: white; formats without transparency go over white),"interlaced":bool=false,"webSnap":0..100=0,"quality":0..100=60,"progressive":bool=false,"optimized":bool=true,"embedIcc":bool=false,"metadata":"none|copyright|copyrightAndContact|allExceptCameraInfo|all"="copyright" (EXIF only with all),"convertToSrgb":bool=true,"width"|"height"|"percent"? (image size),"resample":"bicubic|bilinear|nearest"?,"path":file? (whole image),"dir":folder? (one file per slice in images/),"imagesFolder":relative-folder?="images","html":bool=false,"trustedSliceHtml":bool=false (only for trusted documents; emit raw no-image cell HTML),"slices":"all|user"="all","numbers":[n]?} → no path/dir: {bytes,width,height,colors,colorTable,transparentIndex} estimate; else {files, html, bytes, warnings}"##,
             has_doc,
             save_for_web
         ),
@@ -1387,7 +1547,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Export Preferences…",
             &["File", "Export"],
             None,
-            r##"{"quickExportFormat":"png|jpg|gif|webp"?,"quickExportLocation":"ask|sameFolder"?,"jpegQuality":1..100?,"webpLossless":bool?,"webpQuality":1..100?,"metadata":"none|copyright|all"?,"convertToSrgb":bool?} → {values}"##,
+            r##"{"quickExportFormat":"png|jpg|gif|webp|exr"?,"quickExportLocation":"ask|sameFolder"?,"jpegQuality":1..100?,"webpLossless":bool?,"webpQuality":1..100?,"metadata":"none|copyright|all"?,"convertToSrgb":bool?} → {values}"##,
             |_| Ok(()),
             export_preferences
         ),
@@ -1396,7 +1556,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Quick Export",
             &[],
             None,
-            r##"{"path":str? (required unless Export Preferences › Location is "sameFolder" and the document is saved)} → {path, format, bytes}"##,
+            r##"{"path":str? (required unless Export Preferences › Location is "sameFolder" and the document is saved)} → {path, format, bytes, warnings}"##,
             native_doc,
             quick_export
         ),

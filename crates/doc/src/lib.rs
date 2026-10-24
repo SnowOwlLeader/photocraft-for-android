@@ -1,4 +1,4 @@
-//! The Photocraft document model: pure data, no rendering, no UI.
+//! The PhotoCraft document model: pure data, no rendering, no UI.
 //!
 //! Layer order: inside every group (and the root), `children[0]` is the **bottom** layer, matching
 //! compositing order and the PSD file order. UIs display the list reversed.
@@ -99,6 +99,32 @@ pub struct Locks {
 }
 
 impl Locks {
+    /// Set the lock a command names (`transparency`, `pixels`, `position`, `artboard`, `all`);
+    /// false for an unknown name. Lock Image Pixels includes Lock Transparent Pixels, so, as in
+    /// Photoshop, locking the pixels clears the transparency lock, and that one stays off while the
+    /// pixels are locked (#4892).
+    pub fn set(&mut self, key: &str, on: bool) -> bool {
+        match key {
+            "transparency" => self.transparency = on && !self.pixels,
+            "pixels" => {
+                self.pixels = on;
+                if on {
+                    self.transparency = false;
+                }
+            }
+            "position" => self.position = on,
+            "artboard" => self.artboard = on,
+            "all" => self.all = on,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Whether any lock is set: Photoshop then shows the lock icon on the layer's row.
+    pub fn any(self) -> bool {
+        self.transparency || self.pixels || self.position || self.artboard || self.all
+    }
+
     pub fn union(self, o: Locks) -> Locks {
         Locks {
             transparency: self.transparency || o.transparency,
@@ -633,6 +659,10 @@ pub struct Layer {
     pub advanced: AdvancedBlending,
     /// Layer › Video Layers frame stack (None for a normal layer).
     pub video: Option<VideoData>,
+    /// The layer's own XMP packet (Photoshop's `layer.xmpMetadata.rawData`), where scripts and
+    /// embedding apps keep data about the layer under their own namespaces. Copied by
+    /// [`Layer::duplicate`], as in Photoshop. PSD `shmd` › `cust` › `layerXMP`.
+    pub xmp: Option<Arc<str>>,
 }
 
 impl Layer {
@@ -666,6 +696,7 @@ impl Layer {
             blend_if: BlendIf::default(),
             advanced: AdvancedBlending::default(),
             video: None,
+            xmp: None,
         }
     }
     pub fn raster(name: impl Into<String>, format: PixelFormat) -> Self {
@@ -839,6 +870,10 @@ pub struct Document {
     pub layers: Vec<Layer>,
     pub channels: Vec<AlphaChannel>,
     pub guides: Guides,
+    /// The rulers' zero point in document pixels (`[x, y]`), dragged from the ruler corner. The
+    /// rulers, the Info panel and other position readouts measure from it; `[0, 0]` (the
+    /// image's top-left) is the default.
+    pub ruler_origin: [f64; 2],
     /// Active selection as a grayscale coverage surface (None = no selection).
     pub selection: Option<Surface>,
     pub metadata: Metadata,
@@ -882,8 +917,8 @@ pub struct Document {
     pub variables: Variables,
     /// Window › Timeline (None until a video timeline is created).
     pub timeline: Option<Timeline>,
-    /// How the document's lossy file was encoded (its JPEG quality, WebP lossy or lossless), so
-    /// a save writes it back the same way rather than at fixed defaults.
+    /// How the document's lossy file was encoded (its JPEG quality, WebP lossy or lossless,
+    /// PNG stereo pairing), so a save writes it back the same way rather than at fixed defaults.
     pub file_encoding: FileEncoding,
 }
 
@@ -902,6 +937,11 @@ pub struct FileEncoding {
     /// Lossy WebP quality.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub webp_quality: Option<u8>,
+    /// PNG stereo pairing (the `sTER` chunk's mode byte, PNG Extensions 1.4.0 §3.6): `Some(0)`
+    /// cross-fuse (right eye first), `Some(1)` diverging-fuse (left eye first). Both are
+    /// side by side; saving a stereo PNG keeps this eye-order mark (#6063).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub png_stereo: Option<u8>,
 }
 
 impl FileEncoding {
@@ -926,6 +966,7 @@ impl Document {
             layers: Vec::new(),
             channels: Vec::new(),
             guides: Guides::default(),
+            ruler_origin: [0.0, 0.0],
             selection: None,
             metadata: Metadata::default(),
             global_light: GlobalLight::default(),
@@ -1042,6 +1083,11 @@ impl Document {
         (1..=path.len()).filter_map(|n| self.layer_at(path.get(..n)?)).fold(Locks::default(), |a, l| a.union(l.locks))
     }
 
+    /// Whether the layer at `path` is shown: it and every group around it are visible.
+    pub fn shown_at(&self, path: &[usize]) -> bool {
+        (1..=path.len()).all(|n| path.get(..n).and_then(|p| self.layer_at(p)).is_some_and(|l| l.visible))
+    }
+
     /// [`Self::locks_at`] for the layer `id`.
     pub fn effective_locks(&self, id: LayerId) -> Locks {
         self.path_of(id).map_or_else(Locks::default, |p| self.locks_at(&p))
@@ -1138,6 +1184,16 @@ impl Document {
         id
     }
 
+    /// Insert `layer` directly below the layer `below` (or at the bottom of the root if None).
+    pub fn insert_below(&mut self, below: Option<LayerId>, layer: Layer) -> LayerId {
+        let id = layer.id;
+        match below.and_then(|b| self.path_of(b)).and_then(|path| self.siblings_mut(&path)) {
+            Some((sib, idx)) => sib.insert(idx, layer),
+            None => self.layers.insert(0, layer),
+        }
+        id
+    }
+
     pub fn remove(&mut self, id: LayerId) -> Option<Layer> {
         let path = self.path_of(id)?;
         let (sib, idx) = self.siblings_mut(&path)?;
@@ -1193,6 +1249,19 @@ mod tests {
 
     fn doc() -> Document {
         Document::with_background("t", Size::new(100, 50), ColorMode::Rgb, SampleType::U8, Color::WHITE)
+    }
+
+    #[test]
+    fn any_lock_counts_every_lock() {
+        assert!(!Locks::default().any());
+        let each = [
+            Locks { transparency: true, ..Locks::default() },
+            Locks { pixels: true, ..Locks::default() },
+            Locks { position: true, ..Locks::default() },
+            Locks { artboard: true, ..Locks::default() },
+            Locks { all: true, ..Locks::default() },
+        ];
+        assert!(each.iter().all(|k| k.any()));
     }
 
     #[test]
@@ -1320,6 +1389,17 @@ mod tests {
         assert!(!d.shift(b, 1));
         assert_eq!(d.remove(a).unwrap().name, "A");
         assert!(d.layer(a).is_none());
+    }
+
+    #[test]
+    fn insert_below_lands_under_the_reference() {
+        let mut d = doc();
+        let bg = d.layers[0].id;
+        let a = d.insert_above(Some(bg), Layer::raster("A", d.pixel_format()));
+        let b = d.insert_below(Some(a), Layer::raster("B", d.pixel_format()));
+        let names: Vec<_> = d.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["Background", "B", "A"]);
+        assert_eq!(d.layers[1].id, b);
     }
 
     #[test]

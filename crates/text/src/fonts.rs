@@ -1,6 +1,6 @@
 //! Font database: bundled fonts (always available, also on the web), the optional craft-fonts
-//! Japanese fonts ([`crate::craft_fonts`], when built with `CRAFT_FONTS_DIR`), optional system
-//! fonts found by scanning platform directories (plus Fontconfig's file list on Linux),
+//! fonts of every script ([`crate::craft_fonts`], when built with `CRAFT_FONTS_DIR`), optional
+//! system fonts found by scanning platform directories (plus Fontconfig's file list on Linux),
 //! user-registered font data, and PostScript-name lookup for PSD import.
 
 use std::collections::HashMap;
@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use parley::FontContext;
+#[cfg(any(target_os = "macos", all(test, not(target_arch = "wasm32"))))]
+use parley::fontique::SourceKind;
 use parley::fontique::{Blob, Collection, CollectionOptions, FontInfoOverride, FontStyle, FontWeight, FontWidth, GenericFamily, SourceCache};
 use skrifa::raw::{FileRef, TableProvider, types::Tag};
 use skrifa::{MetadataProvider, string::StringId};
@@ -35,7 +37,7 @@ pub static INTER_MEDIUM: LazyLock<Vec<u8>> = LazyLock::new(|| inflate_font(bundl
 pub static INTER_SEMIBOLD: LazyLock<Vec<u8>> = LazyLock::new(|| inflate_font(bundled_font!("Inter-SemiBold.ttf")));
 pub static JETBRAINS_MONO_REGULAR: LazyLock<Vec<u8>> = LazyLock::new(|| inflate_font(bundled_font!("JetBrainsMono-Regular.ttf")));
 
-/// Fonts shipped with Photocraft (OFL; licences in `assets/fonts`).
+/// Fonts shipped with PhotoCraft (OFL; licences in `assets/fonts`).
 pub static BUNDLED: [(&str, &LazyLock<Vec<u8>>); 4] = [
     ("Inter-Regular.ttf", &INTER_REGULAR),
     ("Inter-Medium.ttf", &INTER_MEDIUM),
@@ -59,7 +61,7 @@ fn inflate_font(deflated: &[u8]) -> Vec<u8> {
 
 /// Families tried (if installed) after the requested one, for missing glyphs. The Southeast Asian
 /// and CJK families ([`THAI_FAMILIES`], [`KHMER_FAMILIES`], [`LAO_FAMILIES`], [`MYANMAR_FAMILIES`],
-/// [`crate::cjk::families`]) go between these two lists, in the UI locale's script order.
+/// [`INDIC_FAMILIES`], [`crate::cjk::families`]) go between these two lists, in the UI locale's script order.
 const FALLBACK_CANDIDATES: &[&str] = &["Noto Sans", "Segoe UI", "DejaVu Sans", "Geeza Pro", "Arial Hebrew", "Noto Sans Arabic", "Noto Sans Hebrew"];
 /// Thai-capable families: Windows (Leelawadee UI since Windows 8; Tahoma and Leelawadee on
 /// older systems), macOS (Thonburi, Sukhumvit Set) and Linux (Noto). Text in a font without Thai
@@ -76,6 +78,38 @@ pub const LAO_FAMILIES: &[&str] = &["Lao Sangam MN", "Lao MN", "Lao UI", "Noto S
 /// Myanmar/Burmese-capable families: macOS (Myanmar Sangam MN, Myanmar MN), Windows (Myanmar Text)
 /// and Linux (Noto).
 pub const MYANMAR_FAMILIES: &[&str] = &["Myanmar Sangam MN", "Myanmar MN", "Myanmar Text", "Noto Sans Myanmar"];
+/// Indic-script families for document text. Windows has `Nirmala UI` for all nine scripts (from
+/// Windows 8); macOS has the Kohinoor and Sangam MN families; Linux has Noto Sans. Indic text in a
+/// font without these glyphs had no candidate to fall back to and drew .notdef boxes (#218).
+pub const DEVANAGARI_FAMILIES: &[&str] = &["Nirmala UI", "Kohinoor Devanagari", "Devanagari Sangam MN", "Noto Sans Devanagari", "Noto Sans Devanagari UI"];
+/// Bengali-capable families (see [`DEVANAGARI_FAMILIES`]).
+pub const BENGALI_FAMILIES: &[&str] = &["Nirmala UI", "Kohinoor Bangla", "Bangla Sangam MN", "Noto Sans Bengali", "Noto Sans Bengali UI"];
+/// Gurmukhi-capable families (see [`DEVANAGARI_FAMILIES`]).
+pub const GURMUKHI_FAMILIES: &[&str] = &["Nirmala UI", "Gurmukhi Sangam MN", "Noto Sans Gurmukhi", "Noto Sans Gurmukhi UI"];
+/// Gujarati-capable families (see [`DEVANAGARI_FAMILIES`]).
+pub const GUJARATI_FAMILIES: &[&str] = &["Nirmala UI", "Kohinoor Gujarati", "Gujarati Sangam MN", "Noto Sans Gujarati", "Noto Sans Gujarati UI"];
+/// Tamil-capable families (see [`DEVANAGARI_FAMILIES`]).
+pub const TAMIL_FAMILIES: &[&str] = &["Nirmala UI", "Tamil Sangam MN", "Noto Sans Tamil", "Noto Sans Tamil UI"];
+/// Telugu-capable families (see [`DEVANAGARI_FAMILIES`]).
+pub const TELUGU_FAMILIES: &[&str] = &["Nirmala UI", "Kohinoor Telugu", "Telugu Sangam MN", "Noto Sans Telugu", "Noto Sans Telugu UI"];
+/// Kannada-capable families (see [`DEVANAGARI_FAMILIES`]).
+pub const KANNADA_FAMILIES: &[&str] = &["Nirmala UI", "Kannada Sangam MN", "Noto Sans Kannada", "Noto Sans Kannada UI"];
+/// Malayalam-capable families (see [`DEVANAGARI_FAMILIES`]).
+pub const MALAYALAM_FAMILIES: &[&str] = &["Nirmala UI", "Malayalam Sangam MN", "Noto Sans Malayalam", "Noto Sans Malayalam UI"];
+/// Sinhala-capable families (see [`DEVANAGARI_FAMILIES`]).
+pub const SINHALA_FAMILIES: &[&str] = &["Nirmala UI", "Sinhala Sangam MN", "Noto Sans Sinhala", "Noto Sans Sinhala UI"];
+/// All Indic-script families, in the order they join the fallback candidates.
+pub const INDIC_FAMILIES: &[&[&str]] = &[
+    DEVANAGARI_FAMILIES,
+    BENGALI_FAMILIES,
+    GURMUKHI_FAMILIES,
+    GUJARATI_FAMILIES,
+    TAMIL_FAMILIES,
+    TELUGU_FAMILIES,
+    KANNADA_FAMILIES,
+    MALAYALAM_FAMILIES,
+    SINHALA_FAMILIES,
+];
 /// Broad-coverage and emoji fonts, tried after the CJK script fonts so shared Han characters get
 /// the locale's forms instead of Arial Unicode's.
 const FALLBACK_LAST: &[&str] = &["Arial Unicode MS", "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji"];
@@ -87,6 +121,14 @@ pub fn fallback_candidates(order: &[crate::cjk::CjkScript; 4]) -> Vec<&'static s
     v.extend_from_slice(KHMER_FAMILIES);
     v.extend_from_slice(LAO_FAMILIES);
     v.extend_from_slice(MYANMAR_FAMILIES);
+    for fams in INDIC_FAMILIES {
+        for f in *fams {
+            // Nirmala UI covers all nine scripts and is listed by each; probe it once.
+            if !v.contains(f) {
+                v.push(f);
+            }
+        }
+    }
     for s in order {
         // craft-fonts' Japanese fonts (if built in) go ahead of the installed Japanese fonts, in
         // the Japanese slot of the locale order, so shared Han keeps the locale's forms.
@@ -107,6 +149,16 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 /// Changes whenever font data is registered in any [`FontDb`].
 pub fn generation() -> u64 {
     GENERATION.load(Ordering::Relaxed)
+}
+
+/// Bumped only by the [`FontDb`] of [`crate::shared`], so caches of the shared engine's fonts
+/// aren't invalidated by unrelated databases (a document's own engine, a test's throwaway one).
+static SHARED_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Changes whenever font data is registered in the shared engine's [`FontDb`] ([`crate::shared`]).
+/// Font menus key their caches on this, not [`generation`].
+pub fn shared_generation() -> u64 {
+    SHARED_GENERATION.load(Ordering::Relaxed)
 }
 
 /// One face in the database (for font menus).
@@ -145,6 +197,8 @@ pub struct FontDb {
     missing_glyph_protection: bool,
     face_cache: HashMap<String, Vec<FaceInfo>>,
     face_aliases: HashMap<(String, usize), String>,
+    /// This is the shared engine's database: registrations also move [`shared_generation`].
+    shared: bool,
 }
 
 impl Default for FontDb {
@@ -165,17 +219,26 @@ impl FontDb {
             missing_glyph_protection: true,
             face_cache: HashMap::new(),
             face_aliases: HashMap::new(),
+            shared: false,
         };
         for (_, bytes) in BUNDLED {
             db.register_static_font(bytes.as_slice());
         }
         // The optional craft-fonts (empty unless built with CRAFT_FONTS_DIR; always empty on
-        // wasm32), before any system font.
-        for f in crate::craft_fonts::CRAFT_FONTS.iter().filter(|f| f.is_japanese()) {
-            db.register_static_font(f.bytes);
-        }
+        // wasm32), every script, before any system font.
+        db.register_craft_fonts(crate::craft_fonts::CRAFT_FONTS);
         db.refresh_generics();
         db
+    }
+
+    /// Registers craft-fonts manifest entries of every script. A single-face file registers under
+    /// its manifest family, whatever family its `name` table gives. Each face of a collection
+    /// (TTC/OTC) keeps the family its `name` table gives.
+    fn register_craft_fonts(&mut self, fonts: &[crate::CraftFont]) {
+        for f in fonts {
+            let family = (face_count(f.bytes) == 1).then_some(f.family);
+            self.register_blob(Blob::new(Arc::new(f.bytes)), family);
+        }
     }
 
     /// Bundled fonts plus the fonts installed on this machine (no-op on the web).
@@ -201,6 +264,10 @@ impl FontDb {
             }
             #[cfg(target_os = "linux")]
             files.extend(fontconfig_font_paths());
+            // Core Text knows every font macOS offers, also those activated from outside the
+            // font folders (#6683).
+            #[cfg(target_os = "macos")]
+            files.extend(coretext_font_paths());
             // PingFang (the macOS Chinese UI font) lives outside the font folders.
             if cfg!(target_os = "macos") {
                 files.extend(crate::cjk::mac_pingfang());
@@ -220,16 +287,18 @@ impl FontDb {
 
     /// Registers font data (TTF/OTF, or every face of a TTC/OTC). Returns the family names added.
     pub fn register_font_data(&mut self, bytes: Vec<u8>) -> Vec<String> {
-        self.register_blob(Blob::new(Arc::new(bytes)))
+        self.register_blob(Blob::new(Arc::new(bytes)), None)
     }
 
     /// Registers embedded font data without copying it.
     fn register_static_font(&mut self, bytes: &'static [u8]) -> Vec<String> {
-        self.register_blob(Blob::new(Arc::new(bytes)))
+        self.register_blob(Blob::new(Arc::new(bytes)), None)
     }
 
-    fn register_blob(&mut self, blob: Blob<u8>) -> Vec<String> {
-        let added = self.fcx.collection.register_fonts(blob, None);
+    /// Registers every face in `blob`, under `family` when given, else under the family each
+    /// face's `name` table gives.
+    fn register_blob(&mut self, blob: Blob<u8>, family: Option<&str>) -> Vec<String> {
+        let added = self.fcx.collection.register_fonts(blob, family.map(|f| FontInfoOverride { family_name: Some(f), ..Default::default() }));
         let mut names = Vec::new();
         for (id, _) in added {
             if let Some(n) = self.fcx.collection.family_name(id)
@@ -246,7 +315,17 @@ impl FontDb {
         self.face_cache.clear();
         self.refresh_generics();
         GENERATION.fetch_add(1, Ordering::Relaxed);
+        if self.shared {
+            SHARED_GENERATION.fetch_add(1, Ordering::Relaxed);
+        }
         names
+    }
+
+    /// Marks this as the shared engine's database ([`crate::shared`]) and moves
+    /// [`shared_generation`], since its fonts replace whatever caches saw before.
+    pub(crate) fn mark_shared(&mut self) {
+        self.shared = true;
+        SHARED_GENERATION.fetch_add(1, Ordering::Relaxed);
     }
 
     fn refresh_generics(&mut self) {
@@ -521,11 +600,77 @@ pub fn face_count(bytes: &[u8]) -> usize {
     }
 }
 
+// CamelCase style suffix of a name without a hyphen (`GmarketSansBold`). Only a capitalised word
+// counts ("Daylight" keeps its "light"), and one after a vendor tag stays in a legacy family name
+// (`ArialRoundedMTBold` is the family "Arial Rounded MT Bold").
+fn split_trailing_style(ps: &str) -> (&str, &str) {
+    let base = ps.trim_end_matches("MT").trim_end_matches("PS");
+    let mut family = base;
+    for suffix in ["Italic", "Oblique"] {
+        if let Some(rest) = family.strip_suffix(suffix).filter(|s| !s.is_empty()) {
+            family = rest;
+            break;
+        }
+    }
+    for suffix in [
+        "ExtraLight",
+        "UltraLight",
+        "ExtraBold",
+        "UltraBold",
+        "SemiBold",
+        "DemiBold",
+        "Hairline",
+        "Regular",
+        "Medium",
+        "Normal",
+        "Heavy",
+        "Black",
+        "Light",
+        "Thin",
+        "Bold",
+        "Demi",
+    ] {
+        if let Some(rest) = family.strip_suffix(suffix).filter(|s| !s.is_empty()) {
+            family = rest;
+            break;
+        }
+    }
+    if family.len() < base.len() && !family.ends_with("MT") { (family, ps.get(family.len()..).unwrap_or("")) } else { (ps, "") }
+}
+
 /// Heuristic PostScript-name split: `MyriadPro-BoldIt` → ("Myriad Pro", 700, italic).
 pub fn guess_from_postscript(ps: &str) -> ResolvedFont {
-    let (fam, style) = ps.split_once('-').unwrap_or((ps, ""));
-    let fam = fam.trim_end_matches("MT").trim_end_matches("PS").trim_end_matches("Std").trim_end_matches("Pro");
-    let pro = ps.split_once('-').map_or(ps, |p| p.0);
+    // A vendor or family name may contain hyphens; start with the final face suffix.
+    let (mut pro, mut style) = ps.rsplit_once('-').unwrap_or_else(|| split_trailing_style(ps));
+    // Keep compound style suffixes the old heuristic understood, such as Bold-It.
+    // Regular alone must not consume a family component named Bold or Black.
+    if matches!(style.to_ascii_lowercase().as_str(), "it" | "italic" | "oblique")
+        && let Some((family, weight)) = pro.rsplit_once('-')
+        && matches!(
+            weight.to_ascii_lowercase().as_str(),
+            "thin"
+                | "hairline"
+                | "extralight"
+                | "ultralight"
+                | "light"
+                | "regular"
+                | "roman"
+                | "book"
+                | "medium"
+                | "semibold"
+                | "demibold"
+                | "demi"
+                | "bold"
+                | "extrabold"
+                | "ultrabold"
+                | "heavy"
+                | "black"
+        )
+    {
+        pro = family;
+        style = ps.strip_prefix(family).and_then(|s| s.strip_prefix('-')).unwrap_or(style);
+    }
+    let fam = pro.trim_end_matches("MT").trim_end_matches("PS").trim_end_matches("Std").trim_end_matches("Pro");
     let suffix = if pro.ends_with("Pro") {
         " Pro"
     } else if pro.ends_with("Std") {
@@ -630,6 +775,49 @@ mod fontconfig_tests {
 
         assert_eq!(paths, vec![PathBuf::from("/usr/share/fonts/example.ttf"), PathBuf::from("/usr/local/fonts/collection.OTC")]);
     }
+}
+
+/// The font files Core Text offers: the installed fonts and those activated from any other folder
+/// (a font manager, Adobe Fonts, Office, Apple's on-demand downloads). A scratch collection with
+/// fontique's Core Text backend lists them; its fonts are not used, only their files, so our own
+/// collection registers them like any scanned file.
+#[cfg(target_os = "macos")]
+fn coretext_font_paths() -> Vec<std::path::PathBuf> {
+    // Reading arbitrary fonts must not take the scan down: no files is the folder scan's result.
+    std::panic::catch_unwind(|| {
+        let mut system = Collection::new(CollectionOptions { shared: false, system_fonts: true });
+        let mut files = font_files_of(&mut system);
+        files.retain(|f| !f.starts_with(MACOS_PRIVATE_FONTS));
+        files
+    })
+    .unwrap_or_default()
+}
+
+/// Fonts reserved for the system UI (PingFangUI.ttc among them). Core Text offers them, but
+/// fontique can't draw their outlines (it works around PingFangUI for the same reason), so they
+/// are not listed.
+#[cfg(target_os = "macos")]
+const MACOS_PRIVATE_FONTS: &str = "/System/Library/PrivateFrameworks";
+
+/// The files `collection`'s fonts are read from, each once and in a fixed order. Fonts
+/// registered from memory have no file.
+#[cfg(any(target_os = "macos", all(test, not(target_arch = "wasm32"))))]
+fn font_files_of(collection: &mut Collection) -> Vec<std::path::PathBuf> {
+    let names: Vec<String> = collection.family_names().map(str::to_string).collect();
+    let mut files = HashSet::new();
+    for name in names {
+        let Some(family) = collection.family_by_name(&name) else {
+            continue;
+        };
+        for font in family.fonts() {
+            if let SourceKind::Path(path) = font.source().kind() {
+                files.insert(path.to_path_buf());
+            }
+        }
+    }
+    let mut files: Vec<_> = files.into_iter().collect();
+    files.sort();
+    files
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -775,6 +963,63 @@ mod tests {
         assert_eq!(super::localized_name("Arial", &names(&[("Arial", Some("en-GB")), ("Arial", Some("de-DE"))])), None);
         assert_eq!(super::localized_name("X", &names(&[("Y", None), ("  ", Some("ja-JP"))])), None);
         assert_eq!(super::localized_name("X", &[]), None);
+    }
+
+    /// The files a collection's fonts come from (what Core Text's fonts are loaded from, #6683):
+    /// each once, none for fonts held in memory.
+    #[test]
+    fn font_files_of_lists_each_font_file_once() {
+        use super::{Blob, Collection, CollectionOptions};
+        let dir = std::env::temp_dir().join(format!("photocraft-font-files-{}", std::process::id()));
+        let activated = dir.join("activated");
+        std::fs::create_dir_all(&activated).unwrap();
+        let (inter, mono) = (dir.join("inter.ttf"), activated.join("mono.ttf"));
+        std::fs::write(&inter, super::INTER_REGULAR.as_slice()).unwrap();
+        std::fs::write(&mono, super::JETBRAINS_MONO_REGULAR.as_slice()).unwrap();
+        let mut collection = Collection::new(CollectionOptions { shared: false, system_fonts: false });
+        collection.load_fonts_from_paths([&dir]);
+        // The same file again and a font from memory add no files.
+        collection.load_fonts_from_paths([&inter]);
+        collection.register_fonts(Blob::new(std::sync::Arc::new(super::INTER_MEDIUM.clone())), None);
+        let files = super::font_files_of(&mut collection);
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut expected = vec![inter, mono];
+        expected.sort();
+        assert_eq!(files, expected);
+    }
+
+    /// Core Text lists the system's font files, all readable, none of the reserved UI fonts.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn coretext_lists_the_system_font_files() {
+        let files = super::coretext_font_paths();
+        assert!(files.iter().any(|f| f.starts_with("/System/Library/Fonts")), "{} files", files.len());
+        assert!(files.iter().all(|f| f.is_file() && !f.starts_with("/System/Library/PrivateFrameworks")));
+    }
+
+    /// Every family macOS offers is in the font list, not only those in the font folders (#6683).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn every_family_coretext_offers_is_listed() {
+        use super::{Collection, CollectionOptions, SourceKind};
+        let mut system = Collection::new(CollectionOptions { shared: false, system_fonts: true });
+        // Its names include localized aliases of a family ("Systemschrift"); the family has one name.
+        let aliases: Vec<String> = system.family_names().map(str::to_string).collect();
+        let mut offered = Vec::new();
+        for family in aliases.iter().filter_map(|n| system.family_by_name(n)) {
+            // A family only the reserved UI fonts provide (PingFang before its download) is not listed.
+            let listed_file =
+                |font: &parley::fontique::FontInfo| matches!(font.source().kind(), SourceKind::Path(p) if !p.starts_with(super::MACOS_PRIVATE_FONTS));
+            if !super::is_hidden_family(family.name()) && family.fonts().iter().any(listed_file) {
+                offered.push(family.name().to_string());
+            }
+        }
+        offered.sort();
+        offered.dedup();
+        assert!(!offered.is_empty());
+        let listed = super::FontDb::with_system_fonts().families();
+        let missing: Vec<&String> = offered.iter().filter(|n| !listed.contains(n)).collect();
+        assert!(missing.is_empty(), "macOS offers these families, the font list lacks them: {missing:?}");
     }
 
     #[test]

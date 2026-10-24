@@ -9,7 +9,8 @@
 //! effect maps (shadow / glow / satin / bevel coverage, stroke bands) are built once per layer
 //! state by [`crate::fx`] and sampled here; exterior effects paint into a copy of the backdrop,
 //! the layer at fill opacity takes the interior effects, and the two merge with the layer's mode
-//! and opacity. Effect passes are clipped to the layer's effect region and the result is copied
+//! (or the layer merges first and the effects paint over it: `effects::premerges_layer`) and
+//! opacity. Effect passes are clipped to the layer's effect region and the result is copied
 //! back into the backdrop in place, so a small text layer costs only its own pixels.
 
 use photocraft_color::BlendMode;
@@ -33,6 +34,14 @@ pub enum Kernel {
     Content,
     Mask,
     Blend,
+    /// `Content` then `Blend` in one pass: a plain layer's pixels blended straight onto A.
+    LayerBlend,
+    /// A run of consecutive `LayerBlend` passes drawn as one (never planned: the executor draws
+    /// it in their place, see `batch_runs`).
+    LayerBatch,
+    /// `LayerBatch` of a run whose layers all blend Normal without text gamma, outside Lab
+    /// documents (never planned: the executor picks it, see `batch_kernel`).
+    LayerBatchNormal,
     Atop,
     Adjust,
     AdjMix,
@@ -72,6 +81,9 @@ impl Kernel {
             Kernel::Content => "fs_content",
             Kernel::Mask => "fs_mask",
             Kernel::Blend => "fs_blend",
+            Kernel::LayerBlend => "fs_layerblend",
+            Kernel::LayerBatch => "fs_layerbatch",
+            Kernel::LayerBatchNormal => "fs_layerbatch_normal",
             Kernel::Atop => "fs_atop",
             Kernel::Adjust => "fs_adjust",
             Kernel::AdjMix => "fs_adjmix",
@@ -110,10 +122,13 @@ impl Kernel {
     }
 
     /// Every kernel with a pipeline.
-    pub const DRAWN: [Kernel; 21] = [
+    pub const DRAWN: [Kernel; 24] = [
         Kernel::Content,
         Kernel::Mask,
         Kernel::Blend,
+        Kernel::LayerBlend,
+        Kernel::LayerBatch,
+        Kernel::LayerBatchNormal,
         Kernel::Atop,
         Kernel::Adjust,
         Kernel::AdjMix,
@@ -387,8 +402,33 @@ pub const F_HDR: u32 = 262144;
 pub const F_QUANT: u32 = 32768;
 /// `Lerp` as A + (B − C) premultiplied (layers clipped to pass-through groups).
 pub const F_ADD_DIFF: u32 = 16384;
+/// `Lerp`: B mixed back towards A (the backdrop) by the layer's Blend If weight
+/// (`compose::apply_blend_if`), from C ("This Layer", or B itself for an adjustment layer, `p4.y`)
+/// and A ("Underlying Layer"). The ranges are packed in `p0..p3` (`blend_if_params`); `p4.x` marks
+/// a one-channel document.
+pub const F_BLEND_IF: u32 = 524288;
 /// Blend / Atop / FxMerge of a type layer: coverage mixed at `psblend::TEXT_GAMMA`.
 pub const F_TEXT_GAMMA: u32 = 8192;
+/// `FxMerge`: B is the layer's shape (its content); the layer is its colour at fill opacity
+/// (`p0.x`) inside the shape, times the shape's alpha: `FxInit` `INIT_INSIDE` then
+/// `INIT_ALPHA` in the merge, for a layer with no interior effects between them.
+pub const F_LAYER_SHAPE: u32 = 1_048_576;
+
+/// A layer's Blend If ranges for `F_BLEND_IF`: Gray, then the colour channels, each as
+/// [this layer, underlying layer]; every range as two floats, `black low × 256 + black high` and
+/// `white low × 256 + white high` (exact in f32), so entry `e`, side `s` starts at float
+/// `(e × 2 + s) × 2`. Entries past the fourth never apply (RGB has four, one-channel modes two).
+fn blend_if_params(bi: &photocraft_doc::BlendIf) -> [[f32; 4]; 4] {
+    let mut f = [0.0f32; 16];
+    for e in 0..4 {
+        for (s, r) in bi.get(e).iter().enumerate() {
+            let i = (e * 2 + s) * 2;
+            f[i] = f32::from(r.black[0]) * 256.0 + f32::from(r.black[1]);
+            f[i + 1] = f32::from(r.white[0]) * 256.0 + f32::from(r.white[1]);
+        }
+    }
+    [[f[0], f[1], f[2], f[3]], [f[4], f[5], f[6], f[7]], [f[8], f[9], f[10], f[11]], [f[12], f[13], f[14], f[15]]]
+}
 
 /// `F_TEXT_GAMMA` for type layers while text gamma blending is on; the gamma goes in `p4.w`.
 fn gamma_flag(layer: &Layer) -> u32 {
@@ -514,12 +554,44 @@ impl<'a> Planner<'a> {
         })
     }
 
-    /// Blending Options › Blend If has no GPU pass yet: such documents use the CPU compositor.
-    fn check_blend_if(&self, layer: &Layer) -> Result<(), Unsupported> {
-        if photocraft_compose::blend_if_active(layer, self.cx.mode) {
-            return Err(Unsupported(format!("Blend If on `{}` (composited on the CPU)", layer.name)));
+    /// `compose::apply_blend_if`: `after` (the backdrop with `layer` drawn) mixed back towards
+    /// `before` (the backdrop without it) where the layer's Blend If ranges hide it. "This Layer"
+    /// is the layer's own content with its masks; an adjustment layer is judged by its result.
+    /// Consumes both slots.
+    fn blend_if(&mut self, layer: &'a Layer, before: Slot, after: Slot) -> Result<Slot, Unsupported> {
+        let own = match layer.content {
+            LayerContent::Adjustment(_) => None,
+            _ => Some(self.content(layer)?),
+        };
+        let mut p = Pass::new(Kernel::Lerp, 0);
+        p.a = Some(before);
+        p.b = Some(after);
+        p.c = own;
+        p.flags = F_BLEND_IF;
+        p.params = blend_if_params(&layer.blend_if);
+        let one_channel = self.cx.mode != photocraft_color::ColorMode::Rgb;
+        p.extra = [f32::from(u8::from(one_channel)), f32::from(u8::from(own.is_none())), 0.0, 0.0];
+        Ok(self.emit(p))
+    }
+
+    /// Channel restrictions and Blend If around `draw`, which composites `layer` onto `backdrop`
+    /// (`compose::composite_layer` / `composite_atop`: both are relative to the same backdrop).
+    fn restricted(&mut self, layer: &'a Layer, backdrop: Slot, draw: impl FnOnce(&mut Self, Slot) -> Result<Slot, Unsupported>) -> Result<Slot, Unsupported> {
+        let w = photocraft_compose::channel_weights(layer, self.cx.mode);
+        let blend_if = photocraft_compose::blend_if_active(layer, self.cx.mode);
+        if w.is_none() && !blend_if {
+            return draw(self, backdrop);
         }
-        Ok(())
+        let before = self.retain(backdrop);
+        let mut after = draw(self, backdrop)?;
+        if let Some(w) = w {
+            let b = if blend_if { self.retain(before) } else { before };
+            after = self.restore_channels(b, after, w);
+        }
+        if blend_if {
+            after = self.blend_if(layer, before, after)?;
+        }
+        Ok(after)
     }
 
     /// Blending Options › Advanced Blending (knockout, clipped layers blended individually, blend
@@ -535,16 +607,8 @@ impl<'a> Planner<'a> {
 
     /// composite_layer, honouring the layer's channel restrictions.
     fn layer(&mut self, layer: &'a Layer, clipped: &'a [Layer], backdrop: Slot) -> Result<Slot, Unsupported> {
-        self.check_blend_if(layer)?;
         self.check_advanced(layer, clipped)?;
-        match photocraft_compose::channel_weights(layer, self.cx.mode) {
-            Some(w) => {
-                let before = self.retain(backdrop);
-                let after = self.layer_any(layer, clipped, backdrop)?;
-                Ok(self.restore_channels(before, after, w))
-            }
-            None => self.layer_any(layer, clipped, backdrop),
-        }
+        self.restricted(layer, backdrop, |s, b| s.layer_any(layer, clipped, b))
     }
 
     /// `compose::restore_channels`: `after` with the channels a layer leaves out taken from
@@ -606,11 +670,15 @@ impl<'a> Planner<'a> {
         let opacity = layer.opacity * layer.fill_opacity;
         let visible_clipped: Vec<&'a Layer> = clipped.iter().filter(|c| c.visible).collect();
 
-        // Below 100% fill a pass-through group renders isolated (as the CPU compositor does).
+        // Below 100% fill a pass-through group renders isolated (as the CPU compositor does), and
+        // so does one that is the base of a clipping group and holds an adjustment layer.
+        let clip_base_adjusts = !visible_clipped.is_empty()
+            && matches!(&layer.content, LayerContent::Group(g) if g.children.iter().any(|c| c.visible && matches!(c.content, LayerContent::Adjustment(_))));
         if let LayerContent::Group(g) = &layer.content
             && layer.blend == BlendMode::PassThrough
             && layer.fill_opacity >= 1.0
             && !has_effects(layer)
+            && !clip_base_adjusts
         {
             let before = self.retain(backdrop);
             let mut after = self.stack(&g.children, backdrop)?;
@@ -710,31 +778,40 @@ impl<'a> Planner<'a> {
         if clip.is_some_and(|c| c.is_empty()) {
             // Nothing to draw (an empty layer, or a group of them).
             for c in &visible_clipped {
-                self.check_blend_if(c)?;
                 self.check_advanced(c, &[])?;
             }
             return Ok(backdrop);
         }
-        let start = self.passes.len();
-        let mut content = self.content(layer)?;
-        for c in visible_clipped {
-            content = self.atop(c, content)?;
-        }
-        if let Some(clip) = clip {
-            // Everything that built the layer's content only matters inside its bounds.
-            for p in &mut self.passes[start..] {
-                if p.clip.is_none() && !matches!(p.kernel, Kernel::Clear | Kernel::CopyFull) {
-                    p.clip = Some(clip);
+        // A layer with nothing clipped to it whose content is one Content pass is blended
+        // straight from its pixels (`Kernel::LayerBlend`): one pass instead of two, and no
+        // scratch chunk written and read back.
+        let mut p = if visible_clipped.is_empty() && single_content_pass(layer) {
+            let mut p = self.content_pass(layer)?;
+            p.kernel = Kernel::LayerBlend;
+            p
+        } else {
+            let start = self.passes.len();
+            let mut content = self.content(layer)?;
+            for c in visible_clipped {
+                content = self.atop(c, content)?;
+            }
+            if let Some(clip) = clip {
+                // Everything that built the layer's content only matters inside its bounds.
+                for p in &mut self.passes[start..] {
+                    if p.clip.is_none() && !matches!(p.kernel, Kernel::Clear | Kernel::CopyFull) {
+                        p.clip = Some(clip);
+                    }
                 }
             }
-        }
-        let mut p = Pass::new(Kernel::Blend, 0);
+            let mut p = Pass::new(Kernel::Blend, 0);
+            p.b = Some(content);
+            p
+        };
         p.a = Some(if clip.is_some() { self.retain(backdrop) } else { backdrop });
-        p.b = Some(content);
         p.mode = layer.blend;
         p.opacity = layer.opacity;
         p.fill = layer.fill_opacity;
-        p.flags = gamma_flag(layer);
+        p.flags |= gamma_flag(layer);
         p.extra[3] = photocraft_compose::text_gamma(layer);
         p.clip = clip;
         let merged = self.emit(p);
@@ -755,6 +832,11 @@ impl<'a> Planner<'a> {
     /// Copy `merged` into `backdrop` over `clip` (in place when nothing else holds the backdrop);
     /// returns the new backdrop. Consumes both.
     fn write_back(&mut self, backdrop: Slot, merged: Slot, clip: Rect) -> Slot {
+        // A clip over the whole canvas left no pixel of `merged` uncomputed: it is the backdrop.
+        if clip.contains_rect(&self.cx.canvas) {
+            self.release(backdrop);
+            return merged;
+        }
         let dst = if self.refs[backdrop as usize] == 1 {
             backdrop
         } else {
@@ -893,16 +975,8 @@ impl<'a> Planner<'a> {
     /// composite_atop: `layer` onto `base`, restricted to the base's alpha, honouring the
     /// layer's channel restrictions.
     fn atop(&mut self, layer: &'a Layer, base: Slot) -> Result<Slot, Unsupported> {
-        self.check_blend_if(layer)?;
         self.check_advanced(layer, &[])?;
-        match photocraft_compose::channel_weights(layer, self.cx.mode) {
-            Some(w) => {
-                let before = self.retain(base);
-                let after = self.atop_any(layer, base)?;
-                Ok(self.restore_channels(before, after, w))
-            }
-            None => self.atop_any(layer, base),
-        }
+        self.restricted(layer, base, |s, b| s.atop_any(layer, b))
     }
 
     fn atop_any(&mut self, layer: &'a Layer, base: Slot) -> Result<Slot, Unsupported> {
@@ -1060,9 +1134,10 @@ impl<'a> Planner<'a> {
         };
         for &(i, e) in &rev {
             if let Effect::DropShadow(s) = e {
-                // The layer hides the shadow beneath it where its fill is see-through.
+                // The layer hides the shadow beneath it where its fill is see-through, and wholly
+                // in a mode that blends with it (as the CPU renderer: `shadow_see_through`).
                 let flags = if s.knocks_out { F_KNOCKOUT } else { 0 };
-                let see_through = 1.0 - layer.fill_opacity.clamp(0.0, 1.0);
+                let see_through = photocraft_compose::effects::shadow_see_through(layer);
                 w = self.paint_k(
                     w,
                     content,
@@ -1087,6 +1162,25 @@ impl<'a> Planner<'a> {
             }
         }
 
+        // Only exterior effects (drop shadows, outer glows): nothing is painted between the
+        // layer's colour inside its shape and the shape's alpha, so the merge derives both from
+        // the shape (`F_LAYER_SHAPE`) instead of two passes building the layer.
+        let premerge = photocraft_compose::effects::premerges_layer(layer);
+        if !relative && !premerge && items.iter().all(|e| matches!(e, Effect::DropShadow(_) | Effect::OuterGlow(_))) {
+            let mut p = Pass::new(Kernel::FxMerge, 0);
+            p.a = Some(w);
+            p.b = Some(lay_src);
+            p.c = Some(self.retain(backdrop));
+            p.mode = if layer.blend == BlendMode::PassThrough { BlendMode::Normal } else { layer.blend };
+            p.opacity = layer.opacity;
+            p.flags = if atop { F_ATOP } else { 0 } | gamma_flag(layer) | F_LAYER_SHAPE;
+            p.params[0][0] = layer.fill_opacity;
+            p.extra[3] = photocraft_compose::text_gamma(layer);
+            p.clip = Some(clip);
+            let merged = self.emit(p);
+            self.release(content);
+            return Ok(self.write_back(backdrop, merged, clip));
+        }
         // The layer: its colour at fill opacity inside its shape; interior effects are painted
         // relative to the shape (coverage within it), then the shape's alpha applies.
         let mut l = if relative {
@@ -1095,6 +1189,18 @@ impl<'a> Planner<'a> {
         } else {
             init(self, lay_src, None, INIT_INSIDE, layer.fill_opacity)
         };
+        // Blend Interior Effects as Group off: the layer merges in its mode first and the
+        // interior effects paint over the result (`effects::premerges_layer`).
+        if premerge {
+            let mut p = Pass::new(Kernel::Blend, 0);
+            p.a = Some(self.retain(w));
+            p.b = Some(l);
+            p.mode = layer.blend;
+            p.flags = gamma_flag(layer);
+            p.extra[3] = photocraft_compose::text_gamma(layer);
+            p.clip = Some(clip);
+            l = self.emit(p);
+        }
         for &(_, e) in &rev {
             if let Effect::PatternOverlay { common, name, id, scale, angle, link, phase } = e
                 && let Some(pat) = photocraft_doc::pattern::find(self.cx.patterns, id, name).filter(|p| p.is_paintable())
@@ -1223,7 +1329,9 @@ impl<'a> Planner<'a> {
                 p.c = cover.map(|c| self.retain(c));
                 p.d = acc;
                 let a = self.emit(p);
-                let mut p = self.fx_pass_kernel(Kernel::FxStroke, w, content, &Paint::Color([0.0; 3]), BlendMode::Normal, st.common.opacity, flags, clip, sb);
+                // The stroke's mode rides along only for Dissolve, whose coverage is all or
+                // nothing in this pass as in the colour pass (#6995).
+                let mut p = self.fx_pass_kernel(Kernel::FxStroke, w, content, &Paint::Color([0.0; 3]), st.common.blend, st.common.opacity, flags, clip, sb);
                 p.adjust_kind = 1;
                 p.map = Some(map(i, 0));
                 p.c = cover;
@@ -1257,7 +1365,7 @@ impl<'a> Planner<'a> {
             }
         }
 
-        let mode = if layer.blend == BlendMode::PassThrough { BlendMode::Normal } else { layer.blend };
+        let mode = if premerge || layer.blend == BlendMode::PassThrough { BlendMode::Normal } else { layer.blend };
         let late: Vec<(usize, &'a photocraft_doc::Bevel)> = rev
             .iter()
             .filter_map(|&(i, e)| if let Effect::BevelEmboss(b) = e { Some((i, b)) } else { None })
@@ -1514,13 +1622,18 @@ fn to_row(t: &[f32]) -> [f32; 4096] {
 
 /// Whether the adjustment kernel can evaluate `adj` in a document of colour `mode`: Levels and
 /// Curves on CMYK ink or Lab channels convert through ICC profiles per pixel, and so do the
-/// adjustments a Lab document evaluates on L, a and b (`photocraft_compose::adjust::lab_channel_adjustment`),
-/// which only the CPU does.
+/// adjustments a Lab document evaluates on L, a and b (`photocraft_compose::adjust::lab_channel_adjustment`)
+/// and a CMYK document on its inks (`cmyk_channel_adjustment`), which only the CPU does.
 pub fn adjustment_on_gpu(adj: &Adjustment, mode: photocraft_color::ColorMode) -> bool {
+    use photocraft_compose::adjust::{cmyk_channel_adjustment, lab_channel_adjustment};
     let tone_in_space =
         matches!(adj, Adjustment::Levels { space: ToneSpace::Cmyk | ToneSpace::Lab, .. } | Adjustment::Curves { space: ToneSpace::Cmyk | ToneSpace::Lab, .. });
-    let lab_channels = mode == photocraft_color::ColorMode::Lab && photocraft_compose::adjust::lab_channel_adjustment(adj);
-    !tone_in_space && !lab_channels
+    let own_channels = match mode {
+        photocraft_color::ColorMode::Lab => lab_channel_adjustment(adj),
+        photocraft_color::ColorMode::Cmyk => cmyk_channel_adjustment(adj),
+        _ => false,
+    };
+    !tone_in_space && !own_channels
 }
 
 /// A tone transfer as the shader's `t_decode`/`t_encode` exponent (0: the sRGB curve).
@@ -1537,11 +1650,19 @@ pub fn adjustment_program(adj: &Adjustment, transfer: Transfer, depth: photocraf
     match adj {
         Adjustment::Invert => (1, p, None),
         Adjustment::Threshold { level } => {
-            p[0][0] = (level * 255.0).round();
+            // The level, the depth's split (compose::adjust::threshold_white) and the level in 16 bits.
+            let t = (level * 255.0).round();
+            p[0] = match depth {
+                photocraft_color::SampleType::U8 => [t, 1.0, 0.0, 0.0],
+                photocraft_color::SampleType::U16 => [t, 2.0, (t * 32768.0 / 255.0).round(), 0.0],
+                photocraft_color::SampleType::F32 => [t, 0.0, 0.0, 0.0],
+            };
             (2, p, None)
         }
         Adjustment::Posterize { levels } => {
+            // The levels, and the 16-bit rule (compose::adjust::posterize_in).
             p[0][0] = (*levels).clamp(2, 255) as f32;
+            p[0][1] = if depth == photocraft_color::SampleType::U16 { 1.0 } else { 0.0 };
             (3, p, None)
         }
         Adjustment::BrightnessContrast { brightness, contrast, legacy: true } => {
@@ -1549,14 +1670,16 @@ pub fn adjustment_program(adj: &Adjustment, transfer: Transfer, depth: photocraf
             let k = if c >= 0.0 { 1.0 / (1.0 - c / 100.0) } else { 1.0 + c / 100.0 };
             // Brightness before contrast when it is raised, after it when lowered (compose::adjust).
             let (pre, post) = if c >= 0.0 { (brightness / 255.0, 0.0) } else { (0.0, brightness / 255.0) };
-            p[0] = [pre, k, photocraft_compose::adjust::LEGACY_PIVOT, post];
+            // 32-bit documents pivot at 127 of 255 and don't clip (the shader checks F_HDR).
+            let pivot = if depth == photocraft_color::SampleType::F32 { 127.0 / 255.0 } else { photocraft_compose::adjust::LEGACY_PIVOT };
+            p[0] = [pre, k, pivot, post];
             (4, p, None)
         }
         Adjustment::BrightnessContrast { brightness, contrast, .. } => {
-            // Modern B/C: the shader rebuilds the curves from raw slider values (see compose.wgsl
-            // `mbright`/`mcontrast`, mirroring compose::adjust::modern_brightness/modern_contrast).
-            p[0] = [*brightness, *contrast, 0.0, 0.0];
-            (5, p, None)
+            // Modern B/C: the CPU's lookup table (compose::adjust::modern_lut) on every channel,
+            // through the Levels / Curves kernel.
+            let row = to_row(&adjust::modern_lut(*brightness, *contrast));
+            (7, p, Some(vec![row; 3]))
         }
         Adjustment::Exposure { exposure, offset, gamma } => {
             p[0] = [2f32.powf(*exposure), *offset, gamma.max(0.01), transfer_exponent(transfer.for_exposure())];
@@ -1580,7 +1703,8 @@ pub fn adjustment_program(adj: &Adjustment, transfer: Transfer, depth: photocraf
             (7, p, Some(adjust::tone_luts_depth(adj, Some(depth)).iter().take(3).map(|t| to_row(t)).collect()))
         }
         Adjustment::HueSaturation { hue, saturation, lightness, colorize, ranges } => {
-            p[0] = [*hue, saturation / 100.0, lightness / 100.0, if *colorize { 1.0 } else { 0.0 }];
+            let sat = adjust::colorize_saturation(saturation / 100.0, lightness / 100.0, *colorize, Some(depth));
+            p[0] = [*hue, sat, lightness / 100.0, if *colorize { 1.0 } else { 0.0 }];
             if !*colorize && ranges.iter().any(|r| !r.is_neutral()) {
                 // Range edits: hue-indexed rows (shift, saturation, lightness), as on the CPU.
                 p[1][0] = 1.0;
@@ -1599,9 +1723,14 @@ pub fn adjustment_program(adj: &Adjustment, transfer: Transfer, depth: photocraf
             (9, p, None)
         }
         Adjustment::ChannelMixer { matrix, monochrome } => {
-            p[0] = matrix[0];
-            p[1] = matrix[1];
-            p[2] = matrix[2];
+            // compose::adjust: 32-bit documents cut each percentage to 1/1024, count 255/512 of
+            // the constant and don't clip (the shader checks F_HDR).
+            let hdr = depth == photocraft_color::SampleType::F32;
+            let cut = |v: f32| if hdr { (v * 1024.0).trunc() / 1024.0 } else { v };
+            let rows = matrix.map(|r| [cut(r[0]), cut(r[1]), cut(r[2]), if hdr { r[3] * 255.0 / 512.0 } else { r[3] }]);
+            p[0] = rows[0];
+            p[1] = rows[1];
+            p[2] = rows[2];
             p[3][0] = if *monochrome { 1.0 } else { 0.0 };
             (10, p, None)
         }
@@ -1631,9 +1760,9 @@ pub fn adjustment_program(adj: &Adjustment, transfer: Transfer, depth: photocraf
             (13, p, Some(rows))
         }
         Adjustment::ColorBalance { shadows, midtones, highlights, preserve_luminosity } => {
-            // Per-channel curves (compose::adjust::color_balance_channel), through the Levels kernel.
-            let tones = [*shadows, *midtones, *highlights];
-            (7, p, Some(lut_rows(|ch, v| adjust::color_balance_channel(tones, *preserve_luminosity, ch, v), 3)))
+            // Per-channel curves (compose::adjust::BalanceCurve), through the Levels kernel.
+            let curves = adjust::BalanceCurve::rgb([*shadows, *midtones, *highlights], *preserve_luminosity);
+            (7, p, Some(lut_rows(|ch, v| curves[ch].eval(v), 3)))
         }
         Adjustment::SelectiveColor { relative, adjustments } => {
             // 9 ranges × CMYK don't fit the 16 params: they go in LUT row 0 (read texel-exact).
@@ -1684,7 +1813,8 @@ fn gradient_rows(g: &Gradient) -> Vec<[f32; 4096]> {
 fn check_gradient_stops<T>(stops: &[(f32, T)]) -> Result<(), Unsupported> {
     let mut positions: Vec<f32> = stops.iter().map(|s| s.0).collect();
     positions.sort_by(f32::total_cmp);
-    if positions.windows(2).any(|w| w[0] == w[1]) {
+    // A 4096-entry LUT cannot keep two stops that fall in the same entry apart (#3053).
+    if positions.windows(2).any(|w| (w[1] - w[0]).abs() < 1.0 / 4095.0) {
         return Err(Unsupported("coincident gradient stops (composited on the CPU)".into()));
     }
     Ok(())
@@ -1730,11 +1860,27 @@ pub fn mode_index(m: BlendMode) -> i32 {
     }
 }
 
+/// Whether `Planner::content` draws `layer` as one `Planner::content_pass`: not a group's stack,
+/// an adjustment, or a pattern fill painted in passes.
+fn single_content_pass(layer: &Layer) -> bool {
+    match &layer.content {
+        LayerContent::Group(_) | LayerContent::Adjustment(_) => false,
+        LayerContent::Fill(f @ Fill::Pattern { .. }) => layer.fill_cache.as_ref().is_some_and(|c| c.fill == *f),
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use photocraft_color::{Color, ColorMode, SampleType};
     use photocraft_geom::Size;
+
+    #[test]
+    fn stops_closer_than_one_lut_step_stay_on_the_cpu() {
+        assert!(check_gradient_stops(&[(0.4999_f32, ()), (0.5, ())]).is_err());
+        assert!(check_gradient_stops(&[(0.0_f32, ()), (1.0, ())]).is_ok());
+    }
 
     #[test]
     fn lab_channel_adjustments_defer_to_the_cpu_in_lab_documents() {
@@ -1747,10 +1893,18 @@ mod tests {
         ];
         for adj in &lab_rules {
             assert!(!adjustment_on_gpu(adj, ColorMode::Lab), "{adj:?}");
-            for mode in [ColorMode::Rgb, ColorMode::Cmyk, ColorMode::Grayscale] {
+            for mode in [ColorMode::Rgb, ColorMode::Grayscale] {
                 assert!(adjustment_on_gpu(adj, mode), "{adj:?} in {mode:?}");
             }
+            // CMYK documents invert, posterize, threshold and brighten their inks, on the CPU.
+            let inks = !matches!(adj, Adjustment::GradientMap { .. });
+            assert_eq!(adjustment_on_gpu(adj, ColorMode::Cmyk), !inks, "{adj:?} in CMYK");
         }
+        // CMYK Hue/Saturation works on the inks (on the CPU); Colorize stays on the screen colour.
+        let ranges = photocraft_doc::adjust::HueRange::defaults();
+        let hue = |colorize| Adjustment::HueSaturation { hue: 30.0, saturation: 10.0, lightness: 0.0, colorize, ranges: ranges.clone() };
+        assert!(!adjustment_on_gpu(&hue(false), ColorMode::Cmyk) && adjustment_on_gpu(&hue(true), ColorMode::Cmyk));
+        assert!(adjustment_on_gpu(&hue(false), ColorMode::Rgb));
         // Screen-colour adjustments stay on the GPU in Lab documents.
         assert!(adjustment_on_gpu(&Adjustment::Exposure { exposure: 1.0, offset: 0.0, gamma: 1.0 }, ColorMode::Lab));
     }
@@ -1856,15 +2010,15 @@ mod tests {
             d.layers.push(Layer::raster(format!("l{i}"), d.pixel_format()));
         }
         let p = plan(&d).unwrap();
-        // Empty layers draw nothing.
-        assert_eq!(p.passes.len(), 1 + 2);
+        // Empty layers draw nothing: the clear and the background's one fused pass.
+        assert_eq!(p.passes.len(), 1 + 1);
         for (i, l) in d.layers.iter_mut().skip(1).enumerate() {
             l.surface_mut().unwrap().fill_rect(Rect::new(i as i32 % 4, 0, 4, 8), &[0.0, 0.0, 1.0, 1.0]);
         }
         let p = plan(&d).unwrap();
         assert!(p.slots <= 3, "{} slots", p.slots);
-        // The background, then each small layer over its bounds and copied back.
-        assert_eq!(p.passes.len(), 1 + 2 + 10 * 3);
+        // The background, then each small layer blended over its bounds and copied back.
+        assert_eq!(p.passes.len(), 1 + 1 + 10 * 2);
     }
 
     #[test]
@@ -1899,11 +2053,44 @@ mod tests {
         assert_eq!(p.fx.len(), 1);
         let m = photocraft_compose::effects::margin(&d.layers[1]);
         assert_eq!(p.fx[0].region, Rect::new(2, 2, 5, 5).inflate(m).intersect(&d.bounds().inflate(m)));
-        // The effect result lands back in the backdrop slot.
+        // The effect region covers the whole canvas: the merged result is the backdrop, no copy.
+        assert!(p.fx[0].region.contains_rect(&d.bounds()));
         let last = p.passes.last().unwrap();
-        assert_eq!(last.kernel, Kernel::CopyRect);
+        assert_eq!(last.kernel, Kernel::FxMerge);
         assert_eq!(last.dst, p.root);
         assert!(p.slots <= 6, "{} slots", p.slots);
+        // On a larger canvas the result lands back in the backdrop slot over the region only.
+        let mut big = Document::with_background("t", Size::new(64, 64), ColorMode::Rgb, SampleType::U8, Color::WHITE);
+        big.layers.push(d.layers[1].clone());
+        let p = plan(&big).unwrap();
+        assert!(!p.fx[0].region.contains_rect(&big.bounds()));
+        let last = p.passes.last().unwrap();
+        assert_eq!((last.kernel, last.dst, last.clip), (Kernel::CopyRect, p.root, Some(p.fx[0].region)));
+    }
+
+    #[test]
+    fn exterior_effects_merge_from_the_shape() {
+        // A drop shadow alone: the layer's pixels, the shadow, the merge. With an interior effect
+        // the layer is built in passes of its own (colour inside the shape, the overlay, alpha).
+        let mut d = Document::with_background("t", Size::new(8, 8), ColorMode::Rgb, SampleType::U8, Color::WHITE);
+        let mut l = Layer::raster("fx", d.pixel_format());
+        l.surface_mut().unwrap().fill_rect(Rect::new(0, 0, 8, 8), &[1.0, 0.0, 0.0, 0.5]);
+        l.fill_opacity = 0.7;
+        l.effects.items.push(photocraft_doc::Effect::default_drop_shadow());
+        d.layers.push(l);
+        let p = plan(&d).unwrap();
+        let fx: Vec<Kernel> = p.passes.iter().skip(2).map(|p| p.kernel).collect();
+        assert_eq!(fx, [Kernel::Content, Kernel::FxPaint, Kernel::FxMerge], "{:?}", p.passes);
+        let merge = p.passes.last().unwrap();
+        assert!(merge.flags & F_LAYER_SHAPE != 0);
+        assert_eq!(merge.params[0][0], 0.7);
+        d.layers[1]
+            .effects
+            .items
+            .push(photocraft_doc::Effect::ColorOverlay { common: photocraft_doc::FxCommon::new(BlendMode::Normal, 1.0), color: Color::WHITE });
+        let p = plan(&d).unwrap();
+        assert!(p.passes.iter().all(|p| p.flags & F_LAYER_SHAPE == 0));
+        assert!(p.passes.iter().any(|p| p.kernel == Kernel::FxInit));
     }
 
     #[test]
@@ -1951,17 +2138,32 @@ mod tests {
     }
 
     #[test]
-    fn blend_if_falls_back_to_the_cpu() {
+    fn blend_if_plans_on_the_gpu() {
         let mut d = Document::with_background("t", Size::new(8, 8), ColorMode::Rgb, SampleType::U8, Color::WHITE);
         let mut l = Layer::raster("bi", d.pixel_format());
+        l.surface_mut().unwrap().fill_rect(photocraft_geom::Rect::new(0, 0, 4, 4), &[1.0, 0.0, 0.0, 1.0]);
         l.blend_if.set(0, [photocraft_doc::BlendRange { black: [40, 40], white: [255, 255] }, photocraft_doc::BlendRange::FULL]);
         d.layers.push(l.clone());
-        assert!(plan(&d).unwrap_err().0.contains("Blend If"));
+        let blend_if = |d: &Document| plan(d).unwrap().passes.iter().filter(|p| p.flags & F_BLEND_IF != 0).count();
+        assert_eq!(blend_if(&d), 1);
         // Clipped layers too.
         l.clipped = true;
         d.layers[1].blend_if = Default::default();
         d.layers.push(l);
-        assert!(plan(&d).is_err());
+        assert_eq!(blend_if(&d), 1);
+        // Outside RGB, Grayscale and Duotone the setting round-trips without applying.
+        d.mode = ColorMode::Lab;
+        assert_eq!(blend_if(&d), 0);
+    }
+
+    #[test]
+    fn blend_if_params_pack_every_range_exactly() {
+        let mut bi = photocraft_doc::BlendIf::default();
+        bi.set(3, [photocraft_doc::BlendRange { black: [255, 255], white: [0, 1] }, photocraft_doc::BlendRange { black: [12, 200], white: [201, 254] }]);
+        let f: Vec<f32> = blend_if_params(&bi).iter().flatten().copied().collect();
+        // Entry 3 (B), this layer then underlying; unset entries are full ranges.
+        assert_eq!(&f[12..16], &[255.0 * 256.0 + 255.0, 1.0, 12.0 * 256.0 + 200.0, 201.0 * 256.0 + 254.0]);
+        assert_eq!(&f[0..2], &[0.0, 255.0 * 256.0 + 255.0]);
     }
 
     #[test]

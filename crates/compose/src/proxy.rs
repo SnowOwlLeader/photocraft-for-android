@@ -4,8 +4,8 @@
 //! channel thumbnails, histograms, file previews), where a full-resolution composite of a 200 MP
 //! document would cost seconds and gigabytes.
 
-use photocraft_doc::{Document, Layer, LayerContent, Size};
-use photocraft_geom::Rect;
+use photocraft_doc::{Document, Layer, LayerContent, Size, SmartObject};
+use photocraft_geom::{Affine, Rect};
 use photocraft_raster::Surface;
 
 /// Nearest-neighbour downsample of a surface by integer factor `k` (document coordinates / k).
@@ -20,12 +20,15 @@ pub fn downsample(s: &Surface, k: u32) -> Surface {
     let bpp = s.format().bytes_per_pixel();
     let (x0, x1) = (b.x0.div_euclid(k), b.x1.div_euclid(k) + i32::from(b.x1.rem_euclid(k) != 0));
     let (y0, y1) = (b.y0.div_euclid(k), b.y1.div_euclid(k) + i32::from(b.y1.rem_euclid(k) != 0));
-    let w = (x1 - x0).max(0) as usize;
+    let w = x1.saturating_sub(x0).max(0) as usize;
     let mut row = vec![0u8; w * bpp];
     for oy in y0..y1 {
-        let src = s.to_interleaved(Rect::new(x0 * k, oy * k, x1 * k, oy * k + 1));
+        let src = s.to_interleaved(Rect::new(x0.saturating_mul(k), oy.saturating_mul(k), x1.saturating_mul(k), oy.saturating_mul(k).saturating_add(1)));
         for (i, px) in row.chunks_exact_mut(bpp).enumerate() {
-            px.copy_from_slice(&src[i * k as usize * bpp..(i * k as usize + 1) * bpp]);
+            // Saturated edges (a surface at the i32 limits) can make `src` shorter than expected.
+            if let Some(from) = (i * k as usize * bpp).checked_add(bpp).and_then(|end| src.get(i * k as usize * bpp..end)) {
+                px.copy_from_slice(from);
+            }
         }
         out.write_interleaved(Rect::new(x0, oy, x1, oy + 1), &row);
     }
@@ -57,8 +60,27 @@ fn shrink_layer(l: &mut Layer, k: u32) {
         }
         LayerContent::Text(t) => t.cache = t.cache.as_ref().map(|s| downsample(s, k)),
         LayerContent::Shape(sh) => sh.cache = sh.cache.as_ref().map(|s| downsample(s, k)),
-        LayerContent::Smart(so) => so.cache = so.cache.as_ref().map(|s| downsample(s, k)),
+        LayerContent::Smart(so) => shrink_smart(so, k),
         LayerContent::Adjustment(_) | LayerContent::Fill(_) => {}
+    }
+}
+
+/// Scales a smart object with its proxy: the cache and filter mask like any surface, and the
+/// placement too. A preview that adds a smart filter re-renders the source through the placement;
+/// left in full-size document coordinates, that render came out `k` times too large on the proxy
+/// canvas, so the Curves preview on a smart object zoomed in (#5766).
+fn shrink_smart(so: &mut SmartObject, k: u32) {
+    so.cache = so.cache.as_ref().map(|s| downsample(s, k));
+    if let Some(m) = &mut so.filter_mask {
+        m.surface = downsample(&m.surface, k);
+    }
+    let s = 1.0 / f64::from(k);
+    so.transform = Affine::scale(s).mul(&so.transform);
+    // Row-major source → document map: scaling the document side scales its first two rows.
+    if let Some(h) = &mut so.perspective {
+        for v in h.iter_mut().take(6) {
+            *v *= s;
+        }
     }
 }
 
@@ -79,6 +101,9 @@ pub fn proxy_document(doc: &Document, k: u32) -> Document {
         c.surface = downsample(&c.surface, k);
     }
     p.selection = p.selection.as_ref().map(|s| downsample(s, k));
+    if let Some(mask) = &mut p.quick_mask {
+        mask.surface = downsample(&mask.surface, k);
+    }
     p
 }
 
@@ -160,6 +185,33 @@ mod tests {
         assert!(proxy_faithful(&doc));
     }
 
+    /// #5766: a smart object re-rendered on the proxy (a smart filter preview) goes through its
+    /// placement, which must shrink with the canvas, cache and filter mask.
+    #[test]
+    fn proxy_scales_smart_object_placement() {
+        use photocraft_doc::SmartSource;
+        let mut doc = Document::new("smart", Size::new(64, 64), ColorMode::Rgb, SampleType::U8);
+        let mut cache = Surface::new(doc.pixel_format());
+        cache.fill_rect(Rect::new(16, 16, 32, 48), &[0.0, 0.0, 0.0, 1.0]);
+        let source = SmartSource::Embedded { file_name: "s.png".into(), bytes: std::sync::Arc::new(Vec::new()) };
+        let mut sm = SmartObject::new(source, Affine::translate(16.0, 16.0).mul(&Affine::scale(2.0)), Some(cache));
+        let mut mask = LayerMask::hide_all();
+        mask.surface.fill_rect(Rect::new(16, 16, 32, 32), &[1.0]);
+        sm.filter_mask = Some(mask);
+        sm.perspective = Some([2.0, 0.0, 16.0, 0.0, 2.0, 16.0, 0.0, 0.0, 1.0]);
+        doc.layers.push(Layer::new("smart", LayerContent::Smart(sm)));
+        let p = proxy_document(&doc, 4);
+        let LayerContent::Smart(sm) = &p.layers[0].content else { panic!("a smart object") };
+        assert_eq!(sm.transform, Affine { m: [0.5, 0.0, 0.0, 0.5, 4.0, 4.0] });
+        assert_eq!(sm.perspective, Some([0.5, 0.0, 4.0, 0.0, 0.5, 4.0, 0.0, 0.0, 1.0]));
+        assert_eq!(sm.cache.as_ref().unwrap().content_bounds(), Rect::new(4, 4, 8, 12));
+        let mask = &sm.filter_mask.as_ref().unwrap().surface;
+        assert_eq!((mask.pixel(4, 4)[0], mask.pixel(8, 8)[0]), (1.0, 0.0));
+        // The document keeps its full-size placement.
+        let LayerContent::Smart(orig) = &doc.layers[0].content else { panic!("a smart object") };
+        assert_eq!(orig.transform.m[4], 16.0);
+    }
+
     #[test]
     fn proxy_scales_the_selection() {
         let mut doc = Document::with_background("d", Size::new(64, 64), ColorMode::Rgb, SampleType::U8, Color::WHITE);
@@ -170,6 +222,27 @@ mod tests {
         let s = p.selection.as_ref().expect("selection kept");
         assert_eq!((s.pixel(7, 15)[0], s.pixel(8, 0)[0]), (1.0, 0.0));
         assert!(proxy_document(&Document::new("n", Size::new(8, 8), ColorMode::Rgb, SampleType::U8), 4).selection.is_none());
+    }
+
+    #[test]
+    fn proxy_scales_quick_mask_at_every_depth() {
+        for depth in [SampleType::U8, SampleType::U16, SampleType::F32] {
+            let mut doc = Document::new("mask", Size::new(16, 12), ColorMode::Rgb, depth);
+            let mut surface = Surface::new(PixelFormat::new(ColorMode::Grayscale, depth, false));
+            surface.fill_rect(Rect::new(0, 0, 8, 12), &[1.0]);
+            let mut mask = photocraft_doc::AlphaChannel::new("Quick Mask", surface);
+            mask.opacity = 0.25;
+            doc.quick_mask = Some(mask);
+            for k in [1, 2, 4] {
+                let proxy = proxy_document(&doc, k);
+                let mask = proxy.quick_mask.as_ref().unwrap();
+                assert_eq!(mask.surface.pixel((8 / k - 1) as i32, 0), vec![1.0]);
+                assert_eq!(mask.surface.pixel((8 / k) as i32, 0), vec![0.0], "depth {depth:?}, factor {k}");
+                assert_eq!(mask.opacity, 0.25);
+                assert_eq!(mask.surface.format().sample, depth);
+            }
+            assert_eq!(doc.quick_mask.as_ref().unwrap().surface.pixel(7, 0), vec![1.0], "source stays intact");
+        }
     }
 
     #[test]

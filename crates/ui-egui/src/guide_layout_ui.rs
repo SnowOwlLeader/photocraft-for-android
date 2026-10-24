@@ -157,6 +157,10 @@ pub fn confirm(app: &mut PhotocraftApp, f: &Map<String, Value>) -> Result<Value,
     let color = rgb(color).ok_or("invalid guide color")?;
     let hex = format!("#{:02x}{:02x}{:02x}", color.r(), color.g(), color.b());
     let result = app.run(COMMAND, params(f))?;
+    // The preview is visible even when guides were hidden. Keep a committed layout visible too.
+    app.ui.view.extras = true;
+    app.ui.view.show.canvas_guides = true;
+    app.ui.extras.guides = true;
     app.session.prefs.edit(|prefs| prefs.guides_grid_and_slices.guide_color = hex);
     let mut remembered = f.clone();
     for key in [MARK, "__command", "__label", "__document", "__previewGuides", "__previewParams", "__previewSource"] {
@@ -190,6 +194,9 @@ fn number(ui: &mut egui::Ui, f: &mut Map<String, Value>, key: &str, count: bool)
     let mut value = f.get(key).and_then(Value::as_f64).unwrap_or(0.0) as f32;
     if widgets::value_field(ui, &mut value, (if count { 1.0 } else { 0.0 })..=if count { 1000.0 } else { 300_000.0 }, if count { "" } else { "px" }, 68.0)
         .changed()
+        // A disabled field still clamps its value into range (a zero count to 1); writing that
+        // back would switch the axis on through its `positive` fallback (#5625).
+        && ui.is_enabled()
     {
         f.insert(key.into(), if count { json!(value.round() as u64) } else { json!(value) });
     }

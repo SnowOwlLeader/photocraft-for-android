@@ -31,6 +31,35 @@ fn panel_commands_group_split_reorder_float_and_restore_without_duplicate_owners
 }
 
 #[test]
+fn floating_panel_rail_toggle_closes_the_float_window() {
+    let mut app = app();
+    app.run("window.panel.float", json!({"panel":"properties","x":50,"y":70,"width":330,"height":410})).unwrap();
+    assert!(app.ui.docking.as_ref().unwrap().floating.iter().any(|g| g.panels.contains(&"properties".into())));
+
+    rail_click(&mut app, Group::Properties);
+
+    assert!(app.ui.docking.as_ref().unwrap().floating.iter().all(|g| !g.panels.contains(&"properties".into())));
+    assert!(app.ui.docking.as_ref().unwrap().contains(&"adjustments".into()));
+    assert!(app.ui.panels.properties, "the docked Adjustments tab keeps the group visible");
+}
+
+#[test]
+fn brushes_menu_action_uses_the_shared_docking_layout() {
+    let mut app = app();
+    let before = app.ui.docking.clone();
+    assert!(crate::menus::invoke(&mut app, &egui::Context::default(), "window.panel.brushes", json!({})).is_ok());
+    let layout = app.ui.docking.as_ref().expect("brushes panel must be registered in docking");
+    assert!(layout.contains(&"brushes".to_string()));
+    assert!(app.ui.panels.brushes);
+    assert_ne!(app.ui.docking, before);
+
+    app.run("window.panel.float", json!({"panel":"brushes"})).unwrap();
+    assert!(app.ui.docking.as_ref().unwrap().floating.iter().any(|group| group.panels.contains(&"brushes".into())));
+    app.run("window.panel.dock", json!({"panel":"brushes"})).unwrap();
+    assert!(!app.ui.docking.as_ref().unwrap().floating.iter().any(|group| group.panels.contains(&"brushes".into())));
+}
+
+#[test]
 fn invalid_panel_requests_are_atomic_and_do_not_enter_a_custom_workspace() {
     let mut app = app();
     for (id, params) in [
@@ -96,6 +125,24 @@ fn ordinary_panel_tab_drag_enters_shared_docking_and_can_redock_into_another_tab
 }
 
 #[test]
+fn brushes_tab_drag_floats_and_can_redock_into_another_tab_group() {
+    let mut app = app();
+    crate::menus::invoke(&mut app, &egui::Context::default(), "window.panel.brushes", json!({})).unwrap();
+    let mut h = harness(app, vec2(1280.0, 800.0));
+    let source = h.query_all_by_label("Brushes").find(|node| node.rect().height() <= 45.0).unwrap().rect().center();
+    drag(&mut h, source, egui::pos2(160.0, 140.0));
+    let layout = h.state().ui.docking.as_ref().expect("brushes drag starts shared docking");
+    assert!(layout.floating.iter().any(|group| group.panels.contains(&"brushes".into())), "{layout:?}");
+
+    let source = h.ctx.read_response(egui::Id::new("photocraft-panel-docking").with(("tab", &"brushes".to_string()))).unwrap().rect.center();
+    let destination = h.ctx.read_response(egui::Id::new("photocraft-panel-docking").with(("tab", &"layers".to_string()))).unwrap().rect.center();
+    drag(&mut h, source, destination);
+    let layout = h.state().ui.docking.as_ref().unwrap();
+    assert!(!layout.floating.iter().any(|group| group.panels.contains(&"brushes".into())));
+    assert!(valid(layout));
+}
+
+#[test]
 fn saved_workspace_restores_the_custom_tree_and_hidden_panel_placement() {
     let mut app = app();
     let ctx = egui::Context::default();
@@ -128,6 +175,7 @@ fn shared_layout_keeps_panel_identity_across_themes_and_respects_workspace_lock(
 /// Explicit offscreen evidence; this creates no native windows.
 #[test]
 fn capture_custom_panel_docking_visual_fixtures() {
+    let _gpu = photocraft_testkit::gpu_lock();
     let Some(directory) = std::env::var_os("CRAFT_UI_DOCKING_FIXTURES").map(std::path::PathBuf::from) else { return };
     std::fs::create_dir_all(&directory).unwrap();
     for theme in crate::theme::ThemeKind::ALL {
@@ -160,6 +208,38 @@ fn capture_custom_panel_docking_visual_fixtures() {
             }
         }
     }
+}
+
+#[test]
+fn floating_group_titles_are_opaque_in_studio_themes() {
+    let _gpu = photocraft_testkit::gpu_lock();
+    // Studio's tab strip is transparent over the dock's card; a floating group must not show the canvas (#4509).
+    let mut app = app();
+    app.run("window.panel.float", json!({"panel":"swatches","x":40,"y":60,"width":300,"height":300})).unwrap();
+    let mut ready = false;
+    let mut h = Harness::builder().with_size(vec2(1280.0, 800.0)).wgpu().build_ui_state(
+        move |ui, app: &mut PhotocraftApp| {
+            if !ready {
+                PhotocraftApp::setup_context(ui.ctx(), crate::theme::ThemeKind::Studio);
+                app.ui.theme = crate::theme::ThemeKind::Studio;
+                ready = true;
+                return;
+            }
+            crate::panels::right_dock(app, ui);
+            egui::CentralPanel::default().frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(255, 0, 255))).show(ui, |_| {});
+        },
+        app,
+    );
+    h.run_steps(5);
+    let area = h.ctx.memory(|m| m.area_rect(egui::Id::new("photocraft-panel-docking").with(("floating", &"swatches".to_string())))).unwrap();
+    let image = h.render().unwrap();
+    let ppp = image.width() as f32 / 1280.0;
+    let strip = egui::Rect::from_min_size(area.min, vec2(area.width(), 40.0)).shrink(2.0);
+    let magenta = (strip.left() as u32..strip.right() as u32)
+        .flat_map(|x| (strip.top() as u32..strip.bottom() as u32).map(move |y| (x, y)))
+        .filter(|&(x, y)| image.get_pixel((x as f32 * ppp) as u32, (y as f32 * ppp) as u32).0[..3] == [255, 0, 255])
+        .count();
+    assert_eq!(magenta, 0, "canvas shows through the floating group's title strip {strip:?}");
 }
 
 #[test]
@@ -268,6 +348,7 @@ fn splitting_a_short_column_keeps_the_layers_footer_visible_and_usable() {
 
 #[test]
 fn populated_canvas_keeps_a_real_opacity_edit_after_floating_and_redocking() {
+    let _gpu = photocraft_testkit::gpu_lock();
     let mut app = app();
     app.ui.theme = crate::theme::ThemeKind::Studio;
     app.run("file.new", json!({"width":480,"height":360})).unwrap();
@@ -480,7 +561,9 @@ fn legacy_dock_width_is_consumed_by_custom_renderer_and_clamped_to_existing_rang
     app.run("window.panel.float", json!({"panel":"properties"})).unwrap();
     let mut h = harness(app, vec2(1280.0, 800.0));
     let ctx = h.ctx.clone();
-    for (requested, expected) in [(410.0, 410.0), (900.0, 520.0), (20.0, 250.0)] {
+    // A 1280-point window: the dock may take all but 400 points (#7896), so 700 is no longer
+    // cut to 520.
+    for (requested, expected) in [(410.0, 410.0), (700.0, 700.0), (900.0, 880.0), (20.0, 250.0)] {
         assert_eq!(control_set(h.state_mut(), &ctx, json!({"dockWidth":requested}))["ok"], true);
         h.run_steps(2);
         let state = egui::containers::panel::PanelState::load(&h.ctx, egui::Id::new("shared-panel-dock")).unwrap();
@@ -502,6 +585,34 @@ fn explicit_reveal_activates_existing_tab_and_expands_custom_group() {
     let before = app.ui.docking.clone();
     assert!(app.run("window.panel.layers", json!({"show":"yes"})).is_err());
     assert_eq!(app.ui.docking, before);
+}
+
+// #2455 in a custom workspace: the pro Color field fills a tall floating group, not 120 pt.
+#[test]
+fn pro_color_field_fills_a_tall_custom_group() {
+    let mut app = app();
+    app.run("window.panel.float", json!({"panel":"color","x":40,"y":60,"width":320,"height":560})).unwrap();
+    assert!(app.ui.docking.is_some());
+    let h = harness(app, vec2(1280.0, 800.0));
+    // The SV field and the 14 pt hue strip beside it are draggable, equally tall and 8 pt apart.
+    let drags: Vec<egui::Rect> =
+        h.ctx.viewport(|v| v.this_pass.widgets.layers().flat_map(|(_, w)| w).filter(|w| w.sense.senses_drag()).map(|w| w.rect).collect());
+    let field = drags
+        .iter()
+        .find(|f| drags.iter().any(|s| s.width() == 14.0 && s.top() == f.top() && s.height() == f.height() && (s.left() - f.right() - 8.0).abs() < 0.5))
+        .expect("Color field with its hue strip");
+    assert!(field.height() > 300.0, "field stays short in a 560 pt group: {field:?}");
+}
+
+// #4028: in a custom workspace too, a new adjustment layer brings Properties to the front.
+#[test]
+fn a_new_adjustment_layer_activates_properties_in_a_custom_workspace() {
+    let mut app = app();
+    app.run("window.panel.activate", json!({"panel":"adjustments"})).unwrap();
+    assert!(panel_active(app.ui.docking.as_ref().unwrap(), "adjustments"));
+    app.run("file.new", json!({"width":64,"height":64})).unwrap();
+    app.run("layer.newAdjustmentLayer.curves", json!({})).unwrap();
+    assert!(panel_active(app.ui.docking.as_ref().unwrap(), "properties"));
 }
 
 #[test]
@@ -562,6 +673,25 @@ fn customized_panel_menus_and_rail_remain_reachable_after_float_and_restore() {
     );
     menu.run_steps(2);
     assert!(menu.query_all_by_label("New Swatch…").count() > 0);
+}
+
+#[test]
+fn actions_panel_menu_includes_load_and_save_actions() {
+    let mut ready = false;
+    let mut menu = Harness::builder().build_ui_state(
+        move |ui, app: &mut PhotocraftApp| {
+            if !ready {
+                PhotocraftApp::setup_context(ui.ctx(), crate::theme::ThemeKind::ProMedium);
+                ready = true;
+            }
+            panel_menu(app, ui, "actions");
+        },
+        self::app(),
+    );
+    menu.run_steps(2);
+    assert!(menu.query_all_by_label("Load Actions…").count() > 0);
+    assert!(menu.query_all_by_label("Save Actions…").count() > 0);
+    assert!(menu.query_all_by_label("New Action…").count() > 0);
 }
 
 #[test]
@@ -658,4 +788,14 @@ fn native_tab_reorder_stays_native_until_drag_crosses_the_strip() {
     let layers = tabs.iter().position(|(_, label)| *label == "Layers").unwrap();
     let channels = tabs.iter().position(|(_, label)| *label == "Channels").unwrap();
     assert!(channels < layers, "upstream native reorder remains effective");
+}
+
+/// #7896: the dock's widest is the window less what the toolbar and the canvas keep, never
+/// below the old 520 points, so a wide window allows a two-column dock.
+#[test]
+fn the_dock_can_be_as_wide_as_the_window_allows() {
+    for (window, max) in [(2560.0, 2160.0), (1280.0, 880.0), (800.0, 520.0), (f32::NAN, 520.0)] {
+        let range = crate::panels::dock_width_range(window);
+        assert_eq!((*range.start(), *range.end()), (crate::panels::DOCK_MIN_WIDTH, max), "{window}");
+    }
 }

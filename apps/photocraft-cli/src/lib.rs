@@ -1,4 +1,4 @@
-//! Headless Photocraft command line. `run` is the whole program, so it can be
+//! Headless PhotoCraft command line. `run` is the whole program, so it can be
 //! tested in-process as well as through the binary.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
@@ -12,22 +12,32 @@ use photocraft_io::ExportOptions;
 use serde_json::{Value, json};
 
 pub const USAGE: &str = "\
-photocraft-cli: headless Photocraft
+photocraft-cli: headless PhotoCraft
 
 USAGE:
-  photocraft-cli convert <in> <out> [--format <ext>] [--quality <1-100>] [--tiff-layers] [--tga-bits <24|32>]
+  photocraft-cli convert <in> <out> [--format <ext>] [--quality <1-100>] [--in-place] [--tiff-layers] [--tiff-compression <none|lzw|zip>] [--tga-bits <24|32>] [--dpx-bits <8|10|12|16>] [--dds-compression <none|bc1|bc2|bc3>] [--dds-mipmaps] [--jpeg-format <baseline|optimized|progressive>]
       Convert between formats (.pcraft, .psd, .png, .jpg, .tif, .webp, .exr, …).
-      TIFF output is flat unless --tiff-layers keeps the layers (Photoshop layer data).
+      An <out> that is the <in> file is refused, as the result would replace the original;
+      --in-place allows it.
+      TIFF output is flat unless --tiff-layers keeps the layers (Photoshop layer data);
+      --tiff-compression compresses it (none, the default; lzw; zip).
       --quality sets the JPEG or WebP quality; a WebP written with a quality is lossy, without one lossless.
       --tga-bits sets a TGA's bits per pixel: 32 writes the alpha channel (or else the transparency) as
       its alpha, 24 none. Without it: 32 with an alpha channel or transparency, else 24.
+      --dpx-bits sets a DPX's bits per sample. Without it: 8 for an 8-bit document, else 16.
+      --dds-compression sets a DDS texture's compression: none (uncompressed, the default), bc1
+      (DXT1: alpha on or off), bc2 (DXT3) or bc3 (DXT5). --dds-mipmaps also writes the full mip chain.
+      --jpeg-format picks a JPEG's scans, as JPEG Options does: baseline (the default), optimized
+      (Huffman tables fitted to the image; RGB is written 4:2:0 and keeps the standard tables, so
+      only Gray and CMYK shrink) or progressive.
   photocraft-cli info <file> [--compact]
       Print the document as JSON (size, mode, depth, layer tree).
-  photocraft-cli run (<file> | --new <json>) --cmd <id> [--params <json>] [--cmd …] [--out <file>] [--format <ext>] [--quality <1-100>] [--tiff-layers] [--tga-bits <24|32>]
+  photocraft-cli run (<file> | --new <json>) --cmd <id> [--params <json>] [--cmd …] [--out <file>] [--format <ext>] [--quality <1-100>] [--tiff-layers] [--tiff-compression <none|lzw|zip>] [--tga-bits <24|32>] [--dpx-bits <8|10|12|16>] [--dds-compression <none|bc1|bc2|bc3>] [--dds-mipmaps] [--jpeg-format <baseline|optimized|progressive>]
       Open a file, run engine commands in order, save the result. Each --params
       applies to the preceding --cmd. Prints each command's JSON result.
-  photocraft-cli batch --actions <actions.json> [--action <name>] --in <dir> --out <dir> [--format <ext>] [--quality <1-100>] [--in-place] [--tiff-layers] [--tga-bits <24|32>]
-      Apply an action list to every image in a directory. Steps are [id, params] pairs,
+  photocraft-cli batch --actions <actions.json|set.atn> [--action <name>] --in <dir> --out <dir> [--format <ext>] [--quality <1-100>] [--in-place] [--tiff-layers] [--tiff-compression <none|lzw|zip>] [--tga-bits <24|32>] [--dpx-bits <8|10|12|16>] [--dds-compression <none|bc1|bc2|bc3>] [--dds-mipmaps] [--jpeg-format <baseline|optimized|progressive>]
+      Apply an action list to every image in a directory. A Photoshop Actions file (.atn) is a
+      set: its action --action names plays, as below. JSON steps are [id, params] pairs,
       {\"command\": id, \"params\": {…}} objects or bare ids, as a recorded action or droplet stores them
       (a list, or wrapped in {\"actions\": …}, {\"steps\": …} or a droplet). An Actions set (the Actions
       panel's actions.json, {\"actions\": [{\"name\", \"steps\"}…]}) plays the action --action names (needed
@@ -67,18 +77,47 @@ struct Subcommand {
 }
 
 const SUBCOMMANDS: &[Subcommand] = &[
-    Subcommand { name: "convert", values: &["--format", "--quality", "--tga-bits"], bare: &["--tiff-layers"], run: convert },
+    Subcommand {
+        name: "convert",
+        values: &["--format", "--quality", "--tga-bits", "--dpx-bits", "--dds-compression", "--tiff-compression", "--jpeg-format"],
+        bare: &["--in-place", "--tiff-layers", "--dds-mipmaps"],
+        run: convert,
+    },
     Subcommand { name: "info", values: &[], bare: &["--compact"], run: |a, out, _| info(a, out) },
     Subcommand {
         name: "run",
-        values: &["--new", "--cmd", "--params", "--out", "--format", "--quality", "--tga-bits"],
-        bare: &["--tiff-layers"],
+        values: &[
+            "--new",
+            "--cmd",
+            "--params",
+            "--out",
+            "--format",
+            "--quality",
+            "--tga-bits",
+            "--dpx-bits",
+            "--dds-compression",
+            "--tiff-compression",
+            "--jpeg-format",
+        ],
+        bare: &["--tiff-layers", "--dds-mipmaps"],
         run: run_cmds,
     },
     Subcommand {
         name: "batch",
-        values: &["--actions", "--action", "--in", "--out", "--format", "--quality", "--tga-bits"],
-        bare: &["--in-place", "--tiff-layers"],
+        values: &[
+            "--actions",
+            "--action",
+            "--in",
+            "--out",
+            "--format",
+            "--quality",
+            "--tga-bits",
+            "--dpx-bits",
+            "--dds-compression",
+            "--tiff-compression",
+            "--jpeg-format",
+        ],
+        bare: &["--in-place", "--tiff-layers", "--dds-mipmaps"],
         run: batch,
     },
     Subcommand { name: "droplet", values: &["--out"], bare: &[], run: droplet },
@@ -213,6 +252,27 @@ fn export_opts(a: &Args) -> Result<ExportOptions, String> {
     if let Some(b) = a.get("--tga-bits") {
         o.tga_bits = Some(b.parse().ok().and_then(photocraft_io::TgaBits::from_bits).ok_or_else(|| format!("bad --tga-bits `{b}`: expected 24 or 32"))?);
     }
+    if let Some(b) = a.get("--dpx-bits") {
+        o.encode.dpx_bits =
+            Some(b.parse().ok().and_then(photocraft_io::DpxBits::from_bits).ok_or_else(|| format!("bad --dpx-bits `{b}`: expected 8, 10, 12 or 16"))?);
+    }
+    if let Some(c) = a.get("--tiff-compression") {
+        o.encode.tiff_compression = match c {
+            "none" => photocraft_codecs::TiffCompression::None,
+            "lzw" => photocraft_codecs::TiffCompression::Lzw,
+            "zip" => photocraft_codecs::TiffCompression::Deflate,
+            _ => return Err(format!("bad --tiff-compression `{c}`: expected none, lzw or zip")),
+        };
+    }
+    if let Some(f) = a.get("--jpeg-format") {
+        o.encode.jpeg_format =
+            photocraft_codecs::JpegFormat::parse(f).ok_or_else(|| format!("bad --jpeg-format `{f}`: expected baseline, optimized or progressive"))?;
+    }
+    if let Some(c) = a.get("--dds-compression") {
+        o.encode.dds.compression =
+            photocraft_io::DdsCompression::from_name(c).ok_or_else(|| format!("bad --dds-compression `{c}`: expected none, bc1, bc2 or bc3"))?;
+    }
+    o.encode.dds.mipmaps = a.has("--dds-mipmaps");
     Ok(o)
 }
 
@@ -233,12 +293,28 @@ fn automation_workspace(args: &Args) -> Result<AuthorizedWorkspace, String> {
         .map_err(|error| error.to_string())
 }
 
+/// An output that is the input file itself, however it is spelt (relative, with `./`, through a
+/// hard or symbolic link), would replace the original, and a lossy re-encode can't be undone: it
+/// is refused unless `--in-place` asks for it, as `batch` refuses an `--out` that is its `--in`
+/// folder (#7437). The paths are compared when the command starts and the save opens `output`
+/// again later, so another process swapping in a link meanwhile goes unnoticed: this guards
+/// against mistakes, it is not a security boundary.
+fn refuse_overwriting_input(a: &Args, input: &str, output: &str) -> R {
+    if !a.has("--in-place") && photocraft_engine::file_cmds::same_file(input, output) {
+        return Err(format!("{output} is the input file, so the result would replace the original: choose another output, or pass --in-place to overwrite it"));
+    }
+    Ok(())
+}
+
 fn convert(a: &Args, _out: &mut dyn Write, err: &mut dyn Write) -> R {
     let [input, output] = a.positional.as_slice() else {
         return Err("convert needs <in> <out>".into());
     };
     let opts = export_opts(a)?;
-    let o = files::open(Path::new(input)).map_err(|e| e.to_string())?;
+    refuse_overwriting_input(a, input, output)?;
+    let mut o = files::open(Path::new(input)).map_err(|e| e.to_string())?;
+    // Preferences › Raw Defaults › Resolution at its default, as `run` and `info` open a raw.
+    photocraft_engine::file_cmds::raw_defaults(&photocraft_engine::Session::new(), &o.warnings, &mut o.document);
     warn_all(err, &o.warnings);
     warn_all(err, &photocraft_engine::type_extra_cmds::missing_font_warnings(&o.document));
     let ws = files::save(&o.document, Path::new(output), a.get("--format"), &opts, None).map_err(|e| e.to_string())?;
@@ -292,13 +368,14 @@ fn command_list(a: &Args) -> Result<Vec<(String, Value)>, String> {
 fn run_cmds(a: &Args, out: &mut dyn Write, err: &mut dyn Write) -> R {
     let opts = export_opts(a)?;
     let mut h = Headless::trusted_local();
-    // Each missing-font warning is printed once, wherever it is first detected (open, a command or
-    // the save).
+    // Opening, running commands and exporting can all notice the same missing font:
+    // one `run` invocation reports each warning line at most once.
     let mut reported_fonts = std::collections::HashSet::<String>::new();
     match (a.positional.as_slice(), a.get("--new")) {
         ([file], None) => {
             let o = h.open(Path::new(file)).map_err(|e| e.to_string())?;
             let ws: Vec<String> = serde_json::from_value(o["warnings"].clone()).unwrap_or_default();
+            reported_fonts.extend(ws.iter().cloned());
             warn_all(err, &ws);
             reported_fonts.extend(ws);
         }
@@ -344,9 +421,8 @@ fn run_cmds(a: &Args, out: &mut dyn Write, err: &mut dyn Write) -> R {
     warn_all(err, &remaining);
     if let Some(o) = a.get("--out") {
         let r = h.save(None, Some(Path::new(o)), a.get("--format"), &opts).map_err(|e| e.to_string())?;
-        // The save repeats the document's missing-font warnings; each was already reported above.
-        let ws: Vec<String> =
-            serde_json::from_value::<Vec<String>>(r["warnings"].clone()).unwrap_or_default().into_iter().filter(|w| !reported_fonts.contains(w)).collect();
+        let ws: Vec<String> = serde_json::from_value(r["warnings"].clone()).unwrap_or_default();
+        let ws: Vec<String> = ws.into_iter().filter(|w| reported_fonts.insert(w.clone())).collect();
         warn_all(err, &ws);
     }
     Ok(())
@@ -392,6 +468,38 @@ pub fn load_actions(text: &str, name: Option<&str>) -> Result<(Steps, Vec<Action
     Ok((play, set))
 }
 
+/// [`load_actions`] for a file on disk: a Photoshop Actions file (`.atn`, by extension or by
+/// its version word) is converted first; the played action's steps with no PhotoCraft
+/// equivalent come back as warnings (they fail at playback, as in Photoshop when a step can't run).
+pub fn load_actions_file(path: &str, name: Option<&str>) -> Result<(Steps, Vec<Action>, Vec<String>), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    let is_atn = Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("atn")) || bytes.starts_with(&[0, 0, 0, 16]);
+    if !is_atn {
+        let text = String::from_utf8(bytes).map_err(|e| format!("{path}: {e}"))?;
+        let (steps, set) = load_actions(&text, name)?;
+        return Ok((steps, set, Vec::new()));
+    }
+    let imp = photocraft_engine::atn_cmds::import(&bytes).map_err(|e| format!("{path}: {e}"))?;
+    let names = || imp.actions.iter().map(|a| format!("`{}`", a.name)).collect::<Vec<_>>().join(", ");
+    let action = match (name, imp.actions.as_slice()) {
+        (Some(n), _) => {
+            imp.actions.iter().find(|a| a.name == n).ok_or_else(|| format!("no action named `{n}` in the set `{}` (it holds {})", imp.set, names()))?
+        }
+        (None, [only]) => only,
+        (None, []) => return Err(format!("{path}: the set holds no actions")),
+        (None, _) => return Err(format!("the set `{}` holds {} actions: pick one with --action <name> ({})", imp.set, imp.actions.len(), names())),
+    };
+    let warnings = imp
+        .unsupported
+        .iter()
+        .filter(|u| u.action == action.name)
+        .map(|u| format!("`{}` step {}: Photoshop's \"{}\" ({}) has no PhotoCraft equivalent yet", u.action, u.step + 1, u.name, u.event))
+        .chain(imp.warnings.iter().cloned())
+        .collect();
+    let play = vec![("actions.play".to_string(), json!({"action": action.name}))];
+    Ok((play, imp.actions, warnings))
+}
+
 /// Whether `a` and `b` name the same existing folder, however they are spelt (relative, with a
 /// trailing separator, through a symbolic link).
 fn same_dir(a: &Path, b: &Path) -> bool {
@@ -400,18 +508,41 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 
 fn is_input(p: &Path) -> bool {
     let known = |e: &str| {
-        matches!(e, "pcraft" | "psd" | "psb" | "pdn" | "ora" | "af" | "afdesign" | "afphoto" | "afpub")
+        matches!(e, "pcraft" | "psd" | "psb" | "pdn" | "ora" | "kra" | "krz" | "af" | "afdesign" | "afphoto" | "afpub")
             || photocraft_codecs::from_extension(e).is_some_and(|f| photocraft_codecs::caps(f).read)
     };
     p.is_file() && p.extension().is_some_and(|e| known(&e.to_string_lossy().to_ascii_lowercase()))
+}
+
+/// Drops the Save and view steps the desktop records from `action` (Batch saves each result
+/// itself, #3143), keeping its unchecked and dialog flags on the steps that remain (#6860).
+fn strip_shell_steps(action: &mut Action) {
+    use photocraft_engine::actions_cmds::{shell_save_command, shell_view_command};
+    let (mut steps, mut disabled, mut dialogs) = (Vec::new(), std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
+    for (i, (id, p)) in std::mem::take(&mut action.steps).into_iter().enumerate() {
+        if shell_save_command(&id) || shell_view_command(&id) {
+            continue;
+        }
+        if action.disabled.contains(&i) {
+            disabled.insert(steps.len());
+        }
+        if action.dialogs.contains(&i) {
+            dialogs.insert(steps.len());
+        }
+        steps.push((id, p));
+    }
+    (action.steps, action.disabled, action.dialogs) = (steps, disabled, dialogs);
 }
 
 fn batch(a: &Args, out: &mut dyn Write, err: &mut dyn Write) -> R {
     let actions_path = a.get("--actions").ok_or("batch needs --actions <file>")?;
     let in_dir = PathBuf::from(a.get("--in").ok_or("batch needs --in <dir>")?);
     let out_dir = PathBuf::from(a.get("--out").ok_or("batch needs --out <dir>")?);
-    let text = std::fs::read_to_string(actions_path).map_err(|e| format!("{actions_path}: {e}"))?;
-    let (actions, set) = load_actions(&text, a.get("--action"))?;
+    let (actions, mut set, warnings) = load_actions_file(actions_path, a.get("--action"))?;
+    set.iter_mut().for_each(strip_shell_steps);
+    for w in &warnings {
+        let _ = writeln!(err, "warning: {w}");
+    }
     let opts = export_opts(a)?;
     // Results are saved as `<out>/<stem>.<ext>`, so an `--out` that is the `--in` folder would
     // replace the originals (#492).
@@ -501,9 +632,7 @@ fn commands(a: &Args, out: &mut dyn Write) -> R {
         .map(|v| v.iter().collect::<Vec<_>>())
         .unwrap_or_default()
         .into_iter()
-        .filter(|c| {
-            needle.as_ref().is_none_or(|n| format!("{} {}", c["id"].as_str().unwrap_or(""), c["label"].as_str().unwrap_or("")).to_lowercase().contains(n))
-        })
+        .filter(|c| needle.as_ref().is_none_or(|n| photocraft_engine::commands::list_entry_matches(c, n)))
         .collect();
     if a.has("--json") {
         return print_json(out, &Value::Array(items.into_iter().cloned().collect()), false);
@@ -634,6 +763,11 @@ mod missing_font_warning_tests {
         let (code, _, stderr) = invoke(&["convert", &ora, &png]);
         assert_eq!(code, 0, "{stderr}");
         assert!(is_input(std::path::Path::new(&ora)));
+        // Krita documents are batch inputs too (import-only).
+        for name in ["sketch.kra", "old.KRZ"] {
+            std::fs::write(folder.join(name), b"").unwrap();
+            assert!(is_input(&folder.join(name)), "{name}");
+        }
         let _ = std::fs::remove_dir_all(&folder);
     }
 
@@ -705,6 +839,39 @@ mod batch_action_set_tests {
             assert_ne!(code, 0, "{stdout}");
             assert_eq!(stderr.matches("FAIL").count(), 2, "{stderr}");
             assert!(!dir.join(action).join("a.png").exists(), "a file whose called action failed is not saved");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Save and view steps recorded inside a batched action set are skipped, also in a called
+    /// action, and unchecked steps stay unchecked once they are gone (#6860).
+    #[test]
+    fn batch_skips_save_and_view_steps_inside_an_action_set() {
+        let dir = std::env::temp_dir().join(format!("photocraft-cli-action-set-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = |name: &str| dir.join(name).to_string_lossy().to_string();
+        std::fs::create_dir_all(dir.join("in")).unwrap();
+        let (code, _, stderr) = invoke(&["run", "--new", r#"{"width":8,"height":6}"#, "--out", &path("in/a.png")]);
+        assert_eq!(code, 0, "{stderr}");
+        let set = json!({"version": 1, "actions": [
+            {"name": "Outer", "steps": [["actions.play", {"action": "Rotate"}], ["file.saveAs", {}]]},
+            {"name": "Rotate", "steps": [
+                ["file.save", {}],
+                ["image.imageRotation.90cw", {}],
+                ["view.fitOnScreen", {}],
+                ["image.imageRotation.90cw", {}],
+                ["file.saveAs", {}],
+            ], "disabled": [3], "dialogs": [1]},
+        ]});
+        std::fs::write(dir.join("actions.json"), set.to_string()).unwrap();
+        for action in ["Outer", "Rotate"] {
+            let (code, stdout, stderr) =
+                invoke(&["batch", "--actions", &path("actions.json"), "--action", action, "--in", &path("in"), "--out", &path(action)]);
+            assert_eq!(code, 0, "{stdout}{stderr}");
+            let (code, info, stderr) = invoke(&["info", &path(&format!("{action}/a.png")), "--compact"]);
+            assert_eq!(code, 0, "{stderr}");
+            let info: Value = serde_json::from_str(&info).unwrap();
+            assert_eq!((info["width"].as_u64(), info["height"].as_u64()), (Some(6), Some(8)), "{action}: rotated once, the unchecked step skipped");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

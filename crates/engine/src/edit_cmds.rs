@@ -28,19 +28,21 @@ pub struct Clip {
     /// than rasterize (see [`whole_layer`]): a scratch document in the source's colour holding it.
     /// `surface` still holds its pixels, for Paste Into, masks, channels and other apps.
     pub layers: Option<Box<Document>>,
+    /// The source document's resolution (ppi): File › New from the clipboard takes it, as
+    /// Photoshop's Clipboard preset does. None for an image from another app.
+    pub resolution: Option<f32>,
 }
 
 /// Photoshop's layer-based copy (CC 2018 on): with no selection, Copy takes the active layer
 /// whole when it is a smart object (#2428), a type or shape layer, or a group (its whole subtree)
-/// (#2670), so Paste recreates it instead of its pixels. Pixel layers still copy their pixels;
-/// several selected layers are [`multi_copy_ids`].
+/// (#2670), so Paste recreates it instead of its pixels. Fill and adjustment layers have no
+/// pixels of their own, so they are taken whole too rather than refused (#2344). Pixel layers
+/// still copy their pixels; several selected layers are [`multi_copy_ids`].
 fn takes_whole(d: &crate::DocState, id: LayerId) -> bool {
     d.doc.selection.is_none()
         && d.selected_layers().len() <= 1
         && crate::layer_copy_cmds::layered(d.doc.mode)
-        && d.doc
-            .layer(id)
-            .is_some_and(|l| matches!(l.content, LayerContent::Smart(_) | LayerContent::Text(_) | LayerContent::Shape(_) | LayerContent::Group(_)))
+        && d.doc.layer(id).is_some_and(|l| !matches!(l.content, LayerContent::Raster(_)))
 }
 
 /// A scratch document in the source's colour, to hold copied layers.
@@ -50,6 +52,46 @@ fn scratch_doc(doc: &Document) -> Document {
     copies.resolution_dpi = doc.resolution_dpi;
     copies.patterns = doc.patterns.clone();
     copies
+}
+
+/// Scope linked records to the copied layer tree: a PSD block can also hold files belonging
+/// to unselected or hidden layers, which must not follow this copy into a native save.
+fn copy_linked_sources(source: &Document, copies: &mut Document) -> Result<()> {
+    fn collect<'a>(layers: &'a [Layer], depth: usize, paths: &mut std::collections::HashSet<&'a str>) -> Result<()> {
+        if depth > photocraft_doc::MAX_GROUP_DEPTH {
+            return Err(EngineError::Other("can't copy linked smart objects from layers nested too deeply".into()));
+        }
+        for layer in layers {
+            if let LayerContent::Smart(sm) = &layer.content
+                && let photocraft_doc::SmartSource::Linked { path } = &sm.source
+            {
+                paths.try_reserve(1).map_err(|_| EngineError::Other("not enough memory to copy smart-object source IDs".into()))?;
+                paths.insert(path);
+            }
+            if let Some(children) = layer.children().filter(|children| !children.is_empty()) {
+                collect(children, depth + 1, paths)?;
+            }
+        }
+        Ok(())
+    }
+    let mut paths = std::collections::HashSet::new();
+    collect(&copies.layers, 0, &mut paths)?;
+    if paths.is_empty() {
+        return Ok(());
+    }
+    for (signature, key, data) in &source.metadata.psd_global_blocks {
+        if !matches!(key, b"lnk2" | b"lnk3" | b"lnkD" | b"lnkE") {
+            continue;
+        }
+        let selected = photocraft_io::linked::select_items(data, &|uuid, _| paths.contains(uuid))
+            .map_err(|e| EngineError::Other(format!("Could not copy smart-object contents: {e}; the clipboard was not changed")))?;
+        let selected = selected.map(std::sync::Arc::new).unwrap_or_else(|| data.clone());
+        if !selected.is_empty() {
+            copies.metadata.psd_global_blocks.try_reserve(1).map_err(|_| EngineError::Other("not enough memory to copy smart-object source records".into()))?;
+            copies.metadata.psd_global_blocks.push((*signature, *key, selected));
+        }
+    }
+    Ok(())
 }
 
 /// The layer Copy takes whole ([`takes_whole`]): a scratch document in the source's colour
@@ -139,6 +181,11 @@ fn active_id(s: &Session) -> Result<LayerId> {
 }
 
 /// The pixels of `src` inside the selection (or all of them), as a straight-alpha surface.
+///
+/// Built tile by tile (#4516). A source tile that the copy takes whole (inside the canvas, fully
+/// selected or no selection, already in the clip's format) is shared copy-on-write, so a plain
+/// Copy or Select All, Copy costs a pointer per tile; only the other tiles are read and written,
+/// one at a time, instead of the whole area as one `f32` buffer.
 fn lift(src: &Surface, sel: Option<&Surface>, canvas: Rect) -> Result<Clip> {
     let fmt = src.format();
     let with_alpha = PixelFormat::new(fmt.mode, fmt.sample, true);
@@ -148,15 +195,39 @@ fn lift(src: &Surface, sel: Option<&Surface>, canvas: Rect) -> Result<Clip> {
     };
     let mut out = Surface::new(with_alpha);
     if area.is_empty() {
-        return Ok(Clip { surface: out, bounds: Rect::EMPTY, layers: None });
+        return Ok(Clip { surface: out, bounds: Rect::EMPTY, layers: None, resolution: None });
     }
     // Only the selected area is read: converting the whole layer (a 24 MP Background gaining
     // alpha) cost about a second per Layer via Copy (#668).
-    let n = with_alpha.channels();
+    let mut shared = Vec::new();
+    for tc in area.tiles() {
+        let tr = tc.rect().intersect(&area);
+        if fmt.alpha
+            && tr == tc.rect()
+            && let Some(tile) = src.tile(tc)
+            && sel.is_none_or(|m| crate::fill_cmds::Mask::of(m, tc).full(tr))
+        {
+            // Reading and writing it back would give the same bytes.
+            shared.push((tc, tile.clone()));
+            continue;
+        }
+        let px = lift_region(src, sel, tr, with_alpha.channels())?;
+        out.try_write_region(tr, &px).map_err(|e| EngineError::Other(format!("not enough memory while copying pixels ({e}); the document was not changed")))?;
+    }
+    out.put_tiles(shared);
+    out.prune();
+    let bounds = out.content_bounds();
+    Ok(Clip { surface: out, bounds, layers: None, resolution: None })
+}
+
+/// [`lift`] over one rectangle: `src`'s pixels with alpha (`n` channels), the selection
+/// multiplied into it.
+fn lift_region(src: &Surface, sel: Option<&Surface>, r: Rect, n: usize) -> Result<Vec<f32>> {
+    let fmt = src.format();
     let mut px = if fmt.alpha {
-        crate::allocation::read_region(src, area, "copying pixels")?
+        crate::allocation::read_region(src, r, "copying pixels")?
     } else {
-        let opaque = crate::allocation::read_region(src, area, "copying pixels")?;
+        let opaque = crate::allocation::read_region(src, r, "copying pixels")?;
         let k = fmt.channels();
         let len = opaque
             .len()
@@ -177,16 +248,15 @@ fn lift(src: &Surface, sel: Option<&Surface>, canvas: Rect) -> Result<Clip> {
         v
     };
     if let Some(m) = sel {
-        let mask = crate::allocation::read_region(m, area, "applying the selection to copied pixels")?;
+        let mask = crate::allocation::read_region(m, r, "applying the selection to copied pixels")?;
         let mk = m.format().channels().max(1);
-        for (p, a) in px.chunks_exact_mut(n).zip(mask.chunks_exact(mk)) {
-            p[n - 1] *= a[0];
+        for (p, a) in px.chunks_exact_mut(n.max(1)).zip(mask.chunks_exact(mk)) {
+            if let Some(alpha) = p.last_mut() {
+                *alpha *= a[0];
+            }
         }
     }
-    out.try_write_region(area, &px).map_err(|e| EngineError::Other(format!("not enough memory while copying pixels ({e}); the document was not changed")))?;
-    out.prune();
-    let bounds = out.content_bounds();
-    Ok(Clip { surface: out, bounds, layers: None })
+    Ok(px)
 }
 
 /// Merged composite of the visible document as a surface in the document's format.
@@ -203,16 +273,24 @@ fn copy(s: &mut Session, merged: bool) -> Result<Value> {
     } else {
         let id = d.active_layer.ok_or(EngineError::Other("no active layer".into()))?;
         let several = multi_copy_ids(d);
-        let layers = if several.is_empty() { whole_layer(d, id) } else { whole_layers(d, &several) };
+        let mut layers = if several.is_empty() { whole_layer(d, id) } else { whole_layers(d, &several) };
+        if let Some(copies) = &mut layers {
+            copy_linked_sources(&d.doc, copies)?;
+        }
         match (d.doc.layer(id).and_then(Layer::surface).filter(|_| several.is_empty()), &layers) {
             (Some(surf), _) => Clip { layers, ..lift(surf, d.doc.selection.as_ref(), canvas)? },
-            // A group has no pixels of its own: the clipboard pixels are what it shows.
+            // A group or fill layer has no pixels of its own: the clipboard pixels are what it
+            // shows. Adjustment layers show nothing by themselves, so their clip spans the canvas
+            // they apply to: Paste places them as a full-canvas layer, and the UI still mirrors
+            // the clip to the OS clipboard (an empty clip would let a stale OS image replace it).
             (None, Some(copies)) => {
                 let mut shown = (**copies).clone();
                 for l in &mut shown.layers {
                     l.visible = true;
                 }
-                Clip { layers, ..lift(&merged_surface(&shown), None, canvas)? }
+                let clip = lift(&merged_surface(&shown), None, canvas)?;
+                let bounds = if clip.bounds.is_empty() { canvas } else { clip.bounds };
+                Clip { layers, bounds, ..clip }
             }
             (None, None) => return Err(EngineError::Other("the active layer has no pixels".into())),
         }
@@ -221,6 +299,7 @@ fn copy(s: &mut Session, merged: bool) -> Result<Value> {
         return Err(EngineError::Other("Could not copy: the selected area is empty".into()));
     }
     let b = clip.bounds;
+    let clip = Clip { resolution: Some(d.doc.resolution_dpi), ..clip };
     s.clipboard = Some(clip);
     Ok(json!({"bounds": [b.x0, b.y0, b.width(), b.height()]}))
 }
@@ -263,7 +342,8 @@ fn copy_mask(s: &mut Session) -> Result<Value> {
         return Err(EngineError::Other("Could not copy: the selected area is empty".into()));
     }
     let b = bounds;
-    s.clipboard = Some(Clip { surface, bounds: b, layers: None });
+    let resolution = Some(d.doc.resolution_dpi);
+    s.clipboard = Some(Clip { surface, bounds: b, layers: None, resolution });
     Ok(json!({"bounds": [b.x0, b.y0, b.width(), b.height()], "target": "mask"}))
 }
 
@@ -314,7 +394,6 @@ fn paste(s: &mut Session, p: &Value, in_place: bool) -> Result<Value> {
     let moved = shifted(&clip.surface, dx, dy);
     let target = PixelFormat::new(fmt.mode, fmt.sample, true);
     let surf = if moved.format() == target { moved } else { moved.convert(target) };
-    let before = d.doc.clone();
     let id = s.edit("Paste", |doc, active| {
         let mut l = Layer::raster(doc.next_layer_name("Layer"), target);
         *crate::pixels_mut(&mut l)? = surf;
@@ -323,8 +402,7 @@ fn paste(s: &mut Session, p: &Value, in_place: bool) -> Result<Value> {
         doc.selection = None;
         Ok(id)
     })?;
-    // Only where the pasted pixels land needs recompositing, not the whole document (#2901).
-    crate::layer_multi_cmds::note_insert(s, &before);
+    // `edit` reports only where the pasted pixels land as damage, not the whole document (#2901).
     Ok(json!({"layer": id.0, "offset": [dx, dy]}))
 }
 
@@ -340,8 +418,27 @@ fn paste_layers(s: &mut Session, layers: &Document, dx: i32, dy: i32) -> Result<
     crate::layer_copy_cmds::adapt_copies(s, &mut copies, &d.doc)?;
     crate::layer_copy_cmds::translate_copies(&mut copies, dx, dy);
     let patterns: Vec<_> = copies.patterns.iter().filter(|pat| !d.doc.patterns.iter().any(|q| q.id == pat.id)).cloned().collect();
+    // A copied smart object may name a PSD-embedded linked file; land its `lnk` block too (#3584).
+    let mut linked = Vec::new();
+    for (signature, key, data) in copies.metadata.psd_global_blocks.iter().filter(|(_, k, _)| matches!(k, b"lnk2" | b"lnk3" | b"lnkD" | b"lnkE")) {
+        if d.doc.metadata.psd_global_blocks.iter().any(|(_, dk, dd)| dk == key && std::sync::Arc::ptr_eq(dd, data)) {
+            continue;
+        }
+        // The clipboard may contain a subset of a destination block. Compare complete records,
+        // so copying one layer in the same document does not duplicate large embedded files.
+        let missing = photocraft_io::linked::select_items(data, &|_, raw| {
+            !d.doc.metadata.psd_global_blocks.iter().any(|(_, dk, dd)| dk == key && photocraft_io::linked::contains_item(dd, raw))
+        })
+        .map_err(|e| EngineError::Other(format!("Could not paste smart-object contents: {e}; the document was not changed")))?;
+        let missing = missing.map(std::sync::Arc::new).unwrap_or_else(|| data.clone());
+        if !missing.is_empty() {
+            linked.try_reserve(1).map_err(|_| EngineError::Other("not enough memory to paste smart-object source records".into()))?;
+            linked.push((*signature, *key, missing));
+        }
+    }
     let id = s.edit("Paste", |doc, active| {
         doc.patterns.extend(patterns);
+        doc.metadata.psd_global_blocks.extend(linked);
         for l in copies.layers {
             *active = Some(doc.insert_above(*active, l));
         }
@@ -359,9 +456,9 @@ pub(crate) fn paste_offset(clip: &Clip, canvas: Rect, p: &Value, in_place: bool)
         return (0, 0);
     }
     let c = p.get("center").and_then(Value::as_array).filter(|a| a.len() >= 2).map(|a| (a[0].as_f64().unwrap_or(0.0), a[1].as_f64().unwrap_or(0.0)));
-    let (cx, cy) = c.unwrap_or(((canvas.x0 + canvas.x1) as f64 / 2.0, (canvas.y0 + canvas.y1) as f64 / 2.0));
+    let (cx, cy) = c.unwrap_or(((f64::from(canvas.x0) + f64::from(canvas.x1)) / 2.0, (f64::from(canvas.y0) + f64::from(canvas.y1)) / 2.0));
     let b = clip.bounds;
-    ((cx - (b.x0 + b.x1) as f64 / 2.0).round() as i32, (cy - (b.y0 + b.y1) as f64 / 2.0).round() as i32)
+    ((cx - (f64::from(b.x0) + f64::from(b.x1)) / 2.0).round() as i32, (cy - (f64::from(b.y0) + f64::from(b.y1)) / 2.0).round() as i32)
 }
 
 pub(crate) fn shifted(surface: &Surface, dx: i32, dy: i32) -> Surface {
@@ -400,14 +497,24 @@ fn new_from_clipboard(s: &mut Session) -> Result<Value> {
     if w == 0 || h == 0 {
         return Err(EngineError::Other("the clipboard image has no size".into()));
     }
+    let (Some(dx), Some(dy)) = (b.x0.checked_neg(), b.y0.checked_neg()) else {
+        return Err(EngineError::Other("the clipboard origin is outside the coordinate range for a new document".into()));
+    };
     let fmt = clip.surface.format();
     let target = PixelFormat::new(fmt.mode, fmt.sample, true);
-    let moved = if b.x0 == 0 && b.y0 == 0 { clip.surface } else { photocraft_algo::resample::translate_surface(&clip.surface, -b.x0, -b.y0) };
+    let moved = if dx == 0 && dy == 0 { clip.surface } else { photocraft_algo::resample::translate_surface(&clip.surface, dx, dy) };
     let mut doc = Document::new("Untitled", photocraft_geom::Size::new(w, h), fmt.mode, fmt.sample);
+    if let Some(r) = clip.resolution.filter(|r| r.is_finite() && *r > 0.0) {
+        doc.resolution_dpi = r;
+    }
     let mut l = Layer::raster(doc.next_layer_name("Layer"), target);
     *crate::pixels_mut(&mut l)? = if moved.format() == target { moved } else { moved.convert(target) };
     doc.layers.push(l);
     let i = s.add_document(doc, None);
+    // Clipboard content has never been saved; closing this tab must ask before discarding it.
+    if let Some(st) = s.active_mut() {
+        st.saved_revision = 0;
+    }
     Ok(json!({"document": i, "width": w, "height": h}))
 }
 
@@ -730,6 +837,44 @@ fn guide_color(p: &Value) -> Result<Option<[u8; 3]>> {
     )
 }
 
+/// Edit Selected Guides (the guide context menu): change one guide's orientation, position and
+/// colour in one history step. A guide that keeps its orientation keeps its index; one that turns
+/// goes to the end of the other list. Without `color` it keeps its own colour, or none.
+fn edit_guide(s: &mut Session, p: &Value) -> Result<Value> {
+    let orientation = |key: &str| match p.get(key).map(|v| v.as_str()) {
+        None => Ok(None),
+        Some(Some("horizontal")) => Ok(Some(false)),
+        Some(Some("vertical")) => Ok(Some(true)),
+        Some(_) => Err(EngineError::Other(format!("`{key}` must be \"horizontal\" or \"vertical\""))),
+    };
+    let from = orientation("orientation")?.unwrap_or(false);
+    let to = orientation("newOrientation")?.unwrap_or(from);
+    let index = p.get("index").and_then(Value::as_u64).ok_or(EngineError::Other("missing `index`".into()))?;
+    let pos = guide_position(s, p, to)?;
+    let color = guide_color(p)?;
+    s.edit("Edit Guide", |doc, _| {
+        let guides = &mut doc.guides;
+        let list = if from { &guides.vertical } else { &guides.horizontal };
+        let i = usize::try_from(index).ok().filter(|i| *i < list.len()).ok_or(EngineError::Other("no such guide".into()))?;
+        let old = list[i];
+        let at = pos.unwrap_or(old);
+        let rgb = color.or_else(|| guides.color(from, old));
+        if from == to {
+            let list = if from { &mut guides.vertical } else { &mut guides.horizontal };
+            list[i] = at;
+        } else {
+            (if from { &mut guides.vertical } else { &mut guides.horizontal }).remove(i);
+            (if to { &mut guides.vertical } else { &mut guides.horizontal }).push(at);
+        }
+        guides.prune_colors();
+        if rgb.is_some() {
+            guides.set_color(to, at, rgb);
+        }
+        Ok(())
+    })?;
+    Ok(Value::Null)
+}
+
 /// View › New Guide / guide moves (undoable, like Photoshop's "New Guide"/"Move Guide" states).
 fn guide_cmd(s: &mut Session, p: &Value, op: &str) -> Result<Value> {
     let vertical = p.get("orientation").and_then(Value::as_str).unwrap_or("horizontal") == "vertical";
@@ -777,6 +922,32 @@ fn guide_cmd(s: &mut Session, p: &Value, op: &str) -> Result<Value> {
         Ok(())
     })?;
     Ok(Value::Null)
+}
+
+/// Farthest the ruler zero point may sit from the image, in document pixels.
+const MAX_RULER_ORIGIN: f64 = 1.0e7;
+
+/// Move the rulers' zero point (`view.setRulerOrigin`), or put it back at the image's top-left
+/// (`view.resetRulerOrigin`, `p` = None). Undoable like the guides.
+fn ruler_origin_cmd(s: &mut Session, p: Option<&Value>) -> Result<Value> {
+    let origin = match p {
+        None => [0.0, 0.0],
+        Some(p) => {
+            let axis = |k: &str| {
+                p.get(k)
+                    .and_then(Value::as_f64)
+                    .filter(|v| v.is_finite() && v.abs() <= MAX_RULER_ORIGIN)
+                    .ok_or_else(|| EngineError::Other(format!("`{k}` must be a number of pixels within ±{MAX_RULER_ORIGIN}")))
+            };
+            [axis("x")?, axis("y")?]
+        }
+    };
+    let label = if p.is_some() { "Set Ruler Origin" } else { "Reset Ruler Origin" };
+    s.edit(label, |doc, _| {
+        doc.ruler_origin = origin;
+        Ok(())
+    })?;
+    Ok(json!({"x": origin[0], "y": origin[1]}))
 }
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -883,8 +1054,29 @@ pub fn specs() -> Vec<CommandSpec> {
             has_doc,
             |s, p| guide_cmd(s, p, "move")
         ),
+        spec!(
+            "view.editGuide",
+            "Edit Guide",
+            &[],
+            None,
+            r##"{"orientation":"horizontal|vertical","index":n,"newOrientation":"horizontal|vertical"?,"position":px or "<number><unit>"?,"color":name or "#rrggbb"?} (Edit Selected Guides: units and colours as for view.newGuide; % is of the new orientation's extent; whatever is left out stays as it was)"##,
+            has_doc,
+            edit_guide
+        ),
         spec!("view.deleteGuide", "Delete Guide", &[], None, r##"{"orientation":"horizontal|vertical","index":n}"##, has_doc, |s, p| guide_cmd(s, p, "delete")),
         spec!("view.clearGuides", "Clear Guides", &["View"], None, "{}", has_doc, |s, p| guide_cmd(s, p, "clear")),
+        spec!(
+            "view.setRulerOrigin",
+            "Set Ruler Origin",
+            &[],
+            None,
+            r##"{"x":px,"y":px} (the rulers' zero point in document pixels; the rulers and Info panel measure from it)"##,
+            has_doc,
+            |s, p| ruler_origin_cmd(s, Some(p))
+        ),
+        spec!("view.resetRulerOrigin", "Reset Ruler Origin", &[], None, "{} (zero point back at the image's top-left)", has_doc, |s, _| ruler_origin_cmd(
+            s, None
+        )),
     ]
 }
 
@@ -902,6 +1094,33 @@ mod tests {
         })
         .unwrap();
         s
+    }
+
+    #[test]
+    fn new_clipboard_document_rejects_an_unrepresentable_origin() {
+        let mut s = Session::new();
+        let mut surface = Surface::new(PixelFormat::RGBA8);
+        surface.write_pixel(i32::MIN, 0, &[1.0, 0.0, 0.0, 1.0]);
+        s.clipboard = Some(Clip { surface, bounds: Rect::from_xywh(i32::MIN, 0, 1, 1), layers: None, resolution: None });
+        let result = new_from_clipboard(&mut s);
+        assert!(result.unwrap_err().to_string().contains("clipboard origin"));
+        assert!(s.execute("file.newFromClipboard", json!({})).is_err());
+        assert!(s.documents().is_empty());
+        assert_eq!(s.clipboard.as_ref().unwrap().surface.rgba(i32::MIN, 0), [1.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn paste_centers_clipboard_bounds_near_coordinate_limits() {
+        for origin in [i32::MAX - 512, i32::MIN + 512] {
+            let clip = Clip { surface: Surface::new(PixelFormat::RGBA8), bounds: Rect::from_xywh(origin, origin, 2, 2), layers: None, resolution: None };
+            let (dx, dy) = paste_offset(&clip, Rect::new(0, 0, 20, 20), &json!({}), false);
+            assert_eq!(i64::from(origin) + i64::from(dx), 9);
+            assert_eq!(i64::from(origin) + i64::from(dy), 9);
+            let clip = Clip { bounds: Rect::new(0, 0, 2, 2), ..clip };
+            let (dx, dy) = paste_offset(&clip, Rect::from_xywh(origin, origin, 20, 20), &json!({}), false);
+            assert_eq!(dx, origin + 9);
+            assert_eq!(dy, origin + 9);
+        }
     }
 
     #[test]
@@ -1007,6 +1226,18 @@ mod tests {
         st.doc.layer(st.active_layer.unwrap()).unwrap().surface().unwrap().content_bounds()
     }
 
+    /// New from Clipboard takes the copied document's resolution (Photoshop's Clipboard preset),
+    /// so a later Image Size by resolution scales from the right size.
+    #[test]
+    fn new_from_clipboard_keeps_the_source_resolution() {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 60, "height": 40, "resolution": 300})).unwrap();
+        s.execute("select.all", json!({})).unwrap();
+        s.execute("edit.copy", json!({})).unwrap();
+        s.execute("file.newFromClipboard", json!({})).unwrap();
+        assert_eq!(s.active().unwrap().doc.resolution_dpi, 300.0);
+    }
+
     /// #368: the clipboard as a document of its own, from New from Clipboard or a Paste with
     /// nothing open, at every depth.
     #[test]
@@ -1016,6 +1247,7 @@ mod tests {
             assert!(!s.is_enabled("file.newFromClipboard") && !s.is_enabled("edit.paste"), "nothing copied yet");
             assert!(s.execute("file.newFromClipboard", json!({})).is_err());
             s.execute("file.new", json!({"width": 100, "height": 100, "depth": depth})).unwrap();
+            assert!(!s.active().unwrap().is_dirty(), "an untouched blank document is clean");
             s.execute("edit.fill", json!({"color": "#ff0000"})).unwrap();
             s.execute("select.rect", json!({"x": 10, "y": 20, "width": 30, "height": 15})).unwrap();
             s.execute("edit.copy", json!({})).unwrap();
@@ -1023,6 +1255,7 @@ mod tests {
             let r = s.execute("file.newFromClipboard", json!({})).unwrap();
             assert_eq!((r["width"].as_u64(), r["height"].as_u64()), (Some(30), Some(15)), "{r}");
             assert_eq!(s.documents().len(), 2);
+            assert!(s.active().unwrap().is_dirty(), "a document made from clipboard pixels needs saving (#4665)");
             let d = &s.active().unwrap().doc;
             assert_eq!((d.size.width, d.size.height, d.layers.len()), (30, 15, 1));
             assert_eq!(d.pixel_format().sample, s.documents()[0].doc.pixel_format().sample, "{depth}-bit kept");
@@ -1036,6 +1269,7 @@ mod tests {
             assert!(s.is_enabled("edit.paste") && !s.is_enabled("edit.pasteSpecial.pasteInPlace"));
             s.execute("edit.paste", json!({})).unwrap();
             assert_eq!(s.documents().len(), 1);
+            assert!(s.active().unwrap().is_dirty(), "Paste with no tab also needs a save prompt");
             assert_eq!(active_bounds(&s), Rect::new(0, 0, 30, 15));
             assert!(s.execute("edit.pasteSpecial.pasteInPlace", json!({})).is_ok(), "into the new document");
         }
@@ -1236,12 +1470,12 @@ mod tests {
         assert!(s.clipboard.is_none(), "a refused copy leaves the clipboard alone");
         s.execute("layer.layerMask.revealAll", json!({})).unwrap();
         assert!(s.execute("edit.copy", json!({"target": "mask"})).is_ok());
-        // An adjustment layer has no pixels of its own: Copy is only enabled while its mask is
-        // targeted (#2928).
+        // An adjustment layer has no pixels of its own: Copy takes the layer whole (#2344), and
+        // its mask while that is targeted (#2928).
         s.execute("file.new", json!({"width": 20, "height": 20})).unwrap();
         let a = s.execute("layer.newAdjustmentLayer.levels", json!({})).unwrap()["layer"].as_u64().unwrap();
         s.execute("layer.select", json!({"layer": a})).unwrap();
-        assert!(!s.is_enabled("edit.copy"), "no pixels to copy");
+        assert!(s.is_enabled("edit.copy"), "the layer itself can be copied");
         s.execute("layer.layerMask.revealAll", json!({})).unwrap();
         assert!(s.is_enabled_with("edit.copy", &json!({"target": "mask"})), "the mask can be copied");
     }
@@ -1629,6 +1863,34 @@ mod tests {
         assert_eq!(active_bounds(&s), Rect::new(10, 10, 50, 30), "on the canvas: in place");
     }
 
+    /// #3584: a PSD-embedded linked smart object (its bytes in the document's `lnk2` block, its
+    /// source a uuid) can still be opened after Copy + Paste into another document.
+    #[test]
+    fn paste_keeps_a_psd_embedded_smart_object_openable() {
+        use std::sync::Arc;
+        let mut s = session();
+        s.execute("layer.smartObjects.convertToSmartObject", json!({})).unwrap();
+        let outer = s.active().unwrap().active_layer.unwrap();
+        s.edit("embedded linked source", |doc, _| {
+            let LayerContent::Smart(sm) = &mut doc.layer_mut(outer).ok_or(EngineError::NoDocument)?.content else {
+                return Err(EngineError::Other("not a smart object".into()));
+            };
+            sm.source = photocraft_doc::SmartSource::Linked { path: "uuid-1".into() };
+            let linked = photocraft_io::linked::LinkedFile { uuid: "uuid-1".into(), file_name: "in.png".into(), bytes: vec![1, 2, 3, 4] };
+            doc.metadata.psd_global_blocks.push((*b"8BIM", *b"lnk2", Arc::new(photocraft_io::linked::encode_linked_file(&linked))));
+            Ok(())
+        })
+        .unwrap();
+        s.execute("edit.copy", json!({})).unwrap();
+        s.execute("file.new", json!({"width": 40, "height": 30})).unwrap();
+        s.execute("edit.paste", json!({})).unwrap();
+        let LayerContent::Smart(sm) = active_content(&s) else { panic!("the paste is a smart object") };
+        assert!(
+            crate::smart_cmds::source_bytes(&s.active().unwrap().doc.metadata, &sm.source).is_some(),
+            "the pasted PSD-embedded linked source must resolve (#3584)"
+        );
+    }
+
     /// Type and shape layers copy their rendered pixels too; groups and adjustments have none.
     #[test]
     fn copy_reads_any_layer_that_shows_pixels() {
@@ -1668,6 +1930,56 @@ mod tests {
         assert!(matches!(shape.content, LayerContent::Shape(_)), "the shape stays a shape");
         assert_ne!(shape.id, src.children[0].id, "fresh ids");
         assert_eq!(shape.surface().map(|c| c.format().sample), Some(s.active().unwrap().doc.depth), "converted to 16 bits");
+    }
+
+    /// #2344: fill and adjustment layers have no pixels of their own, so with no selection Copy
+    /// takes them whole and Paste recreates them, in the same or another document, in one step.
+    #[test]
+    fn copy_paste_keeps_fill_and_adjustment_layers() {
+        for (depth, other) in [(8, 16), (16, 32), (32, 8)] {
+            let mut s = Session::new();
+            s.execute("file.new", json!({"width": 60, "height": 40, "depth": depth})).unwrap();
+            s.execute("layer.newFillLayer.gradient", json!({"from": "#000000", "to": "#ffffff", "angle": 0})).unwrap();
+            let LayerContent::Fill(fill) = active_content(&s) else { panic!("a fill layer") };
+            let src = s.active().unwrap().active_layer.unwrap();
+            assert!(s.is_enabled("edit.copy"), "{depth}-bit: a fill layer can be copied");
+            assert_eq!(s.execute("edit.copy", json!({})).unwrap()["bounds"], json!([0, 0, 60, 40]), "{depth}-bit: what it shows");
+            let clip = s.clipboard.clone().unwrap();
+            assert!(clip.surface.rgba(59, 20)[0] > clip.surface.rgba(0, 20)[0], "{depth}-bit: the clip holds the gradient's pixels");
+            let steps = s.active().unwrap().history.past_len();
+            s.execute("edit.pasteSpecial.pasteInPlace", json!({})).unwrap();
+            assert_eq!(s.active().unwrap().history.past_len(), steps + 1, "{depth}-bit: one history step");
+            assert_eq!(active_content(&s), LayerContent::Fill(fill.clone()), "{depth}-bit: the paste is the same fill layer");
+            assert_ne!(s.active().unwrap().active_layer, Some(src), "{depth}-bit: a new layer");
+            s.undo();
+            assert_eq!(s.active().unwrap().active_layer, Some(src), "{depth}-bit: undo removes the paste");
+            s.redo();
+            assert!(matches!(active_content(&s), LayerContent::Fill(_)), "{depth}-bit: redo brings it back");
+
+            s.execute("layer.newAdjustmentLayer.levels", json!({})).unwrap();
+            let LayerContent::Adjustment(levels) = active_content(&s) else { panic!("an adjustment layer") };
+            assert_eq!(s.execute("edit.copy", json!({})).unwrap()["bounds"], json!([0, 0, 60, 40]), "{depth}-bit: it applies to the canvas");
+            s.execute("file.new", json!({"width": 30, "height": 30, "depth": other})).unwrap();
+            s.execute("edit.paste", json!({})).unwrap();
+            assert_eq!(active_content(&s), LayerContent::Adjustment(levels), "{depth}-bit: the same Levels layer in the {other}-bit document");
+            assert_eq!(s.active().unwrap().doc.layers.len(), 2, "{depth}-bit: pasted above the Background");
+        }
+    }
+
+    /// #2344: several adjustment layers, which show nothing alone, still copy and paste together.
+    #[test]
+    fn several_adjustment_layers_copy_together() {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 40, "height": 40})).unwrap();
+        let a = s.execute("layer.newAdjustmentLayer.levels", json!({})).unwrap()["layer"].as_u64().unwrap();
+        let b = s.execute("layer.newAdjustmentLayer.levels", json!({})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("layer.select", json!({"layer": a})).unwrap();
+        s.execute("layer.select", json!({"layer": b, "mode": "toggle"})).unwrap();
+        assert_eq!(s.execute("edit.copy", json!({})).unwrap()["bounds"], json!([0, 0, 40, 40]));
+        s.execute("edit.pasteSpecial.pasteInPlace", json!({})).unwrap();
+        let d = &s.active().unwrap().doc;
+        assert_eq!(d.layers.len(), 5, "both are pasted");
+        assert!(d.layers[3..].iter().all(|l| matches!(l.content, LayerContent::Adjustment(_))));
     }
 
     #[test]
@@ -1770,6 +2082,28 @@ mod tests {
         assert!(s.execute("view.moveGuide", json!({"orientation": "vertical", "index": 3, "position": 1})).is_err());
     }
 
+    /// #2955: the rulers' zero point is set and reset by command, undoable, and bad params are
+    /// refused without touching the document.
+    #[test]
+    fn ruler_origin_is_set_reset_and_undoable() {
+        let mut s = session();
+        assert_eq!(s.active().unwrap().doc.ruler_origin, [0.0, 0.0]);
+        assert_eq!(s.execute("view.setRulerOrigin", json!({"x": 40, "y": 12.5})).unwrap(), json!({"x": 40.0, "y": 12.5}));
+        assert_eq!(s.active().unwrap().doc.ruler_origin, [40.0, 12.5]);
+        s.execute("view.resetRulerOrigin", json!({})).unwrap();
+        assert_eq!(s.active().unwrap().doc.ruler_origin, [0.0, 0.0]);
+        s.undo();
+        assert_eq!(s.active().unwrap().doc.ruler_origin, [40.0, 12.5]);
+        for bad in [json!({}), json!({"x": 1}), json!({"x": "a", "y": 2}), json!({"x": 1e300, "y": 0}), json!({"x": -2e7, "y": 0}), json!(null), json!([1, 2])]
+        {
+            assert!(s.execute("view.setRulerOrigin", bad.clone()).is_err(), "{bad} is refused");
+        }
+        assert_eq!(s.active().unwrap().doc.ruler_origin, [40.0, 12.5]);
+        let mut empty = Session::new();
+        assert!(empty.execute("view.setRulerOrigin", json!({"x": 1, "y": 2})).is_err());
+        assert!(empty.execute("view.resetRulerOrigin", json!({})).is_err());
+    }
+
     /// The last guide added in `orientation` for `position`.
     fn new_guide(s: &mut Session, orientation: &str, position: Value) -> f64 {
         s.execute("view.newGuide", json!({"orientation": orientation, "position": position})).unwrap();
@@ -1862,6 +2196,60 @@ mod tests {
     }
 
     #[test]
+    fn editing_a_guide_changes_what_is_given_in_one_undoable_step() {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 400, "height": 200})).unwrap();
+        s.execute("view.newGuide", json!({"orientation": "vertical", "position": 10})).unwrap();
+        s.execute("view.newGuide", json!({"orientation": "vertical", "position": 20, "color": "magenta"})).unwrap();
+        s.execute("view.newGuide", json!({"orientation": "vertical", "position": 30})).unwrap();
+        let guides = |s: &Session| s.active().unwrap().doc.guides.clone();
+        // Position only: the guide keeps its index and its own colour.
+        s.execute("view.editGuide", json!({"orientation": "vertical", "index": 1, "position": "50%"})).unwrap();
+        let g = guides(&s);
+        assert_eq!(g.vertical, vec![10.0, 200.0, 30.0]);
+        assert_eq!((g.color(true, 20.0), g.color(true, 200.0)), (None, Some([0xff, 0x00, 0xff])));
+        // Colour only: an uncoloured guide gets one; the position stays.
+        s.execute("view.editGuide", json!({"orientation": "vertical", "index": 0, "color": "#123456"})).unwrap();
+        assert_eq!(guides(&s).color(true, 10.0), Some([0x12, 0x34, 0x56]));
+        // Turning it: % is of the new orientation's extent, and the colour goes along.
+        s.execute("view.editGuide", json!({"orientation": "vertical", "index": 1, "newOrientation": "horizontal", "position": "25%"})).unwrap();
+        let g = guides(&s);
+        assert_eq!((g.vertical.clone(), g.horizontal.clone()), (vec![10.0, 30.0], vec![50.0]));
+        assert_eq!((g.color(true, 200.0), g.color(false, 50.0)), (None, Some([0xff, 0x00, 0xff])));
+        // One step each: undo restores the vertical guide with its colour.
+        s.undo();
+        let g = guides(&s);
+        assert_eq!((g.vertical.clone(), g.horizontal.is_empty()), (vec![10.0, 200.0, 30.0], true));
+        assert_eq!(g.color(true, 200.0), Some([0xff, 0x00, 0xff]));
+    }
+
+    #[test]
+    fn bad_guide_edits_are_refused_without_a_history_step() {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 400, "height": 200})).unwrap();
+        s.execute("view.newGuide", json!({"orientation": "vertical", "position": 10, "color": "green"})).unwrap();
+        let before = s.active().unwrap().doc.guides.clone();
+        for bad in [
+            json!({}),
+            json!({"orientation": "vertical"}),
+            json!({"orientation": "vertical", "index": 1}),
+            json!({"orientation": "horizontal", "index": 0}),
+            json!({"orientation": "vertical", "index": -1}),
+            json!({"orientation": "vertical", "index": "0"}),
+            json!({"orientation": "vertical", "index": u64::MAX}),
+            json!({"orientation": "diagonal", "index": 0}),
+            json!({"orientation": "vertical", "index": 0, "newOrientation": 3}),
+            json!({"orientation": "vertical", "index": 0, "position": "far"}),
+            json!({"orientation": "vertical", "index": 0, "position": 1e12}),
+            json!({"orientation": "vertical", "index": 0, "color": "puce"}),
+        ] {
+            assert!(s.execute("view.editGuide", bad.clone()).is_err(), "{bad}");
+        }
+        assert_eq!(s.active().unwrap().doc.guides, before);
+        assert_eq!(s.active().unwrap().history.undo_label(), Some("New Guide"));
+    }
+
+    #[test]
     fn bad_guide_positions_are_refused_without_a_guide() {
         let mut s = Session::new();
         s.execute("file.new", json!({"width": 400, "height": 200, "resolution": 100})).unwrap();
@@ -1906,5 +2294,90 @@ mod tests {
         let psd = photocraft_io::export(doc, "psd", &Default::default()).unwrap().bytes;
         let back = photocraft_io::import("g.psd", &psd).unwrap().document.guides;
         assert_eq!(wide(back.vertical[0]), far, "1032 stores 1/32 px");
+    }
+
+    /// `lift` as it was before #4516: the whole area through one `f32` buffer. The oracle for
+    /// the tiled version.
+    fn lift_reference(src: &Surface, sel: Option<&Surface>, canvas: Rect) -> Clip {
+        let fmt = src.format();
+        let with_alpha = PixelFormat::new(fmt.mode, fmt.sample, true);
+        let area = match sel {
+            Some(m) => m.content_bounds().intersect(&canvas),
+            None => src.content_bounds().intersect(&canvas),
+        };
+        let mut out = Surface::new(with_alpha);
+        if area.is_empty() {
+            return Clip { surface: out, bounds: Rect::EMPTY, layers: None, resolution: None };
+        }
+        let px = lift_region(src, sel, area, with_alpha.channels()).unwrap();
+        out.try_write_region(area, &px).unwrap();
+        out.prune();
+        let bounds = out.content_bounds();
+        Clip { surface: out, bounds, layers: None, resolution: None }
+    }
+
+    fn noise(fmt: PixelFormat, r: Rect, seed: u32) -> Surface {
+        let mut s = Surface::new(fmt);
+        let n = r.width() as usize * r.height() as usize * fmt.channels();
+        let data: Vec<f32> = (0..n as u32)
+            .map(|i| {
+                let mut h = seed.wrapping_mul(0x9e37_79b9) ^ i.wrapping_mul(0x85eb_ca6b);
+                h ^= h >> 13;
+                h = h.wrapping_mul(0xc2b2_ae35);
+                (h >> 16) as f32 / 65535.0
+            })
+            .collect();
+        s.write_region(r, &data);
+        s
+    }
+
+    fn assert_same_clip(a: &Clip, b: &Clip, what: &str) {
+        assert_eq!(a.bounds, b.bounds, "{what}: bounds");
+        assert_eq!(a.surface.format(), b.surface.format(), "{what}: format");
+        let r = a.bounds.union(&b.bounds);
+        if !r.is_empty() {
+            let (pa, pb) = (a.surface.read_region(r), b.surface.read_region(r));
+            assert!(pa.iter().zip(&pb).all(|(x, y)| x.to_bits() == y.to_bits()), "{what}: pixels differ");
+        }
+    }
+
+    /// The tiled `lift` gives exactly the old result (#4516): with and without alpha, at every
+    /// depth, with no selection, Select All, a partial feathered selection and a selection off
+    /// the tile grid, and for content reaching past the canvas.
+    #[test]
+    fn tiled_lift_matches_the_whole_area_lift() {
+        use photocraft_color::{ColorMode, SampleType};
+        let canvas = Rect::new(0, 0, 700, 600);
+        for sample in [SampleType::U8, SampleType::U16, SampleType::F32] {
+            for alpha in [true, false] {
+                let fmt = PixelFormat::new(ColorMode::Rgb, sample, alpha);
+                let src = noise(fmt, Rect::new(-40, -30, 760, 640), 7);
+                let mut all = Surface::new(PixelFormat::GRAY8);
+                all.fill_rect(canvas, &[1.0]);
+                let mut partial = Surface::new(PixelFormat::GRAY8);
+                partial.fill_rect(Rect::new(100, 50, 600, 550), &[1.0]);
+                partial.write_region(Rect::new(90, 40, 610, 50), &vec![0.5; 520 * 10]);
+                let off_grid = noise(PixelFormat::GRAY8, Rect::new(13, 270, 333, 290), 9);
+                for (name, sel) in [("no selection", None), ("select all", Some(&all)), ("partial", Some(&partial)), ("off grid", Some(&off_grid))] {
+                    let what = format!("{sample:?} alpha {alpha} {name}");
+                    let new = lift(&src, sel, canvas).unwrap();
+                    assert_same_clip(&new, &lift_reference(&src, sel, canvas), &what);
+                }
+            }
+        }
+    }
+
+    /// Copy shares the layer's whole tiles instead of copying them.
+    #[test]
+    fn copy_shares_whole_tiles_with_the_layer() {
+        let src = noise(PixelFormat::RGBA8, Rect::new(0, 0, 1024, 768), 3);
+        let canvas = Rect::new(0, 0, 1024, 768);
+        let mut all = Surface::new(PixelFormat::GRAY8);
+        all.fill_rect(canvas, &[1.0]);
+        for sel in [None, Some(&all)] {
+            let clip = lift(&src, sel, canvas).unwrap();
+            let shared = src.tiles().filter(|(c, t)| clip.surface.tile(**c).is_some_and(|o| std::sync::Arc::ptr_eq(o, t))).count();
+            assert_eq!(shared, src.tile_count(), "every tile is shared");
+        }
     }
 }

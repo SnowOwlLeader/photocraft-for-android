@@ -28,6 +28,36 @@ pub fn composite_layers(solo: &Document, format: photocraft_color::PixelFormat, 
     photocraft_compose::composite_to_surface(solo, area, format, background)
 }
 
+/// [`composite_layers`] without cropping to the canvas: pixels of the layers that lie outside it are kept
+/// (merging layers must not lose them, #5067).
+pub fn composite_layers_uncropped(solo: &Document, format: photocraft_color::PixelFormat) -> Surface {
+    let canvas = solo.bounds();
+    // The canvas grown to every visible layer's content and effects, so no layer is clipped by `composite_bounds`.
+    let reach = solo
+        .layers
+        .iter()
+        .filter(|layer| layer.visible)
+        .map(|layer| {
+            let margin = if photocraft_compose::effects::has_effects(layer) { photocraft_compose::effects::margin(layer) } else { 0 };
+            let bounds = photocraft_compose::layer_bounds(layer, canvas);
+            if bounds.is_empty() { bounds } else { bounds.inflate(margin) }
+        })
+        .filter(|bounds| !bounds.is_empty())
+        .fold(canvas, |a, b| a.union(&b));
+    let area = solo
+        .layers
+        .iter()
+        .filter(|layer| layer.visible)
+        .map(|layer| photocraft_compose::composite_bounds(layer, reach).unwrap_or(canvas))
+        .filter(|bounds| !bounds.is_empty())
+        .reduce(|a, b| a.union(&b))
+        .unwrap_or(Rect::EMPTY);
+    if area.is_empty() {
+        return Surface::new(format);
+    }
+    photocraft_compose::composite_to_surface(solo, area, format, None)
+}
+
 /// Apply an adjustment destructively to a surface, weighted by an optional selection.
 /// Applies `adj` to a surface (any colour model and depth, via straight RGBA) through the
 /// selection; `mode` is the document's, for the tone transfer (e.g. Exposure in Grayscale).
@@ -91,22 +121,113 @@ pub fn adjust_mask(s: &mut Surface, adj: &Adjustment, selection: Option<&Surface
 /// `s`'s pixels over `r` (untouched ones included) with `adj` applied through the selection, encoded.
 fn adjusted(s: &Surface, r: Rect, adj: &Adjustment, selection: Option<&Surface>, mode: photocraft_color::ColorMode) -> Vec<f32> {
     let fmt = s.format();
+    if fmt.mode == mode && matches!(mode, photocraft_color::ColorMode::Lab | photocraft_color::ColorMode::Cmyk) && adjust::stored_channel_adjustment(adj) {
+        return adjusted_channels(s, r, selection, |ch| adjust::stored_channels(adj, fmt.mode, Some(fmt.sample), ch));
+    }
+    if fmt.mode == mode && mode == photocraft_color::ColorMode::Cmyk && adjust::cmy_adjustment(adj) {
+        return adjusted_cmy(s, r, adj, selection);
+    }
+    if let Adjustment::BrightnessContrast { brightness, contrast, legacy } = adj
+        && fmt.mode == mode
+        && mode == photocraft_color::ColorMode::Cmyk
+    {
+        let table = adjust::ink_brightness_contrast_lut(*brightness, *contrast, *legacy);
+        return adjusted_channels(s, r, selection, |ch| ch.iter_mut().for_each(|v| *v = adjust::ink_through(&table, *v)));
+    }
     let n = fmt.channels();
     let raw = s.read_region(r);
     let mut buf = Buffer { rect: r, px: raw.chunks_exact(n).map(|p| to_rgba(&fmt, p)).collect() };
     let orig = buf.clone();
     // 32-bit documents get the float behaviour of an adjustment layer there (Levels doesn't clip);
-    // integer depths keep the unrounded, clipped curves.
-    let depth = (fmt.sample == photocraft_color::SampleType::F32).then_some(fmt.sample);
+    // integer depths keep the unrounded, clipped curves, except that 16-bit Posterize and
+    // Threshold use the 16-bit rules an adjustment layer measures against Photoshop, so the
+    // command matches its live preview (an adjustment layer) and Photoshop.
+    let depth = match (fmt.sample, adj) {
+        (photocraft_color::SampleType::F32, _) => Some(fmt.sample),
+        (photocraft_color::SampleType::U16, Adjustment::Posterize { .. } | Adjustment::Threshold { .. }) => Some(fmt.sample),
+        _ => None,
+    };
     adjust::apply_in(adj, &mut buf, adjust::Transfer::for_document(mode, fmt.sample), depth, mode);
-    let w = r.width() as usize;
-    let mut out = Vec::with_capacity(raw.len());
-    for (i, (a, o)) in buf.px.iter().zip(&orig.px).enumerate() {
-        let k = selection.map_or(1.0, |sel| sel.sample_channel(r.x0 + (i % w) as i32, r.y0 + (i / w) as i32, 0));
-        let mixed: [f32; 4] = std::array::from_fn(|c| o[c] + (a[c] - o[c]) * k);
-        let mut enc = [0.0f32; 8];
-        let m = photocraft_raster::from_rgba_into(&fmt, mixed, &mut enc);
-        out.extend_from_slice(&enc[..m]);
+    mix_through_selection(&fmt, r, &orig.px, &buf.px, selection)
+}
+
+/// [`adjusted`] for an adjustment Photoshop applies to a Lab or CMYK layer's own channels: `op`
+/// changes one pixel's colour channels, exact on the stored values with no trip through RGB, and
+/// the selection mixes those values (alpha untouched).
+fn adjusted_channels(s: &Surface, r: Rect, selection: Option<&Surface>, op: impl Fn(&mut [f32])) -> Vec<f32> {
+    let fmt = s.format();
+    let (n, colors) = (fmt.channels(), fmt.mode.color_channels());
+    let mut raw = s.read_region(r);
+    let w = (r.width() as usize).max(1);
+    let mut coverage = vec![1.0f32; w];
+    for (j, row) in raw.chunks_mut(w * n).enumerate() {
+        if let Some(sel) = selection {
+            sel.sample_row_strided(r.y0.saturating_add(j as i32), r.x0, 1, 0, &mut coverage);
+        }
+        for (px, &k) in row.chunks_exact_mut(n).zip(&coverage) {
+            if k <= 0.0 {
+                continue;
+            }
+            let Some(ch) = px.get_mut(..colors) else { continue };
+            let mut out = [0.0f32; 4];
+            let Some(out) = out.get_mut(..colors) else { continue };
+            out.copy_from_slice(ch);
+            op(out);
+            for (v, o) in ch.iter_mut().zip(out.iter()) {
+                *v += (o - *v) * k;
+            }
+        }
+    }
+    raw
+}
+
+/// [`adjusted`] for Hue/Saturation or Color Balance on a CMYK layer (`adjust::apply_cmy`): on its
+/// stored C, M and Y, black kept, the whole region at once; the selection mixes the stored inks.
+fn adjusted_cmy(s: &Surface, r: Rect, adj: &Adjustment, selection: Option<&Surface>) -> Vec<f32> {
+    let fmt = s.format();
+    let n = fmt.channels();
+    let mut raw = s.read_region(r);
+    let mut inks: Vec<[f32; 4]> = raw.chunks_exact(n).map(|p| std::array::from_fn(|c| p.get(c).copied().unwrap_or(0.0))).collect();
+    adjust::apply_cmy(adj, &mut inks);
+    let w = (r.width() as usize).max(1);
+    let mut coverage = vec![1.0f32; w];
+    for (j, (row, adjusted)) in raw.chunks_mut(w * n).zip(inks.chunks(w)).enumerate() {
+        if let Some(sel) = selection {
+            sel.sample_row_strided(r.y0.saturating_add(j as i32), r.x0, 1, 0, &mut coverage);
+        }
+        for ((px, ink), &k) in row.chunks_exact_mut(n).zip(adjusted).zip(&coverage) {
+            for (v, a) in px.iter_mut().zip(ink) {
+                *v += (a - *v) * k;
+            }
+        }
+    }
+    raw
+}
+
+/// `edited` mixed back over `orig` (straight RGBA over `r`, row-major) by the selection's
+/// coverage, encoded in `fmt`: what a destructive edit writes back through a selection.
+pub(crate) fn mix_through_selection(
+    fmt: &photocraft_color::PixelFormat,
+    r: Rect,
+    orig: &[[f32; 4]],
+    edited: &[[f32; 4]],
+    selection: Option<&Surface>,
+) -> Vec<f32> {
+    let w = (r.width() as usize).max(1);
+    let mut out = Vec::with_capacity(orig.len() * fmt.channels());
+    // The selection's coverage (channel 0) one row at a time, each of its tiles looked up once
+    // per row rather than once per pixel.
+    let mut coverage = vec![1.0f32; w];
+    for (j, (edited_row, orig_row)) in edited.chunks(w).zip(orig.chunks(w)).enumerate() {
+        if let Some(sel) = selection {
+            sel.sample_row_strided(r.y0.saturating_add(j as i32), r.x0, 1, 0, &mut coverage);
+        }
+        for ((a, o), k) in edited_row.iter().zip(orig_row).zip(&coverage) {
+            let mixed: [f32; 4] = std::array::from_fn(|c| o[c] + (a[c] - o[c]) * k);
+            let mut enc = [0.0f32; 8];
+            let m = photocraft_raster::from_rgba_into(fmt, mixed, &mut enc);
+            out.extend_from_slice(&enc[..m]);
+        }
     }
     out
 }
@@ -118,15 +239,20 @@ pub(crate) fn try_fill_surface(s: &mut Surface, area: Rect, color: [f32; 4], sel
     let fmt = s.format();
     // Coverage 1 of an opaque colour replaces the colour (and the alpha, unless it is kept).
     let opaque = color[3] == 1.0 && (!lock_transparency || !fmt.alpha) && selection.is_none_or(|m| m.format().sample != photocraft_color::SampleType::F32);
-    let solid = opaque.then(|| {
-        let mut enc = [0.0f32; 8];
-        let n = photocraft_raster::from_rgba_into(&fmt, [color[0], color[1], color[2], 1.0], &mut enc);
-        s.solid_tile(enc.get(..n).unwrap_or(&[]))
-    });
+    let mut enc = [0.0f32; 8];
+    let enc_len = opaque.then(|| photocraft_raster::from_rgba_into(&fmt, [color[0], color[1], color[2], 1.0], &mut enc));
+    let solid = enc_len.map(|n| s.solid_tile(enc.get(..n).unwrap_or(&[])));
     let whole = |full: bool| solid.as_ref().filter(|_| full).map(|t| TileEdit::Put(t.clone()));
     edit_tiles(s, area, selection, "filling pixels", whole, |k, px| {
         if k <= 0.0 {
             return false;
+        }
+        if k >= 1.0
+            && let Some(m) = enc_len
+            && let Some(src) = enc.get(..px.len().min(m))
+        {
+            px.copy_from_slice(src);
+            return true;
         }
         fill_pixel(&fmt, px, color, k, lock_transparency);
         true
@@ -173,9 +299,31 @@ pub(crate) fn try_clear_surface(s: &mut Surface, area: Rect, selection: Option<&
             px.fill(0.0);
         }
         true
-    })?;
-    s.prune();
-    Ok(())
+    })
+}
+
+/// Take the coverage a floating selection lifts out of `s` over `area`: each pixel loses its
+/// selection coverage k of alpha, down to none, so a selection made from the layer's own
+/// transparency leaves nothing behind (#7655), where [`try_clear_surface`] would leave a ghost.
+pub(crate) fn try_lift_coverage(s: &mut Surface, area: Rect, selection: &Surface) -> crate::Result<()> {
+    let fmt = s.format();
+    let n = fmt.channels();
+    if !fmt.alpha {
+        return Ok(());
+    }
+    let empty_default = s.default_bytes().iter().all(|&b| b == 0);
+    let whole = |full: bool| (full && empty_default).then_some(TileEdit::Drop);
+    edit_tiles(s, area, Some(selection), "lifting pixels", whole, |k, px| {
+        if k <= 0.0 {
+            return false;
+        }
+        let Some(a) = px.get_mut(n - 1) else { return false };
+        *a = (*a - k).max(0.0);
+        if *a <= 0.0 {
+            px.fill(0.0);
+        }
+        true
+    })
 }
 
 /// A whole-tile shortcut of [`edit_tiles`].
@@ -210,6 +358,7 @@ fn edit_tiles(
     coords.extend(area.tiles());
     // Untouched pixels read as the default where the surface has no tile.
     let blank = if coords.iter().any(|&tc| s.tile(tc).is_none()) { Some(s.try_default_tile().map_err(oom)?) } else { None };
+    let dp = s.default_bytes();
     let surf = &*s;
     let edits = coords
         .into_par_iter()
@@ -250,7 +399,11 @@ fn edit_tiles(
                     }
                 }
             }
-            Ok(out.map(|t| (tc, Some(Arc::new(t)))))
+            Ok(match out {
+                Some(t) if bpp > 0 && t.bytes().chunks_exact(bpp).all(|p| p == dp) => current.map(|_| (tc, None)),
+                Some(t) => Some((tc, Some(Arc::new(t)))),
+                None => None,
+            })
         })
         .collect::<crate::Result<Vec<_>>>()?;
     for (tc, tile) in edits.into_iter().flatten() {
@@ -285,7 +438,8 @@ pub fn merge_down(doc: &Document, lower: &Layer, upper: &Layer) -> Layer {
     // The pair is read (and a CMYK one separated again) through the document's own profile.
     tmp.icc_profile = doc.icc_profile.clone();
     tmp.layers = stack;
-    let s = composite_layers(&tmp, format, None);
+    // A Background stays canvas-sized; any other layer keeps the pixels outside the canvas (#5067).
+    let s = if doc.is_background(lower.id) { composite_layers(&tmp, format, None) } else { composite_layers_uncropped(&tmp, format) };
     let mut merged = Layer::new(lower.name.clone(), LayerContent::Raster(s));
     merged.id = lower.id;
     merged.blend = lower.blend;
@@ -293,5 +447,10 @@ pub fn merge_down(doc: &Document, lower: &Layer, upper: &Layer) -> Layer {
     // Merge Down replaces the lower layer, so keep its editing restrictions.
     // In particular, a merged Background must remain opaque and position-locked.
     merged.locks = lower.locks;
+    // And its place: two layers clipped in one chain merge into a layer still clipped to the base,
+    // with the lower layer's colour label and link.
+    merged.clipped = lower.clipped && upper.clipped;
+    merged.label = lower.label;
+    merged.link_group = lower.link_group;
     merged
 }

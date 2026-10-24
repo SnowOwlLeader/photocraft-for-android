@@ -16,6 +16,8 @@
 //!   selection tools do their own ⌘ handling in `canvas` (⌘ inside the selection cuts the
 //!   selected pixels, outside it moves the layer, #896), and the Hand, Zoom, Crop, Slice, Path
 //!   Selection, shape, Pen and Type tools keep ⌘ for themselves.
+//! - With the Hand tool selected, ⌘ (Ctrl off the Mac) is Zoom In while held and ⌥ (with or
+//!   without ⌘) Zoom Out ([`hand_zoom`], #6434).
 //! - `~` (the backtick key) with the Brush or Pencil: a stroke started while it is held erases,
 //!   with that tool's own brush ([`erase_held`], #3439).
 //!
@@ -118,6 +120,28 @@ fn cmd_move_held(app: &PhotocraftApp, i: &InputState) -> bool {
     i.modifiers.command && cmd_moves(app.ui.tool) && app.ui.transform.is_none() && app.ui.text_edit.is_none()
 }
 
+/// The Hand tool's own modifiers (#6434): ⌘ (Ctrl off the Mac) held is Zoom In, ⌥ (with or
+/// without ⌘) Zoom Out, as in Photoshop; the Modifier Keys panel's latched keys count. Not while
+/// Free Transform is open (its box keeps ⌘ for the distort handles), and a modifier pressed during
+/// a Hand press doesn't turn it into a zoom, release included: only a press made with it held
+/// zooms (that one is latched by [`for_frame`] until the button comes up). A middle-button pan
+/// stays a pan whatever is held.
+fn hand_zoom(app: &PhotocraftApp, i: &InputState) -> Option<Temporary> {
+    let p = &i.pointer;
+    let hand_press = ((p.primary_down() || p.primary_released()) && !p.primary_pressed()) || p.middle_down();
+    if app.ui.tool != Tool::Hand || app.ui.transform.is_some() || hand_press {
+        return None;
+    }
+    let m = crate::workspace_ui::sticky_mods(app, i.modifiers);
+    if m.alt {
+        Some(Temporary::ZoomOut)
+    } else if m.command {
+        Some(Temporary::ZoomIn)
+    } else {
+        None
+    }
+}
+
 /// Is `id` a held temporary tool rather than a command?
 pub fn is_temporary(id: &str) -> bool {
     photocraft_engine::prefs::TEMPORARY_TOOLS.iter().any(|t| t.0 == id)
@@ -147,9 +171,10 @@ fn held(i: &InputState, sc: &KeyboardShortcut) -> bool {
 }
 
 /// The temporary tool whose key is held now, the most specific binding first (⌘Space before
-/// Space). Never while a text field has the keyboard.
+/// Space). Never while a text field has the keyboard, or while editing type on the canvas
+/// (Space must insert a space, not grab the Hand tool).
 pub fn held_tool(app: &PhotocraftApp, ctx: &egui::Context) -> Option<Temporary> {
-    if ctx.text_edit_focused() {
+    if ctx.text_edit_focused() || app.ui.text_edit.is_some() {
         return None;
     }
     let count = |sc: &KeyboardShortcut| {
@@ -159,6 +184,7 @@ pub fn held_tool(app: &PhotocraftApp, ctx: &egui::Context) -> Option<Temporary> 
     let mut best: Option<(u8, Temporary, KeyboardShortcut)> = None;
     let mut cmd_move = false;
     let mut alt = false;
+    let mut hand = None;
     ctx.input(|i| {
         for t in Temporary::BOUND {
             if let Some(sc) = binding(app, t)
@@ -170,12 +196,13 @@ pub fn held_tool(app: &PhotocraftApp, ctx: &egui::Context) -> Option<Temporary> 
         }
         cmd_move = cmd_move_held(app, i);
         alt = i.modifiers.alt;
+        hand = hand_zoom(app, i);
     });
     // ⌥ turns a held Zoom In around, as it does the Zoom tool: ⌘⌥Space zooms out (and wins the
     // tie with ⌥Space), unless ⌥ is part of the Zoom In key itself.
     let held = best.map(|(_, t, sc)| if t == Temporary::ZoomIn && alt && !sc.modifiers.alt { Temporary::ZoomOut } else { t });
     // A bound key (⌘Space is Zoom In) wins over ⌘ alone.
-    held.or(cmd_move.then_some(Temporary::Move))
+    held.or(hand).or(cmd_move.then_some(Temporary::Move))
 }
 
 /// The binding id of the Brush and Pencil erase key (`prefs::TEMPORARY_TOOLS`).
@@ -194,7 +221,7 @@ pub fn erase_held(app: &PhotocraftApp, ctx: &egui::Context) -> bool {
 
 /// Is the reposition key (the Hand key, any modifiers) down?
 pub fn reposition_held(app: &PhotocraftApp, ctx: &egui::Context) -> bool {
-    !ctx.text_edit_focused() && binding(app, Temporary::Hand).is_some_and(|sc| ctx.input(|i| i.key_down(sc.logical_key)))
+    !ctx.text_edit_focused() && app.ui.text_edit.is_none() && binding(app, Temporary::Hand).is_some_and(|sc| ctx.input(|i| i.key_down(sc.logical_key)))
 }
 
 /// Tools whose in-progress drag the reposition key moves.

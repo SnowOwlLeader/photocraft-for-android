@@ -52,7 +52,8 @@ fn open_exr_parts(s: &mut Session, p: &Value) -> Result<Value> {
         precomp: p.get("precomp").and_then(Value::as_bool).unwrap_or(false),
     };
     let bytes = read_file(&path)?;
-    let r = photocraft_io::exr_parts::import(&stem(&path), &bytes, &sel).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    let mut r = photocraft_io::exr_parts::import(&stem(&path), &bytes, &sel).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    crate::file_cmds::tag_exr_colorspace(s, &path, &mut r.document);
     let (i, color) = s.open_document(r.document, Some(path.clone()));
     Ok(json!({"document": i, "color": color, "warnings": r.warnings}))
 }
@@ -173,6 +174,25 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// File Handling › "Open color-less EXR as ACEScg" applies to Open EXR Parts too.
+    #[test]
+    fn open_exr_parts_honours_the_aces_cg_preference() {
+        let dir = std::env::temp_dir().join(format!("pcraft-exr-aces-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("aov.exr");
+        write_multipart(&path);
+        let linear = photocraft_cms::Builtin::LinearSrgb.profile().to_bytes();
+        let aces = photocraft_cms::Builtin::AcesCg.profile().to_bytes();
+        for (on, want) in [(false, &linear), (true, &aces)] {
+            let mut s = session();
+            s.prefs.edit(|p| p.file_handling.exr_aces_cg = on);
+            s.execute("file.openExrParts", json!({"path": path.to_str().unwrap(), "part/beauty": true})).unwrap();
+            let doc = &s.active().unwrap().doc;
+            assert_eq!(doc.icc_profile.as_deref().map(|v| v.as_slice()), Some(want.as_slice()), "exr_aces_cg = {on}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn open_exr_parts_refuses_an_empty_selection_and_unknown_names() {
         let dir = std::env::temp_dir().join(format!("pcraft-exr-empty-{}", std::process::id()));
@@ -206,6 +226,46 @@ mod tests {
             // The channels import as stored (straight here): values are untouched.
             assert!((px[0] - 0.3).abs() < 1e-4, "{:?}", px);
             assert!((px[3] - 0.5).abs() < 1e-4, "{:?}", px);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A single-part EXR with no part name (the usual render output) plus an AOV group.
+    fn write_unnamed_grouped(path: &std::path::Path) {
+        use exr::prelude::*;
+        let (w, h) = (4usize, 4usize);
+        let mk = |n: &str, v: f32| AnyChannel::new(n, FlatSamples::F32(vec![v; w * h]));
+        let list = vec![mk("R", 0.7), mk("G", 0.7), mk("B", 0.7), mk("diffuse.R", 0.3), mk("diffuse.G", 0.3), mk("diffuse.B", 0.3)];
+        let layer = Layer::new(
+            (w, h),
+            LayerAttributes::default(),
+            Encoding { compression: Compression::Uncompressed, blocks: Blocks::ScanLines, line_order: LineOrder::Increasing },
+            AnyChannels::sort(list.into_iter().collect()),
+        );
+        let image = Image::from_layers(ImageAttributes::new(IntegerBounds::new((0, 0), (w, h))), vec![layer]);
+        image.write().to_buffered(&mut std::io::BufWriter::new(std::fs::File::create(path).expect("create fixture"))).expect("write fixture");
+    }
+
+    #[test]
+    fn an_unnamed_part_opens_by_the_name_the_listing_gives_it() {
+        // #4210: the listing names an unnamed part "part 0"; feeding that name back must open it.
+        let dir = std::env::temp_dir().join(format!("pcraft-exr-unnamed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("unnamed.exr");
+        write_unnamed_grouped(&path);
+        let info = entries_json(path.to_str().unwrap()).unwrap();
+        let part = info.as_array().unwrap().iter().find(|e| e["kind"] == "part").expect("a part entry");
+        let name = part["name"].as_str().unwrap();
+        assert_eq!(name, "part 0", "{info}");
+        let key = format!("part/{name}");
+        let mut s = session();
+        s.execute("file.openExrParts", json!({"path": path.to_str().unwrap(), key: true})).unwrap();
+        let doc = &s.active().unwrap().doc;
+        assert_eq!(doc.layers.len(), 1);
+        assert_eq!(doc.layers[0].name, "part 0");
+        if let photocraft_doc::LayerContent::Raster(surface) = &doc.layers[0].content {
+            let px = surface.pixel(0, 0);
+            assert!((px[0] - 0.7).abs() < 1e-4, "{:?}", px);
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }

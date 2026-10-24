@@ -61,7 +61,15 @@ with zipfile.ZipFile(b/'unsigned.apk','a',compression=zipfile.ZIP_DEFLATED) as z
         & "$env:JAVA_HOME\bin\keytool.exe" -genkeypair -keystore $key -storetype PKCS12 -storepass:file $passwordFile -alias photocraft-local -keyalg RSA -keysize 3072 -validity 10000 -dname 'CN=PhotoCraft Local Android Build'
         Check-Exit
     }
-    $apk = "$root\dist\android\PhotoCraft-0.8.2-$Abi.apk"
+    # Read the release name from the manifest so future upstream syncs cannot reuse an old name.
+    [xml]$manifest = Get-Content -Raw -LiteralPath "$PSScriptRoot\AndroidManifest.xml"
+    $androidNs = 'http://schemas.android.com/apk/res/android'
+    $versionName = $manifest.manifest.GetAttribute('versionName', $androidNs)
+    $versionCode = $manifest.manifest.GetAttribute('versionCode', $androidNs)
+    if ($versionName -notmatch '^[0-9A-Za-z.-]+$' -or $versionCode -notmatch '^\d+$') {
+        throw 'Invalid Android version in manifest'
+    }
+    $apk = "$root\dist\android\PhotoCraft-$versionName-$versionCode-$Abi.apk"
     & "$bt\apksigner.bat" sign --ks $key --ks-key-alias photocraft-local --ks-pass "file:$passwordFile" --out $apk "$build\aligned.apk"
     Check-Exit
     & "$bt\apksigner.bat" verify --verbose $apk

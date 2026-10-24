@@ -29,8 +29,8 @@ use serde_json::{Value, json};
 
 use crate::budgets::{BatchReplyBudget, write_reply};
 use crate::security::{
-    ConnectionLimiter, LineRead, MAX_BATCH_STEPS, MAX_CONNECTIONS, MAX_REQUEST_BYTES, authentication_reply, configure_stream, discard_rest_of_line,
-    read_bounded_line, repeat_auth_reply,
+    AUTH_DEADLINE, AuthDeadlineStream, ConnectionLimiter, LineRead, MAX_BATCH_STEPS, MAX_CONNECTIONS, MAX_REQUEST_BYTES, authentication_reply,
+    configure_stream, discard_rest_of_line, read_bounded_line, repeat_auth_reply,
 };
 use crate::{AutomationError, Headless};
 
@@ -60,8 +60,13 @@ fn bad(msg: impl Into<String>) -> AutomationError {
     AutomationError::BadRequest(msg.into())
 }
 
-fn index_of(p: &Value) -> Option<usize> {
-    p.get("index").and_then(Value::as_u64).map(|i| i as usize)
+/// The optional `index` param: missing or null means the active document; anything else must be a
+/// non-negative integer (never silently fall back to the active document, which `doc.close` would close).
+fn index_of(p: &Value) -> Result<Option<usize>, AutomationError> {
+    match p.get("index") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v.as_u64().and_then(|i| usize::try_from(i).ok()).map(Some).ok_or_else(|| bad("`index` must be a non-negative integer")),
+    }
 }
 
 fn str_of<'a>(p: &'a Value, k: &str) -> Option<&'a str> {
@@ -86,17 +91,9 @@ impl Headless {
                 let all = self.command_list();
                 Ok(match str_of(&p, "filter").map(str::to_lowercase) {
                     None => all,
-                    Some(n) => Value::Array(
-                        all.as_array()
-                            .into_iter()
-                            .flatten()
-                            .filter(|c| {
-                                let hay = format!("{} {}", c["id"].as_str().unwrap_or(""), c["label"].as_str().unwrap_or(""));
-                                hay.to_lowercase().contains(&n)
-                            })
-                            .cloned()
-                            .collect(),
-                    ),
+                    Some(n) => {
+                        Value::Array(all.as_array().into_iter().flatten().filter(|c| photocraft_engine::commands::list_entry_matches(c, &n)).cloned().collect())
+                    }
                 })
             }
             "session.list" => Ok(self.session_list()),
@@ -109,20 +106,31 @@ impl Headless {
                 let mut opts = p.as_object().cloned().unwrap_or_default();
                 opts.remove("path");
                 opts.remove("index");
-                self.place(index_of(&p), path, &Value::Object(opts))
+                self.place(index_of(&p)?, path, &Value::Object(opts))
             }
             "doc.new" => self.command_run("file.new", p),
             "doc.save" => {
                 let tga_bits = photocraft_engine::file_cmds::tga_bits_param(&p, "doc.save").map_err(|e| bad(e.to_string()))?;
                 let mut opts =
                     photocraft_io::ExportOptions { tiff_layers: p.get("tiffLayers").and_then(Value::as_bool).unwrap_or(false), tga_bits, ..Default::default() };
-                if let Some(q) = p.get("quality").and_then(Value::as_u64) {
-                    opts.encode.jpeg_quality = q.clamp(1, 100) as u8;
-                    opts.encode.webp_quality = q.clamp(1, 100) as u8;
-                    opts.encode.webp_lossless = false;
+                opts.encode.dpx_bits = photocraft_engine::file_cmds::dpx_bits_param(&p, "doc.save").map_err(|e| bad(e.to_string()))?;
+                opts.encode.dds = photocraft_engine::file_cmds::dds_param(&p, "doc.save").map_err(|e| bad(e.to_string()))?.unwrap_or_default();
+                match p.get("quality") {
+                    None | Some(Value::Null) => {}
+                    Some(v) => {
+                        // Like the CLI's `--quality`: never ignore or clamp a bad value.
+                        let q = v
+                            .as_u64()
+                            .filter(|q| (1..=100).contains(q))
+                            .and_then(|q| u8::try_from(q).ok())
+                            .ok_or_else(|| bad(format!("`quality` must be a whole number from 1 to 100, got {v}")))?;
+                        opts.encode.jpeg_quality = q;
+                        opts.encode.webp_quality = q;
+                        opts.encode.webp_lossless = false;
+                    }
                 }
                 let path = str_of(&p, "path").map(PathBuf::from);
-                self.save(index_of(&p), path.as_deref(), str_of(&p, "format"), &opts)
+                self.save(index_of(&p)?, path.as_deref(), str_of(&p, "format"), &opts)
             }
             "doc.exportLayers" | "doc.exportDataSets" => {
                 let dir = str_of(&p, "dir").ok_or_else(|| bad(format!("{method} needs `dir`")))?;
@@ -130,16 +138,16 @@ impl Headless {
                 opts.remove("dir");
                 opts.remove("index");
                 let opts = Value::Object(opts);
-                if method == "doc.exportLayers" { self.export_layers(index_of(&p), dir, &opts) } else { self.export_data_sets(index_of(&p), dir, &opts) }
+                if method == "doc.exportLayers" { self.export_layers(index_of(&p)?, dir, &opts) } else { self.export_data_sets(index_of(&p)?, dir, &opts) }
             }
             "doc.importDataSets" => {
                 let path = str_of(&p, "path").ok_or_else(|| bad("doc.importDataSets needs `path`"))?;
                 let mut opts = p.as_object().cloned().unwrap_or_default();
                 opts.remove("path");
                 opts.remove("index");
-                self.import_data_sets(index_of(&p), path, &Value::Object(opts))
+                self.import_data_sets(index_of(&p)?, path, &Value::Object(opts))
             }
-            "doc.inspect" => self.inspect(index_of(&p)),
+            "doc.inspect" => self.inspect(index_of(&p)?),
             "doc.render" => {
                 let max = match p.get("maxSide") {
                     None => 1024,
@@ -147,7 +155,7 @@ impl Headless {
                         value.as_u64().and_then(|value| u32::try_from(value).ok()).ok_or_else(|| bad("maxSide must be an unsigned 32-bit integer"))?
                     }
                 };
-                let png = self.render_png(index_of(&p), max)?;
+                let png = self.render_png(index_of(&p)?, max)?;
                 match str_of(&p, "path") {
                     Some(path) => {
                         self.write_render(&PathBuf::from(path), &png)?;
@@ -160,10 +168,10 @@ impl Headless {
                 }
             }
             "doc.select" => {
-                let i = index_of(&p).ok_or_else(|| bad("doc.select needs `index`"))?;
+                let i = index_of(&p)?.ok_or_else(|| bad("doc.select needs `index`"))?;
                 self.select(i)
             }
-            "doc.close" => self.close(index_of(&p)),
+            "doc.close" => self.close(index_of(&p)?),
             "batch" => self.batch(&p),
             "methods" => Ok(json!(METHODS)),
             other => Err(bad(format!("unknown method `{other}` (try `methods`)"))),
@@ -264,10 +272,12 @@ pub fn serve_lines(h: &Mutex<Headless>, mut r: impl BufRead, mut w: impl Write) 
     }
 }
 
-fn serve_tcp_connection(h: &Mutex<Headless>, stream: std::net::TcpStream, token: &str) -> std::io::Result<()> {
+/// Serve one connection. It must complete `auth` within `auth_deadline` of connecting, however
+/// much it sends meanwhile (#4965); after that only the idle timeout applies.
+fn serve_tcp_connection(h: &Mutex<Headless>, stream: std::net::TcpStream, token: &str, auth_deadline: std::time::Duration) -> std::io::Result<()> {
     configure_stream(&stream)?;
     let read = stream.try_clone()?;
-    let mut reader = std::io::BufReader::new(read);
+    let mut reader = std::io::BufReader::new(AuthDeadlineStream::new(read, auth_deadline));
     let mut out = stream;
     let mut line = String::new();
     let mut authenticated = false;
@@ -292,6 +302,9 @@ fn serve_tcp_connection(h: &Mutex<Headless>, stream: std::net::TcpStream, token:
         } else {
             let (reply, ok) = authentication_reply(&line, token);
             authenticated = ok;
+            if ok {
+                reader.get_mut().authenticated()?;
+            }
             reply
         };
         write_reply(&mut out, &reply)?;
@@ -324,7 +337,7 @@ pub fn serve_tcp(addr: &str, h: Arc<Mutex<Headless>>, token: String, ready: impl
         let token = Arc::clone(&token);
         std::thread::spawn(move || {
             let _permit = permit;
-            let _ = serve_tcp_connection(&h, stream, &token);
+            let _ = serve_tcp_connection(&h, stream, &token, AUTH_DEADLINE);
         });
     }
     Ok(())
@@ -336,6 +349,19 @@ mod tests {
 
     fn session() -> Mutex<Headless> {
         Mutex::new(Headless::trusted_local())
+    }
+
+    #[test]
+    fn document_activation_reply_survives_engine_rpc() {
+        let h = session();
+        let mut g = h.lock().unwrap();
+        for _ in 0..2 {
+            g.handle("engine.execute", json!({"command": "file.new", "params": {"width": 4, "height": 4}})).unwrap();
+        }
+        let reply = g.handle("engine.execute", json!({"command": "document.activate", "params": {"offset": -1}})).unwrap();
+        assert_eq!(reply, json!({"document": 0}));
+        let reply = g.handle("engine.execute", json!({"command": "document.activate", "params": {"document": 1}})).unwrap();
+        assert_eq!(reply, json!({"document": 1}));
     }
 
     #[test]
@@ -355,6 +381,42 @@ mod tests {
                 assert_eq!(h.lock().unwrap().inspect(None).unwrap(), before);
             }
         }
+    }
+
+    /// Pins the reply shape documented in docs/control-protocol.md › Command list replies
+    /// (#3684): a bare JSON array (not `{"commands": [...]}`), one object per command with
+    /// exactly these keys (plus an optional `keywords` string), from `engine.commands` (filtered or not) and `command.list`.
+    #[test]
+    fn command_list_replies_are_documented_array_of_objects() {
+        let h = session();
+        let mut g = h.lock().unwrap();
+        let all = g.handle("engine.commands", json!({})).unwrap();
+        let filtered = g.handle("engine.commands", json!({"filter": "BLUR"})).unwrap();
+        let engine = g.handle("engine.execute", json!({"command": "command.list"})).unwrap();
+        for (name, reply) in [("engine.commands", &all), ("engine.commands {filter}", &filtered), ("command.list", &engine)] {
+            let items = reply.as_array().unwrap_or_else(|| panic!("{name} must reply with a bare array, got {reply}"));
+            assert!(!items.is_empty(), "{name}");
+            for c in items {
+                // `keywords` is optional: only commands with other search names carry it (#5060).
+                let mut keys: Vec<&str> = c.as_object().unwrap().keys().map(String::as_str).filter(|k| *k != "keywords").collect();
+                keys.sort_unstable();
+                assert!(c.get("keywords").is_none_or(Value::is_string), "{name}: {c}");
+                assert_eq!(keys, ["disabledReason", "enabled", "id", "label", "menu", "needsDocument", "params", "shortcut"], "{name}: {c}");
+                assert!(c["id"].is_string() && c["label"].is_string() && c["params"].is_string() && c["enabled"].is_boolean(), "{c}");
+                assert!(c["needsDocument"].is_boolean(), "{c}");
+                assert_eq!(c["disabledReason"].is_null(), c["enabled"] == true, "disabledReason is null exactly when enabled: {c}");
+                assert!(c["menu"].as_array().unwrap().iter().all(Value::is_string), "{c}");
+                assert!(c["shortcut"].is_string() || c["shortcut"].is_null(), "{c}");
+            }
+        }
+        let n_all = all.as_array().unwrap().len();
+        assert_eq!(engine.as_array().unwrap().len(), n_all);
+        let filtered = filtered.as_array().unwrap();
+        assert!(filtered.len() < n_all);
+        assert!(filtered.iter().all(|c| format!("{} {}", c["id"], c["label"]).to_lowercase().contains("blur")));
+        let new = all.as_array().unwrap().iter().find(|c| c["id"] == "file.new").unwrap();
+        assert_eq!((&new["menu"], &new["shortcut"], &new["enabled"]), (&json!(["File"]), &json!("Cmd+N"), &json!(true)), "{new}");
+        assert_eq!((&new["disabledReason"], &new["needsDocument"]), (&Value::Null, &json!(false)), "{new}");
     }
 
     #[test]
@@ -534,6 +596,26 @@ mod tests {
         let decode = |p: &std::path::Path| photocraft_codecs::decode(&std::fs::read(p).unwrap()).unwrap().to_rgba8();
         assert_ne!(decode(&before), decode(&after), "the export holds the blur");
         assert_ne!(render(&mut h), unblurred, "the preview holds the blur");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Regression: `quality` 85.0 or "85" was ignored (a lossless WebP, reply ok) and 0 or 500 was
+    /// clamped, where the CLI refuses anything but a whole number from 1 to 100.
+    #[test]
+    fn doc_save_rejects_a_bad_quality_instead_of_ignoring_or_clamping_it() {
+        let dir = std::env::temp_dir().join(format!("pc-rpc-save-quality-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.webp");
+        let mut h = Headless::trusted_local();
+        h.handle("doc.new", json!({"width": 16, "height": 16})).unwrap();
+        for q in [json!(85.0), json!("85"), json!(0), json!(500), json!(-5), json!(true)] {
+            let err = h.handle("doc.save", json!({"path": path.to_string_lossy(), "quality": q})).unwrap_err().to_string();
+            assert!(err.contains("quality"), "{q}: {err}");
+            assert!(!path.exists(), "{q} wrote a file");
+        }
+        h.handle("doc.save", json!({"path": path.to_string_lossy(), "quality": 85})).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.get(12..16), Some(&b"VP8 "[..]), "a WebP saved with a quality is lossy");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -718,6 +800,179 @@ mod tests {
     }
 
     #[test]
+    fn indexed_place_and_data_set_methods_keep_the_active_document() {
+        let base = std::env::temp_dir().join(format!("pc-doc-index-active-{}", std::process::id()));
+        let root = base.join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let img = photocraft_codecs::Image::from_u8(4, 4, photocraft_codecs::ChannelLayout::Rgb, vec![42; 4 * 4 * 3]).unwrap();
+        std::fs::write(root.join("logo.png"), photocraft_codecs::encode(&img, photocraft_codecs::Format::Png, &Default::default()).unwrap()).unwrap();
+        std::fs::write(root.join("sets.csv"), "Data Set,show\none,true\ntwo,false\n").unwrap();
+        let mut h = Headless::with_workspace(crate::AuthorizedWorkspace::new(Some(&root), Some(&root)).unwrap());
+        h.handle("doc.new", json!({"width": 8, "height": 8, "background": "white", "name": "first"})).unwrap();
+        h.handle("doc.new", json!({"width": 8, "height": 8, "background": "white", "name": "second"})).unwrap();
+        let layer = h.handle("doc.inspect", json!({})).unwrap()["layers"][0]["id"].as_u64().expect("the layer id");
+        h.handle("engine.execute", json!({"command": "image.variables.define", "params": {"defs": [{"name": "show", "layer": layer, "type": "visibility"}]}}))
+            .unwrap();
+        h.handle("doc.select", json!({"index": 0})).unwrap();
+
+        let steps = [
+            ("doc.place", json!({"path": "logo.png", "index": 1}), true),
+            ("doc.importDataSets", json!({"path": "sets.csv", "index": 1}), true),
+            ("doc.exportLayers", json!({"dir": "layers", "index": 1}), true),
+            ("doc.exportDataSets", json!({"dir": "sets", "index": 1}), true),
+            // A failing call restores the active document too.
+            ("doc.importDataSets", json!({"path": "missing.csv", "index": 1}), false),
+        ];
+        for (method, params, succeeds) in steps {
+            let result = h.handle(method, params.clone());
+            assert_eq!(result.is_ok(), succeeds, "{method} {params}: {result:?}");
+            assert_eq!(h.session.active_index(), Some(0), "{method} {params} must not select document 1");
+        }
+        assert_eq!(h.session.documents()[0].doc.layer_count(), 1, "nothing was placed into the active document");
+        assert_eq!(h.session.documents()[1].doc.layer_count(), 2, "the placed layer is in document 1");
+        assert_eq!(std::fs::read_dir(root.join("sets")).unwrap().count(), 2, "document 1's data sets were exported");
+        // Release directory capabilities before cleanup on Windows.
+        drop(h);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn doc_export_data_sets_judges_pixel_replacement_paths_like_apply() {
+        let base = std::env::temp_dir().join(format!("pc-doc-data-set-pixels-{}", std::process::id()));
+        let root = base.join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let red = photocraft_codecs::Image::from_u8(4, 4, photocraft_codecs::ChannelLayout::Rgb, [255, 0, 0].repeat(16)).unwrap();
+        let photo = base.join("photo.png");
+        std::fs::write(&photo, photocraft_codecs::encode(&red, photocraft_codecs::Format::Png, &Default::default()).unwrap()).unwrap();
+        let mut h = Headless::with_workspace(crate::AuthorizedWorkspace::new(Some(&root), Some(&root)).unwrap());
+        h.handle("doc.new", json!({"width": 8, "height": 8, "background": "white", "name": "card"})).unwrap();
+        let layer = h.handle("engine.execute", json!({"command": "layer.new.layer", "params": {}})).unwrap()["layer"].clone();
+        h.handle(
+            "engine.execute",
+            json!({"command": "image.variables.define", "params": {"defs": [{"name": "photo", "layer": layer, "type": "pixelReplacement"}]}}),
+        )
+        .unwrap();
+        // Storing the path is allowed; reading it is what the gate judges.
+        h.handle(
+            "engine.execute",
+            json!({"command": "image.variables.dataSets", "params": {"dataSets": [
+                {"name": "swap", "values": [{"variable": "photo", "kind": "pixels", "value": photo.to_string_lossy()}]},
+            ]}}),
+        )
+        .unwrap();
+        let applied = h.handle("engine.execute", json!({"command": "image.applyDataSet", "params": {"name": "swap"}})).unwrap_err().to_string();
+        assert!(applied.contains("ambient filesystem paths"), "{applied}");
+        let sets = root.join("sets");
+        let exported = h.handle("doc.exportDataSets", json!({"dir": sets.to_string_lossy(), "format": "png"})).unwrap_err().to_string();
+        assert!(exported.contains("ambient filesystem paths"), "{exported}");
+        assert_eq!(std::fs::read_dir(&sets).map_or(0, Iterator::count), 0, "nothing of the refused batch is written");
+        // Release directory capabilities before cleanup on Windows.
+        drop(h);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn workspace_psd_saves_embed_no_file_a_linked_smart_object_names() {
+        use photocraft_engine::doc::{LayerContent, SmartSource};
+
+        const MARKER: &[u8] = b"PHOTOCRAFT-LINKED-0001";
+        let has_marker = |bytes: &[u8]| bytes.windows(MARKER.len()).any(|w| w == MARKER);
+        let base = std::env::temp_dir().join(format!("pc-psd-linked-embed-{}", std::process::id()));
+        let root = base.join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = base.join("outside.txt");
+        std::fs::write(&outside, MARKER).unwrap();
+        // A document whose smart object names a file outside the roots as its source.
+        let mut session = photocraft_engine::Session::new();
+        session.execute("file.new", json!({"width": 8, "height": 8, "background": "white"})).unwrap();
+        session.execute("layer.smartObjects.convertToSmartObject", json!({})).unwrap();
+        let state = session.active_mut().unwrap();
+        let LayerContent::Smart(smart) = &mut std::sync::Arc::make_mut(&mut state.doc).layers[0].content else { panic!("smart object") };
+        smart.source = SmartSource::Linked { path: outside.to_string_lossy().into_owned() };
+        std::fs::write(root.join("in.pcraft"), photocraft_engine::smart_cmds::encode_source(&state.doc).unwrap()).unwrap();
+        // A trusted export embeds the linked file, as before.
+        assert!(has_marker(&photocraft_io::export(&state.doc, "psd", &Default::default()).unwrap().bytes));
+
+        let mut h = Headless::with_workspace(crate::AuthorizedWorkspace::new(Some(&root), Some(&root)).unwrap());
+        h.handle("doc.open", json!({"path": "in.pcraft"})).unwrap();
+        let saved = h.handle("doc.save", json!({"path": "out.psd"})).unwrap();
+        let warnings = saved["warnings"].to_string();
+        assert!(warnings.contains("written as pixels"), "{warnings}");
+        assert!(!has_marker(&std::fs::read(root.join("out.psd")).unwrap()), "the linked file outside the roots is not embedded");
+        // Release directory capabilities before cleanup on Windows.
+        drop(h);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn allowed_filters_do_not_rerender_a_smart_object_from_its_linked_file() {
+        use photocraft_engine::doc::{LayerContent, SmartSource};
+
+        let base = std::env::temp_dir().join(format!("pc-linked-rerender-{}", std::process::id()));
+        let root = base.join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let red = photocraft_codecs::Image::from_u8(8, 8, photocraft_codecs::ChannelLayout::Rgb, [255, 0, 0].repeat(64)).unwrap();
+        let outside = base.join("red.png");
+        std::fs::write(&outside, photocraft_codecs::encode(&red, photocraft_codecs::Format::Png, &Default::default()).unwrap()).unwrap();
+        // A document whose white smart object names a file outside the roots as its source.
+        let mut session = photocraft_engine::Session::new();
+        session.execute("file.new", json!({"width": 8, "height": 8, "background": "white"})).unwrap();
+        session.execute("layer.smartObjects.convertToSmartObject", json!({})).unwrap();
+        let state = session.active_mut().unwrap();
+        let LayerContent::Smart(smart) = &mut std::sync::Arc::make_mut(&mut state.doc).layers[0].content else { panic!("smart object") };
+        smart.source = SmartSource::Linked { path: outside.to_string_lossy().into_owned() };
+        std::fs::write(root.join("p.pcraft"), photocraft_engine::smart_cmds::encode_source(&state.doc).unwrap()).unwrap();
+
+        let mut h = Headless::with_workspace(crate::AuthorizedWorkspace::new(Some(&root), Some(&root)).unwrap());
+        h.handle("doc.open", json!({"path": "p.pcraft"})).unwrap();
+        h.handle("engine.execute", json!({"command": "filter.blur.gaussianBlur", "params": {"radius": 0.5}})).unwrap();
+        let doc = &h.session.active().unwrap().doc;
+        let LayerContent::Smart(smart) = &doc.layers[0].content else { panic!("smart object") };
+        assert_eq!(smart.smart_filters.len(), 1, "the filter is still recorded");
+        assert_eq!(smart.cache.as_ref().unwrap().rgba(4, 4), [1.0, 1.0, 1.0, 1.0], "the linked file outside the roots is not read");
+        // Release directory capabilities before cleanup on Windows.
+        drop(h);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn workspace_layer_exports_keep_linked_smart_objects_as_pixels() {
+        use photocraft_engine::doc::{LayerContent, SmartSource};
+
+        const MARKER: &[u8] = b"PHOTOCRAFT-LINKED-0002";
+        let has_marker = |bytes: &[u8]| bytes.windows(MARKER.len()).any(|w| w == MARKER);
+        let base = std::env::temp_dir().join(format!("pc-export-layers-linked-{}", std::process::id()));
+        let root = base.join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = base.join("outside.txt");
+        std::fs::write(&outside, MARKER).unwrap();
+        // A document whose smart object names a file outside the roots as its source.
+        let mut session = photocraft_engine::Session::new();
+        session.execute("file.new", json!({"width": 8, "height": 8, "background": "white"})).unwrap();
+        session.execute("layer.smartObjects.convertToSmartObject", json!({})).unwrap();
+        let state = session.active_mut().unwrap();
+        let LayerContent::Smart(smart) = &mut std::sync::Arc::make_mut(&mut state.doc).layers[0].content else { panic!("smart object") };
+        smart.source = SmartSource::Linked { path: outside.to_string_lossy().into_owned() };
+        std::fs::write(root.join("in.pcraft"), photocraft_engine::smart_cmds::encode_source(&state.doc).unwrap()).unwrap();
+
+        let mut h = Headless::with_workspace(crate::AuthorizedWorkspace::new(Some(&root), Some(&root)).unwrap());
+        h.handle("doc.open", json!({"path": "in.pcraft"})).unwrap();
+        let out = root.join("layers");
+        for format in ["psd", "psb"] {
+            let exported = h.handle("doc.exportLayers", json!({"dir": out.to_string_lossy(), "format": format})).unwrap();
+            assert_eq!(exported["count"], 1, "{exported}");
+        }
+        let files: Vec<_> = std::fs::read_dir(&out).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(files.len(), 2, "{files:?}");
+        for file in files {
+            assert!(!has_marker(&std::fs::read(&file).unwrap()), "{} embeds no file outside the roots", file.display());
+        }
+        // Release directory capabilities before cleanup on Windows.
+        drop(h);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn trusted_local_render_keeps_full_size_behavior() {
         let mut h = Headless::trusted_local();
         h.handle("doc.new", json!({"width": 2049, "height": 1})).unwrap();
@@ -780,6 +1035,60 @@ mod tests {
         assert!(v["result"].as_array().unwrap().iter().any(|m| m == "batch"));
     }
 
+    /// #4965: a connection that keeps sending without authenticating is closed at the deadline,
+    /// and one that authenticated in time keeps being served after it.
+    #[test]
+    fn tcp_connections_must_authenticate_before_the_deadline_whatever_they_send() {
+        use std::io::{BufReader, Write as _};
+        use std::time::{Duration, Instant};
+        const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let h = Mutex::new(Headless::new());
+            let mut results = Vec::new();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let started = Instant::now();
+                let r = serve_tcp_connection(&h, stream, TOKEN, Duration::from_millis(300));
+                results.push((r.map_err(|e| e.kind()), started.elapsed()));
+            }
+            results
+        });
+
+        // Never a newline, a byte every 20 ms: each read succeeds long before the idle timeout.
+        let mut slow = std::net::TcpStream::connect(addr).unwrap();
+        for _ in 0..150 {
+            if slow.write_all(b" ").is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(slow);
+
+        // Authenticates at once, then asks again 300 ms after the deadline.
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        writeln!(s, r#"{{"id":"auth","method":"auth","params":{{"token":"{TOKEN}"}}}}"#).unwrap();
+        let mut reader = BufReader::new(s.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["result"]["authenticated"], true);
+        std::thread::sleep(Duration::from_millis(600));
+        writeln!(s, r#"{{"id":"a","method":"methods"}}"#).unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["id"], "a");
+        drop(reader);
+        drop(s);
+
+        let results = server.join().unwrap();
+        let (slow_result, slow_time) = &results[0];
+        assert!(matches!(slow_result, Err(std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)), "{slow_result:?}");
+        assert!(*slow_time < Duration::from_secs(3), "the trickle did not extend the deadline: {slow_time:?}");
+        assert_eq!(results[1].0, Ok(()), "the authenticated connection ended with its client");
+    }
+
     #[test]
     fn tcp_repeat_auth_reports_already_authenticated_and_keeps_serving() {
         use std::io::{BufReader, Write as _};
@@ -828,5 +1137,28 @@ mod tests {
         assert_eq!(v["ok"], false);
         assert_eq!(v["error"], "authentication required");
         assert!(v.get("result").is_none());
+    }
+
+    #[test]
+    fn invalid_document_index_is_rejected_not_the_active_document() {
+        let h = session();
+        for _ in 0..2 {
+            assert_eq!(respond(&h, r#"{"method":"doc.new","params":{"width":8,"height":8}}"#)["ok"], true);
+        }
+        let count = |h: &Mutex<Headless>| h.lock().unwrap().session_list()["documents"].as_array().unwrap().len();
+        for index in [json!("0"), json!(-1), json!(0.5), json!(true)] {
+            for method in ["doc.close", "doc.inspect", "doc.select"] {
+                let reply = respond(&h, &json!({"method": method, "params": {"index": index}}).to_string());
+                assert_eq!(reply["ok"], false, "{method} {index}: {reply}");
+                assert!(reply["error"].as_str().unwrap().contains("`index` must be a non-negative integer"), "{reply}");
+            }
+            assert_eq!(count(&h), 2, "index {index} closed a document");
+        }
+        // Null means "the active document", like a missing `index`.
+        assert_eq!(respond(&h, r#"{"method":"doc.inspect","params":{"index":null}}"#)["ok"], true);
+        // A valid index still closes that document.
+        let reply = respond(&h, r#"{"method":"doc.close","params":{"index":0}}"#);
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(count(&h), 1);
     }
 }

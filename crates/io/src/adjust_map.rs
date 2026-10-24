@@ -228,8 +228,10 @@ fn parse_any(key: &[u8; 4], data: &[u8], cged: Option<&[u8]>) -> Adjustment {
                     *r = HueRange { hue: h, saturation: s, lightness: l, bounds: HueRange::canonical_bounds([a, b, c, d]) };
                 }
             }
+            let hue = f32::from(bei16(data, base)?);
             Some(Adjustment::HueSaturation {
-                hue: f32::from(bei16(data, base)?),
+                // Photoshop stores the colorize hue signed (200 as -160); the model keeps 0..360.
+                hue: if colorize { hue.rem_euclid(360.0) } else { hue },
                 saturation: f32::from(bei16(data, base + 2)?),
                 lightness: f32::from(bei16(data, base + 4)?),
                 colorize,
@@ -280,7 +282,8 @@ fn parse_gradient_map(d: &[u8]) -> Option<Adjustment> {
         3 => (Some(d.get(4..8)?), 8),
         _ => return None,
     };
-    at += 4 + be32(d, at)? as usize * 2;
+    // The gradient's name (UTF-16 units); checked, as `len * 2` overflows a 32-bit `usize`.
+    at = (be32(d, at)? as usize).checked_mul(2)?.checked_add(at + 4)?;
     let n = usize::from(be16(d, at)?);
     at += 2;
     let mut stops = Vec::with_capacity(n);
@@ -322,6 +325,22 @@ pub(crate) fn retarget_gradient_map(data: &mut [u8], target: &Adjustment, channe
             flags[0] = u8::from(*reverse);
             flags[1] = u8::from(*dither);
             true
+        }
+        _ => false,
+    }
+}
+
+/// `true` for a `grdm` block exactly as older PhotoCraft builds wrote it: [`write_gradient_map`]'s
+/// output without the two padding bytes, which makes Photoshop refuse the file (#8070). Blocks
+/// from other writers, whatever their length, are not matched.
+pub(crate) fn is_unpadded_photocraft_gradient_map(data: &[u8]) -> bool {
+    if data.len().is_multiple_of(4) {
+        return false;
+    }
+    match parse_gradient_map(data) {
+        Some(Adjustment::GradientMap { stops, reverse, dither }) => {
+            let padded = write_gradient_map(&stops, reverse, dither);
+            padded.len() == data.len() + 2 && padded.starts_with(data)
         }
         _ => false,
     }
@@ -369,6 +388,8 @@ fn write_gradient_map(stops: &[(f32, [f32; 3])], reverse: bool, dither: bool) ->
         put16(&mut v, x);
     }
     put16(&mut v, 0);
+    // Photoshop includes the two-byte pad in the `grdm` length when the block is 2 mod 4 (#8070).
+    v.resize(v.len().next_multiple_of(4), 0);
     v
 }
 
@@ -509,11 +530,12 @@ fn parse_black_white(d: &[u8]) -> Option<Adjustment> {
 /// (colour space + four u16), version 3 "4 bytes each for XYZ color"; then density (u32 percent)
 /// and preserve luminosity (1 byte).
 ///
-/// The spec gives no scale for the XYZ values. They are read as D50 XYZ (the ICC PCS) with
-/// 1.0 = 32768, the ICC 16-bit PCSXYZ encoding. That is inferred, not documented: the
-/// Photoshop CS2 file in #3777 holds (24191, 25002, 3827), a bright warm yellow at this scale,
-/// and rendering it against Photoshop's export fit best between 30000 and 32768 (1.0 = 65536,
-/// a dull olive, was clearly worse).
+/// The spec gives no scale for the XYZ values. They are read as XYZ relative to the D50 white
+/// (X / 0.9642, Y, Z / 0.8249) with 1.0 = 32768, so white is stored as (32768, 32768, 32768).
+/// That is inferred, not documented: decoded this way, every version 3 colour in the Photoshop
+/// CS2 files of #3777 and #4940 is exactly a Photoshop preset (the Yellow filter holds
+/// (24191, 25002, 3827) and decodes to #F9E31C, Warming Filter (85) holds (15548, 12029, 0)
+/// and decodes to #EC8A00); reading them as absolute XYZ gives #FFE03A and #F18600.
 const PHFL_XYZ_ONE: f32 = 32768.0;
 
 fn parse_photo_filter(d: &[u8]) -> Option<Adjustment> {
@@ -527,11 +549,14 @@ fn parse_photo_filter(d: &[u8]) -> Option<Adjustment> {
             (crate::channel_map::decode_color(space, c).to_rgb(), 12)
         }
         3 => {
-            let xyz = [be32(d, 2)?, be32(d, 6)?, be32(d, 10)?].map(|v| v as f32 / PHFL_XYZ_ONE);
-            // Real colours stay below about 1.0; anything past 2.0 is not an XYZ colour.
-            if xyz.iter().any(|v| *v > 2.0) {
+            let rel = [be32(d, 2)?, be32(d, 6)?, be32(d, 10)?].map(|v| v as f32 / PHFL_XYZ_ONE);
+            // Relative to the white, real colours stay below about 2.0 (Cooling Filter (82)
+            // reaches 1.99 on Z); anything past that is not an XYZ colour.
+            if rel.iter().any(|v| *v > 2.0) {
                 return None;
             }
+            // Relative to the D50 white: bring it back to absolute D50 XYZ before converting.
+            let xyz = [rel[0] * photocraft_color::convert::D50[0], rel[1], rel[2] * photocraft_color::convert::D50[2]];
             let lin = photocraft_color::convert::mat3_mul(&photocraft_color::convert::XYZ_D50_TO_SRGB, xyz);
             (lin.map(|v| photocraft_color::convert::linear_to_srgb(v.clamp(0.0, 1.0))), 14)
         }
@@ -616,10 +641,16 @@ pub fn write(adj: &Adjustment) -> Vec<([u8; 4], Vec<u8>)> {
             put16(&mut v, 2);
             v.push(u8::from(*colorize));
             v.push(0);
-            for _ in 0..2 {
-                for x in [hue, saturation, lightness] {
-                    v.extend_from_slice(&clamp_i16(*x).to_be_bytes());
-                }
+            // The colorize triplet, then the master triplet. The inactive one gets Photoshop's
+            // defaults; the colorize hue (0..360 in the model) is stored signed, -180..180.
+            let (colorize_hsl, master) = if *colorize {
+                let h = hue.rem_euclid(360.0);
+                ([if h > 180.0 { h - 360.0 } else { h }, *saturation, *lightness], [0.0; 3])
+            } else {
+                ([30.0, 25.0, 0.0], [*hue, *saturation, *lightness])
+            };
+            for x in colorize_hsl.into_iter().chain(master) {
+                v.extend_from_slice(&clamp_i16(x).to_be_bytes());
             }
             // Six hue ranges (reds, yellows, greens, cyans, blues, magentas): range values in
             // 0..360, then the range's hue, saturation and lightness.
@@ -822,7 +853,8 @@ mod tests {
         // Smoothness 100 % (4096) bends a three-stop ramp.
         let three = vec![(0.0, [0.0; 3]), (0.25, [1.0, 0.0, 0.0]), (0.75, [0.0, 0.0, 1.0]), (1.0, [1.0; 3])];
         let mut smooth = write_gradient_map(&three, false, false);
-        let at = smooth.len() - 2 - 16 - 2 - 4 - 2 - 2 - 4 - 2 - 2 - 2;
+        // v1 header/name/count + colour stops + transparency stops + expansion count.
+        let at = 48 + three.len() * 20;
         smooth[at..at + 2].copy_from_slice(&4096u16.to_be_bytes());
         let (a, b) = (at_t(&write_gradient_map(&three, false, false), 0.4), at_t(&smooth, 0.4));
         assert!((0..3).any(|k| (a[k] - b[k]).abs() > 1e-3), "{a:?} {b:?}");
@@ -941,6 +973,21 @@ mod tests {
         let cged = blocks.iter().find(|b| &b.0 == b"CgEd").map(|b| &b.1[..]);
         let back = parse(&blocks[0].0, &blocks[0].1, cged, Channels::Rgb);
         assert_eq!(back, a);
+    }
+
+    /// Photoshop keeps the colorize triplet at byte 4 and the master triplet at byte 10, and fills
+    /// the inactive one with its defaults: colorize (30, 25, 0), master (0, 0, 0). The colorize hue
+    /// is stored signed (200 -> -160).
+    #[test]
+    fn hue2_writes_each_triplet_in_its_own_slot() {
+        let triplets = |a: &Adjustment| -> Vec<i16> {
+            let blocks = write(a);
+            (0..6).map(|i| bei16(&blocks[0].1, 4 + 2 * i).unwrap_or(i16::MIN)).collect()
+        };
+        let on = Adjustment::HueSaturation { hue: 200.0, saturation: 40.0, lightness: 10.0, colorize: true, ranges: HueRange::defaults() };
+        assert_eq!(triplets(&on), [-160, 40, 10, 0, 0, 0]);
+        let off = Adjustment::HueSaturation { hue: -30.0, saturation: 20.0, lightness: 5.0, colorize: false, ranges: HueRange::defaults() };
+        assert_eq!(triplets(&off), [30, 25, 0, -30, 20, 5]);
     }
 
     #[test]
@@ -1168,25 +1215,37 @@ mod tests {
         let Adjustment::PhotoFilter { color, density, preserve_luminosity: false } = parse(b"phfl", &lab, None, Channels::Rgb) else { panic!() };
         assert!(color.iter().all(|c| (c - 0.466).abs() < 0.01), "{color:?}");
         assert_eq!(density, 0.25);
-        // Version 3: D50 XYZ, 1.0 = 32768. The ICC sRGB white point (D50) is white.
-        let v3 = phfl_v3([31595, 32768, 27040], 100, true);
+        // Version 3: XYZ relative to the D50 white, 1.0 = 32768. White is (32768, 32768, 32768).
+        let v3 = phfl_v3([32768, 32768, 32768], 100, true);
         let Adjustment::PhotoFilter { color, density, preserve_luminosity: true } = parse(b"phfl", &v3, None, Channels::Rgb) else { panic!() };
         assert!(color.iter().all(|c| (c - 1.0).abs() < 0.005), "{color:?}");
         assert_eq!(density, 1.0);
-        // Photoshop's Warming Filter (85) preset, sRGB #EC8A00, is D50 XYZ (15193, 12086, 1192).
+        // Photoshop's Warming Filter (85) preset, sRGB #EC8A00: the CS2 file of #4940 stores it
+        // relative to the D50 white as (15548, 12029, 0).
         let Adjustment::PhotoFilter { color, density, preserve_luminosity: false } =
-            parse(b"phfl", &phfl_v3([15193, 12086, 1192], 25, false), None, Channels::Rgb)
+            parse(b"phfl", &phfl_v3([15548, 12029, 0], 25, false), None, Channels::Rgb)
         else {
             panic!()
         };
         let expected = [0xecu8, 0x8a, 0x00].map(|v| f32::from(v) / 255.0);
         assert!(color.iter().zip(expected).all(|(got, want)| (got - want).abs() < 1.5 / 255.0), "{color:?}");
         assert_eq!(density, 0.25);
-        // The block from #3777 (Photoshop CS2): a warm yellow, density 63 %, preserve luminosity.
+        // The block from #3777 (Photoshop CS2): the Yellow filter preset, #F9E31C, density 63 %.
         let issue = [0, 3, 0, 0, 0x5e, 0x7f, 0, 0, 0x61, 0xaa, 0, 0, 0x0e, 0xf3, 0, 0, 0, 0x3f, 1, 0];
         let Adjustment::PhotoFilter { color, density, preserve_luminosity: true } = parse(b"phfl", &issue, None, Channels::Rgb) else { panic!() };
-        assert!(color[0] > color[1] && color[1] > color[2] && color[1] > 0.8 && color[2] < 0.3, "{color:?}");
+        let expected = [0xf9u8, 0xe3, 0x1c].map(|v| f32::from(v) / 255.0);
+        assert!(color.iter().zip(expected).all(|(got, want)| (got - want).abs() < 1.5 / 255.0), "{color:?}");
         assert_eq!(density, 0.63);
+        // Cooling Filter (82) from #4940: a deep blue outside sRGB; its Z stays under the 2.0
+        // garbage guard and the colour clamps to (0, 181, 255).
+        let Adjustment::PhotoFilter { color: cooling, density, preserve_luminosity: true } =
+            parse(b"phfl", &phfl_v3([5327, 9584, 65357], 72, true), None, Channels::Rgb)
+        else {
+            panic!("Cooling Filter (82) must parse")
+        };
+        let expected = [0u8, 181, 255].map(|v| f32::from(v) / 255.0);
+        assert!(cooling.iter().zip(expected).all(|(got, want)| (got - want).abs() < 1.5 / 255.0), "{cooling:?}");
+        assert_eq!(density, 0.72);
         // The 19-byte form (no trailing pad) parses the same.
         assert_eq!(parse(b"phfl", &issue[..19], None, Channels::Rgb), parse(b"phfl", &issue, None, Channels::Rgb));
         // Version 3 is read, never written: an edited filter is saved as version 2 and keeps its colour.

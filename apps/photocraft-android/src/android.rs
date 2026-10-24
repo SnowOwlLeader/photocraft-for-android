@@ -13,6 +13,8 @@ use std::{
     time::Duration,
 };
 
+use super::encoding::export;
+
 struct Bridge {
     vm: JavaVM,
     activity: GlobalRef,
@@ -75,23 +77,6 @@ fn guarded<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
         .unwrap_or_else(|_| Err("PhotoCraft could not complete this operation; the document remains open.".into()))
 }
 
-fn export(doc: &photocraft_doc::Document, path: &str, settings: &photocraft_ui_egui::ExportSettings) -> Result<(Vec<u8>, Vec<String>), String> {
-    guarded(|| {
-        let mut options = photocraft_io::ExportOptions::default();
-        if let Some(q) = settings.jpeg_quality {
-            options.encode.jpeg_quality = q;
-        }
-        options.encode.webp_lossless = settings.webp_lossless;
-        if let Some(q) = settings.webp_quality {
-            options.encode.webp_quality = q;
-        }
-        options.tiff_layers = settings.tiff_layers;
-        options.tga_bits = settings.tga_bits;
-        options.xmp = if settings.xmp_all { photocraft_io::XmpEmbed::All } else { photocraft_io::XmpEmbed::None };
-        photocraft_io::export(doc, path, &options).map(|r| (r.bytes, r.warnings)).map_err(|e| e.to_string())
-    })
-}
-
 fn services(bridge: Arc<Bridge>, pending: Pending, browser_request: BrowserRequest, directory: &Path) -> Services {
     let writer = bridge.clone();
     let saver = bridge.clone();
@@ -101,8 +86,8 @@ fn services(bridge: Arc<Bridge>, pending: Pending, browser_request: BrowserReque
     let recovery = Rc::new(RefCell::new(photocraft_format::RecoveryStore::new(recovery_dir.clone())));
     let (autosave, results, discard, adopt) = (recovery.clone(), recovery.clone(), recovery.clone(), recovery.clone());
     Services {
-        import: Some(Box::new(|name, bytes, depth| {
-            guarded(|| photocraft_io::import_with_svg_group_depth(name, bytes, depth).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string()))
+        import: Some(Box::new(|name, bytes, options| {
+            guarded(|| photocraft_io::import_with_options(name, bytes, options).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string()))
         })),
         export: Some(Box::new(export)),
         write: Some(Box::new(move |path, bytes| writer.write(path, bytes))),

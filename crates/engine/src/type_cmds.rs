@@ -8,9 +8,10 @@
 
 use std::sync::Arc;
 
-use photocraft_color::Color;
+use photocraft_color::{Color, PixelFormat};
 use photocraft_doc::text::{
-    AntiAlias, Caps, CharStyle, FontFeature, FontVariation, Kerning, Orientation, ParagraphRun, ParagraphStyle, TextAlign, TextDirection, TextRun, TextShape,
+    AntiAlias, Caps, CharStyle, FontBaseline, FontFeature, FontVariation, Kerning, Orientation, ParagraphRun, ParagraphStyle, TextAlign, TextDirection,
+    TextRun, TextShape,
 };
 use photocraft_doc::{Affine, Document, Layer, LayerContent, LayerId, TextLayer};
 use serde_json::{Value, json};
@@ -34,14 +35,14 @@ fn bad(cmd: &str, msg: impl Into<String>) -> EngineError {
 }
 
 fn f32p(p: &Value, k: &str) -> Option<f32> {
-    p.get(k).and_then(Value::as_f64).map(|v| v as f32)
+    p.get(k).and_then(Value::as_f64).map(|v| v as f32).filter(|v| v.is_finite())
 }
 
 fn color(v: &Value) -> Option<Color> {
     match v {
         Value::Array(a) if a.len() >= 3 => {
             let c: Vec<f32> = a.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect();
-            Some(Color::rgba(c[0], c[1], c[2], c.get(3).copied().unwrap_or(1.0)))
+            c.iter().take(4).all(|v| v.is_finite()).then(|| Color::rgba(c[0], c[1], c[2], c.get(3).copied().unwrap_or(1.0)))
         }
         Value::String(s) => {
             let s = s.trim_start_matches('#');
@@ -89,6 +90,8 @@ pub const TYPE_SIZE_MIN_PT: f64 = 0.1;
 pub const TYPE_SIZE_MAX_PT: f64 = 1296.0;
 pub const TRACKING_MIN: f64 = -1000.0;
 pub const TRACKING_MAX: f64 = 10_000.0;
+/// Photoshop's horizontal and vertical scale range, in percent.
+pub const SCALE_MAX_PERCENT: f64 = 1000.0;
 
 /// Validates the `kerning` key of character params: a number in [`KERN_MIN`]..=[`KERN_MAX`] or
 /// `"metrics"`, `"optical"`, `"off"` (`"none"`, `"0"`).
@@ -104,7 +107,9 @@ pub fn check_kerning(p: &Value) -> std::result::Result<(), String> {
     }
 }
 
-/// Validates text metrics that can otherwise exceed the rasterizer's supported range.
+/// Validates text metrics (size, tracking, leading, baseline shift, scales) that can otherwise
+/// exceed the rasterizer's supported range or overflow `f32`, which a .pcraft manifest cannot hold,
+/// and the superscript/subscript `baseline`, so a typo is an error rather than a reset to Normal.
 pub fn check_size_tracking(p: &Value) -> std::result::Result<(), String> {
     if let Some(v) = p.get("size") {
         match v.as_f64() {
@@ -116,6 +121,35 @@ pub fn check_size_tracking(p: &Value) -> std::result::Result<(), String> {
         match v.as_f64() {
             Some(tracking) if tracking.is_finite() && (TRACKING_MIN..=TRACKING_MAX).contains(&tracking) => {}
             _ => return Err(format!("tracking must be between {TRACKING_MIN} and {TRACKING_MAX} (1/1000 em)")),
+        }
+    }
+    if let Some(v) = p.get("leading") {
+        let (min, max) = (f64::from(LEADING_MIN_PT), f64::from(LEADING_MAX_PT));
+        match v {
+            Value::Null => {}
+            Value::String(a) if a == "auto" => {}
+            Value::Number(n) if n.as_f64().is_some_and(|x| x.is_finite() && (min..=max).contains(&x)) => {}
+            _ => return Err(format!("leading must be between {min} and {max} pt, or \"auto\"")),
+        }
+    }
+    if let Some(v) = p.get("baselineShift") {
+        let max = f64::from(BASELINE_SHIFT_MAX_PT);
+        match v.as_f64() {
+            Some(shift) if shift.is_finite() && shift.abs() <= max => {}
+            _ => return Err(format!("baselineShift must be between -{max} and {max} pt")),
+        }
+    }
+    if let Some(v) = p.get("baseline").filter(|v| !v.is_null())
+        && !matches!(v.as_str(), Some("normal" | "superscript" | "subscript"))
+    {
+        return Err("baseline must be \"normal\", \"superscript\" or \"subscript\"".into());
+    }
+    for key in ["horizontalScale", "verticalScale"] {
+        if let Some(v) = p.get(key) {
+            match v.as_f64() {
+                Some(scale) if scale.is_finite() && (0.0..=SCALE_MAX_PERCENT).contains(&scale) => {}
+                _ => return Err(format!("{key} must be between 0 and {SCALE_MAX_PERCENT} %")),
+            }
         }
     }
     Ok(())
@@ -133,6 +167,81 @@ fn installed_postscript(family: &str, weight: u16, italic: bool) -> Option<Strin
     face.postscript_name.clone()
 }
 
+/// Photoshop's leading range in points.
+pub const LEADING_MIN_PT: f32 = 0.01;
+pub const LEADING_MAX_PT: f32 = 5000.0;
+/// Photoshop's baseline shift range in points (either direction).
+pub const BASELINE_SHIFT_MAX_PT: f32 = 5000.0;
+/// The relative character steps `type.setStyle` accepts, with the largest step allowed.
+const STEP_KEYS: [(&str, f64); 3] = [("leadingBy", 5000.0), ("baselineShiftBy", 10_000.0), ("trackingBy", 11_000.0)];
+
+/// Validates the relative steps (`leadingBy`, `baselineShiftBy`, `trackingBy`): finite numbers
+/// no larger than the whole range they move through.
+pub fn check_steps(p: &Value) -> std::result::Result<(), String> {
+    for (key, max) in STEP_KEYS {
+        if let Some(v) = p.get(key) {
+            match v.as_f64() {
+                Some(by) if by.is_finite() && by.abs() <= max => {}
+                _ => return Err(format!("{key} must be a number between -{max} and {max}")),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Relative character steps (Photoshop's ⌥↑/↓ leading, ⇧⌥↑/↓ baseline shift and ⌥←/→ tracking
+/// over a selection): every character moves from its own value, so mixed values keep their
+/// differences. Auto leading starts from the value layout uses, the paragraph's auto-leading
+/// percentage of the character's size. Results are clamped to Photoshop's ranges. Returns true
+/// if any step key was present.
+fn step_char_metrics(t: &mut TextLayer, a: usize, b: usize, p: &Value) -> bool {
+    let leading_by = f32p(p, "leadingBy").filter(|v| v.is_finite());
+    let shift_by = f32p(p, "baselineShiftBy").filter(|v| v.is_finite());
+    let tracking_by = f32p(p, "trackingBy").filter(|v| v.is_finite());
+    if leading_by.is_none() && shift_by.is_none() && tracking_by.is_none() {
+        return false;
+    }
+    let paragraphs = t.paragraph_runs();
+    let default_auto = ParagraphStyle::default().auto_leading;
+    // Each paragraph's share of `a..b`, with the auto leading it lays out with.
+    let mut pieces = Vec::new();
+    let mut at = 0usize;
+    for pr in &paragraphs {
+        let (ps, pe) = (at, at.saturating_add(pr.len));
+        at = pe;
+        let (pa, pb) = (a.clamp(ps, pe), b.clamp(ps, pe));
+        if pa < pb {
+            pieces.push((pa, pb, pr.style.auto_leading));
+        }
+    }
+    if at < b {
+        pieces.push((a.max(at), b, default_auto));
+    }
+    if t.text.is_empty() {
+        // Empty text: the step sets the style the next typed characters get.
+        pieces = vec![(0, 0, paragraphs.first().map_or(default_auto, |r| r.style.auto_leading))];
+    }
+    for (pa, pb, auto) in pieces {
+        style_range(t, pa, pb, &|st| {
+            if let Some(by) = leading_by {
+                let auto = if auto.is_finite() && auto > 0.0 { auto } else { default_auto };
+                let base = st.leading_pt.unwrap_or(auto * st.size_pt);
+                let base = if base.is_finite() { base } else { 0.0 };
+                st.leading_pt = Some((base + by).clamp(LEADING_MIN_PT, LEADING_MAX_PT));
+            }
+            if let Some(by) = shift_by {
+                let base = if st.baseline_shift_pt.is_finite() { st.baseline_shift_pt } else { 0.0 };
+                st.baseline_shift_pt = (base + by).clamp(-BASELINE_SHIFT_MAX_PT, BASELINE_SHIFT_MAX_PT);
+            }
+            if let Some(by) = tracking_by {
+                let base = if st.tracking.is_finite() { st.tracking } else { 0.0 };
+                st.tracking = (base + by).clamp(TRACKING_MIN as f32, TRACKING_MAX as f32);
+            }
+        });
+    }
+    true
+}
+
 /// Applies character-style keys from JSON. Returns true if any key was present.
 pub fn apply_char_props(s: &mut CharStyle, p: &Value) -> bool {
     let mut any = false;
@@ -141,6 +250,19 @@ pub fn apply_char_props(s: &mut CharStyle, p: &Value) -> bool {
     if let Some(v) = p.get("font").or_else(|| p.get("family")).and_then(Value::as_str) {
         s.font_family = v.to_string();
         s.postscript_name = None;
+        // Photoshop accepts either a family name or a face's PostScript name in the font field.
+        // Resolve only exact PostScript matches here so an unknown family remains untouched.
+        let mut text = photocraft_text::shared().lock().unwrap_or_else(|e| e.into_inner());
+        if !text.fonts.has_family(v) {
+            let resolved = text.fonts.resolve_postscript(v);
+            if resolved.exact {
+                s.variations.retain(|f| f.axis != "wght");
+                s.font_family = resolved.family;
+                s.weight = resolved.weight;
+                s.italic = resolved.italic;
+                s.postscript_name = Some(v.to_string());
+            }
+        }
         hit(true);
     }
     if let Some(v) = p.get("fontStyle").and_then(Value::as_str) {
@@ -260,6 +382,19 @@ pub fn apply_char_props(s: &mut CharStyle, p: &Value) -> bool {
             _ => Caps::Normal,
         };
         hit(true);
+    }
+    if let Some(v) = p.get("baseline").and_then(Value::as_str) {
+        let baseline = match v {
+            "superscript" => Some(FontBaseline::Superscript),
+            "subscript" => Some(FontBaseline::Subscript),
+            "normal" => Some(FontBaseline::Normal),
+            _ => None,
+        };
+        // An unknown value keeps the style (the commands reject it in `check_size_tracking`).
+        if let Some(b) = baseline {
+            s.baseline = b;
+            hit(true);
+        }
     }
     if let Some(Value::Object(m)) = p.get("features") {
         for (tag, v) in m {
@@ -402,8 +537,9 @@ pub fn style_paragraphs(t: &mut TextLayer, a: usize, b: usize, f: &dyn Fn(&mut P
     t.paragraphs = out.into_iter().map(|(len, style)| ParagraphRun { len, style }).collect();
 }
 
-/// Replaces bytes `a..b` with `new`, keeping styles: inserted text takes the style of the
-/// character before it (or after it at the start).
+/// Replaces bytes `a..b` with `new`, keeping styles: replacing a selection keeps the style of its
+/// first character (as Photoshop does, so retyping a smaller second line stays small); inserting
+/// at a caret takes the style of the character before it (or after it at the start).
 pub fn replace_text(t: &mut TextLayer, a: usize, b: usize, new: &str) {
     fn adjust<S: Clone + PartialEq>(runs: Vec<(usize, S)>, a: usize, b: usize, ins: usize, trailing_paragraph: bool) -> Vec<(usize, S)> {
         let mut out: Vec<(usize, S)> = Vec::new();
@@ -419,7 +555,15 @@ pub fn replace_text(t: &mut TextLayer, a: usize, b: usize, new: &str) {
                     *acc += r.0;
                     Some((s, s + r.0))
                 })
-                .position(|(s, e)| if a == 0 { e > 0 || s == 0 } else { a > s && a <= e })
+                .position(|(s, e)| {
+                    if a == 0 {
+                        e > 0 || s == 0
+                    } else if a < b {
+                        a >= s && a < e
+                    } else {
+                        a > s && a <= e
+                    }
+                })
                 .unwrap_or(0)
         };
         for (i, (len, st)) in runs.into_iter().enumerate() {
@@ -459,26 +603,37 @@ pub fn replace_text(t: &mut TextLayer, a: usize, b: usize, new: &str) {
 
 /// Re-renders the layer's pixels and regenerates its PSD `TySh` data.
 pub fn refresh(doc: &Document, t: &mut TextLayer) {
-    let dpi = doc.resolution_dpi;
+    refresh_at(doc.resolution_dpi, doc.pixel_format(), t);
+}
+
+/// [`refresh`] given only the two things it reads from the document: its resolution and its
+/// pixel format. A caller holding the layer mutably reads them first instead of cloning the whole
+/// document to pass it, once per keystroke and pointer move while typing (#7092).
+pub fn refresh_at(dpi: f32, format: PixelFormat, t: &mut TextLayer) {
     let mut eng = photocraft_text::shared().lock().unwrap_or_else(|e| e.into_inner());
-    let (layout, r) = eng.render(t, dpi, doc.pixel_format());
+    let (layout, r) = eng.render(t, dpi, format);
     t.cache = Some(r.surface);
     t.psd_raw = Some(Arc::new(photocraft_text::psd::build_tysh(t, dpi, layout.bounds())));
 }
 
+/// Refuses to change a type layer under Lock All (its own or an enclosing group's), with
+/// Photoshop's message. Every command that edits a type layer's text calls it first (#3132, #4188).
+pub(crate) fn check_text_unlocked(doc: &Document, id: LayerId) -> Result<()> {
+    let layer = doc.layer(id).ok_or(EngineError::NoLayer(id))?;
+    if doc.effective_locks(id).all {
+        return Err(EngineError::Other(format!("Could not complete your request because the layer \"{}\" is locked", layer.name)));
+    }
+    Ok(())
+}
+
 /// Runs `f` on a type layer as one undo step. `f` may set an explicit layer name (`type.edit`'s
 /// `name`), which is applied in the same step; otherwise an auto-named layer follows its text.
-fn with_text_layer<R>(s: &mut Session, p: &Value, label: &str, f: impl FnOnce(&mut TextLayer, &Document, &mut Option<String>) -> Result<R>) -> Result<R> {
+/// `f` gets the document's resolution (dpi).
+fn with_text_layer<R>(s: &mut Session, p: &Value, label: &str, f: impl FnOnce(&mut TextLayer, f32, &mut Option<String>) -> Result<R>) -> Result<R> {
     let id = layer_id(s, p)?;
-    {
-        let doc = &s.active().ok_or(EngineError::NoDocument)?.doc;
-        let layer = doc.layer(id).ok_or(EngineError::NoLayer(id))?;
-        if doc.effective_locks(id).all {
-            return Err(EngineError::Other(format!("Could not complete your request because the layer \"{}\" is locked", layer.name)));
-        }
-    }
+    check_text_unlocked(&s.active().ok_or(EngineError::NoDocument)?.doc, id)?;
     let (r, damage) = s.edit(label, |doc, _| {
-        let snapshot = doc.clone();
+        let (dpi, format) = (doc.resolution_dpi, doc.pixel_format());
         let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
         let auto_named = is_auto_named(l);
         let LayerContent::Text(t) = &mut l.content else {
@@ -486,8 +641,8 @@ fn with_text_layer<R>(s: &mut Session, p: &Value, label: &str, f: impl FnOnce(&m
         };
         let before = t.cache.as_ref().map(|c| c.tile_bounds());
         let mut rename = None;
-        let r = f(t, &snapshot, &mut rename)?;
-        refresh(&snapshot, t);
+        let r = f(t, dpi, &mut rename)?;
+        refresh_at(dpi, format, t);
         // Only this layer's pixels changed: the canvas recomposites their old and new area
         // instead of the whole document (#124). Unknown old pixels mean a full refresh.
         let damage = before.zip(t.cache.as_ref().map(|c| c.tile_bounds())).map(|(a, b)| a.union(&b));
@@ -549,15 +704,19 @@ pub(crate) fn with_text_targets(
     mut f: impl FnMut(&mut TextLayer, (usize, usize)) -> Result<()>,
 ) -> Result<Vec<LayerId>> {
     let ids = format_targets(s, p)?;
+    let doc = &s.active().ok_or(EngineError::NoDocument)?.doc;
+    for id in &ids {
+        check_text_unlocked(doc, *id)?;
+    }
     let damage = s.edit(label, |doc, _| {
-        let snapshot = doc.clone();
+        let (dpi, format) = (doc.resolution_dpi, doc.pixel_format());
         let mut damage = Some(photocraft_geom::Rect::EMPTY);
         for id in &ids {
             let Some(LayerContent::Text(t)) = doc.layer_mut(*id).map(|l| &mut l.content) else { return Err(EngineError::NoLayer(*id)) };
             let before = t.cache.as_ref().map(|c| c.tile_bounds());
             let range = if p.get("layers").is_none() || p.get("layer").is_some() { range_param(&t.text, p) } else { (0, t.text.len()) };
             f(t, range)?;
-            refresh(&snapshot, t);
+            refresh_at(dpi, format, t);
             // An unknown old/new cache retains Session.edit's full-refresh fallback.
             damage = damage.zip(before).zip(t.cache.as_ref().map(|c| c.tile_bounds())).map(|((all, a), b)| all.union(&a).union(&b));
         }
@@ -578,7 +737,7 @@ fn shown_style_params<'a>(t: &TextLayer, p: &'a Value) -> Result<std::borrow::Co
     let scale = (m[0] * m[3] - m[1] * m[2]).abs().sqrt() as f32;
     let scale = if scale.is_finite() && scale > 1e-3 { f64::from(scale) } else { 1.0 };
     let mut params = p.clone();
-    for key in ["size", "leading"] {
+    for key in ["size", "leading", "leadingBy"] {
         if let Some(value) = p.get(key).and_then(Value::as_f64) {
             let value = value / scale;
             if !value.is_finite() || value.abs() > f64::from(f32::MAX) {
@@ -664,6 +823,7 @@ fn info(s: &Session, p: &Value) -> Result<Value> {
 /// paragraph `box`, `orientation`, character and paragraph keys, starting from the default type
 /// styles in the foreground colour. Shared with the Type Mask tools' `type.createSelection`.
 pub(crate) fn new_text_layer(s: &Session, p: &Value, cmd: &str) -> Result<TextLayer> {
+    crate::commands::check_f32_values(cmd, p)?;
     let orientation = match p.get("orientation") {
         None => Orientation::Horizontal,
         Some(Value::String(value)) if value == "horizontal" => Orientation::Horizontal,
@@ -706,7 +866,7 @@ pub(crate) fn new_text_layer(s: &Session, p: &Value, cmd: &str) -> Result<TextLa
     Ok(t)
 }
 
-const CHAR_PARAMS: &str = r##""font":str,"fontStyle":str,"weight":100..900,"italic":bool,"size":0.1..=1296 pt,"color":"#rrggbb"|[r,g,b,a],"tracking":-1000..=10000 (1/1000 em),"leading":pt|"auto","baselineShift":pt,"horizontalScale":%,"verticalScale":%,"underline":bool,"strikethrough":bool,"fauxBold":bool,"fauxItalic":bool,"kerning":1/1000em (manual, after each character)|"metrics"|"optical"|"off","caps":"normal|small|all","ligatures":bool,"discretionaryLigatures":bool,"features":{"ss01":1},"variations":{"wght":650},"language":str"##;
+const CHAR_PARAMS: &str = r##""font":str,"fontStyle":str,"weight":100..900,"italic":bool,"size":0.1..=1296 pt,"color":"#rrggbb"|[r,g,b,a],"tracking":-1000..=10000 (1/1000 em),"leading":pt|"auto","baselineShift":pt,"horizontalScale":%,"verticalScale":%,"underline":bool,"strikethrough":bool,"fauxBold":bool,"fauxItalic":bool,"kerning":1/1000em (manual, after each character)|"metrics"|"optical"|"off","caps":"normal|small|all","baseline":"normal|superscript|subscript","ligatures":bool,"discretionaryLigatures":bool,"features":{"ss01":1},"variations":{"wght":650},"language":str"##;
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -777,7 +937,7 @@ pub fn specs() -> Vec<CommandSpec> {
                     }
                 };
                 let label = if kern_pair.is_some() { "Kerning" } else { "Edit Type" };
-                with_text_layer(s, p, label, |t, doc, rename| {
+                with_text_layer(s, p, label, |t, dpi, rename| {
                     if let Some((at, by)) = kern_pair {
                         // Photoshop's Alt+←/→: the pair before the caret becomes manually kerned,
                         // starting from what it shows now (its metrics/optical or manual value).
@@ -789,7 +949,7 @@ pub fn specs() -> Vec<CommandSpec> {
                         let b = byte_at(&t.text, at);
                         let now = {
                             let mut eng = photocraft_text::shared().lock().unwrap_or_else(|e| e.into_inner());
-                            eng.pair_kerning(t, doc.resolution_dpi, a)
+                            eng.pair_kerning(t, dpi, a)
                         }
                         .ok_or_else(|| bad("type.edit", "no kerning pair at the caret (line break or line end)"))?;
                         let value = (f64::from(now.round()) + by).clamp(KERN_MIN, KERN_MAX) as f32;
@@ -864,13 +1024,14 @@ pub fn specs() -> Vec<CommandSpec> {
             menu: &[],
             shortcut: None,
             params: Box::leak(
-                format!(r##"{{"layer":id? or "layers":[id,…]? (default selected Type layers),"range":[startChar,endChar]? (single layer; default all),"metricsAsShown":bool=false (size/leading include each layer's transform scale), {CHAR_PARAMS}, paragraph keys: "align":"left|center|right|justify|justifyCenter|justifyRight|justifyAll","firstLineIndent":pt,"startIndent":pt,"endIndent":pt,"spaceBefore":pt,"spaceAfter":pt,"autoLeading":%,"direction":"auto|ltr|rtl","hyphenate":bool}}"##)
+                format!(r##"{{"layer":id? or "layers":[id,…]? (default selected Type layers),"range":[startChar,endChar]? (single layer; default all),"metricsAsShown":bool=false (size/leading/leadingBy include each layer's transform scale), {CHAR_PARAMS}, relative steps from each character's own value: "leadingBy":pt (auto leading starts from its laid-out value; result 0.01..=5000),"baselineShiftBy":pt (result -5000..=5000),"trackingBy":1/1000 em (result -1000..=10000), paragraph keys: "align":"left|center|right|justify|justifyCenter|justifyRight|justifyAll","firstLineIndent":pt,"startIndent":pt,"endIndent":pt,"spaceBefore":pt,"spaceAfter":pt,"autoLeading":%,"direction":"auto|ltr|rtl","hyphenate":bool}}"##)
                     .into_boxed_str(),
             ),
             enabled: has_doc,
             journal: true,
             run: |s, p| {
                 check_kerning(p).map_err(|m| bad("type.setStyle", m))?;
+                check_steps(p).map_err(|m| bad("type.setStyle", m))?;
                 let ids = with_text_targets(s, p, "Set Type Style", |t, (a, b)| {
                     let props = shown_style_params(t, p)?;
                     check_size_tracking(&props).map_err(|m| bad("type.setStyle", m))?;
@@ -880,6 +1041,7 @@ pub fn specs() -> Vec<CommandSpec> {
                             apply_char_props(st, &props);
                         });
                     }
+                    step_char_metrics(t, a, b, &props);
                     let mut pprobe = ParagraphStyle::default();
                     if apply_para_props(&mut pprobe, p) {
                         style_paragraphs(t, a, b, &|st| {
@@ -903,16 +1065,16 @@ pub fn specs() -> Vec<CommandSpec> {
             run: |s, p| {
                 let id = layer_id(s, p)?;
                 s.edit("Rasterize Type", |doc, _| {
-                    let snapshot = doc.clone();
+                    let (dpi, format) = (doc.resolution_dpi, doc.pixel_format());
                     let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
                     let LayerContent::Text(t) = &mut l.content else {
                         return Err(EngineError::Other(format!("layer {} is not a type layer", id.0)));
                     };
                     if t.cache.is_none() {
-                        refresh(&snapshot, t);
+                        refresh_at(dpi, format, t);
                     }
-                    let surface = t.cache.take().unwrap_or_else(|| photocraft_raster::Surface::new(snapshot.pixel_format()));
-                    let surface = if surface.format() == snapshot.pixel_format() { surface } else { surface.convert(snapshot.pixel_format()) };
+                    let surface = t.cache.take().unwrap_or_else(|| photocraft_raster::Surface::new(format));
+                    let surface = if surface.format() == format { surface } else { surface.convert(format) };
                     l.content = LayerContent::Raster(surface);
                     l.psd_blocks.retain(|(k, _)| k != b"TySh");
                     Ok(())
@@ -1103,7 +1265,7 @@ mod tests {
             st.saved_revision = st.revision;
         }
         let rev = s.active().unwrap().revision;
-        let unknown = [(doc_id, LayerId(9999)), (photocraft_doc::DocId(u64::MAX), id)];
+        let unknown = [(doc_id, LayerId(u64::MAX)), (photocraft_doc::DocId(u64::MAX), id)];
         assert!(s.refresh_type_layers(&[&[(doc_id, id)][..], &unknown].concat()).is_empty());
         assert!(text_layer(&s, id.0).cache.is_some());
         let st = s.active().unwrap();
@@ -1304,6 +1466,35 @@ mod tests {
     }
 
     #[test]
+    fn all_locked_type_layer_rejects_formatting_without_history() {
+        let mut s = session();
+        let id = s.execute("type.create", json!({"x": 20, "y": 20, "text": "a", "size": 12})).unwrap()["layer"].as_u64().unwrap();
+        let other = s.execute("type.create", json!({"x": 20, "y": 60, "text": "b", "size": 12})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("layer.setProps", json!({"layer": id, "locked": true})).unwrap();
+        let before = text_layer(&s, id);
+        let history = s.active().unwrap().history.past_len();
+
+        for (cmd, p) in [
+            ("type.setStyle", json!({"layer": id, "size": 40, "fauxBold": true})),
+            ("type.setStyle", json!({"layers": [other, id], "size": 40})),
+            ("type.warpText", json!({"layer": id, "style": "arc"})),
+            ("type.antiAlias.none", json!({"layer": id})),
+            ("type.orientation.vertical", json!({"layer": id})),
+            ("type.openType.swash", json!({"layer": id})),
+        ] {
+            let result = s.execute(cmd, p);
+            assert!(matches!(&result, Err(EngineError::Other(message)) if message.contains("locked")), "{cmd}: {result:?}");
+        }
+        assert_eq!(text_layer(&s, id), before);
+        assert_eq!(text_layer(&s, other).size_pt, 12.0);
+        assert_eq!(s.active().unwrap().history.past_len(), history);
+
+        s.execute("layer.setProps", json!({"layer": id, "locked": false})).unwrap();
+        s.execute("type.setStyle", json!({"layer": id, "size": 40})).unwrap();
+        assert_eq!(text_layer(&s, id).size_pt, 40.0);
+    }
+
+    #[test]
     fn trailing_empty_paragraph_styles_without_changing_previous_lines() {
         let mut s = session();
         let id = s.execute("type.create", json!({"text":"a\nb\n","x":20,"y":20,"size":12,"font":"Inter","align":"left"})).unwrap()["layer"].as_u64().unwrap();
@@ -1436,6 +1627,42 @@ mod tests {
         assert_eq!(t.runs.len(), 1);
         assert_eq!(t.runs[0].len, 3);
         assert_eq!(t.runs[0].style.size_pt, 40.0);
+    }
+
+    /// Replacing a selected smaller second line (by typing or pasting) keeps its size, not the
+    /// first line's, whose line break precedes the selection.
+    #[test]
+    fn replacing_a_selection_keeps_its_first_characters_style() {
+        let mut s = session();
+        let id = s.execute("type.create", json!({"x": 5, "y": 50, "text": "BIG\nsmall", "size": 40})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("type.edit", json!({"layer": id, "runs": [{"start": 4, "end": 9, "size": 12}]})).unwrap();
+        s.execute("type.edit", json!({"layer": id, "replace": {"start": 4, "end": 9, "text": "AIR"}})).unwrap();
+        let sizes = |s: &Session| text_layer(s, id).char_runs().iter().map(|r| (r.len, r.style.size_pt)).collect::<Vec<_>>();
+        assert_eq!(text_layer(&s, id).text, "BIG\nAIR");
+        assert_eq!(sizes(&s), [(4, 40.0), (3, 12.0)]);
+        // A mixed selection takes its first character's style.
+        s.execute("type.edit", json!({"layer": id, "replace": {"start": 2, "end": 6, "text": "xy"}})).unwrap();
+        assert_eq!(sizes(&s), [(4, 40.0), (1, 12.0)]);
+        // Inserting at a caret still follows the character before it.
+        s.execute("type.edit", json!({"layer": id, "replace": {"start": 4, "end": 4, "text": "!"}})).unwrap();
+        assert_eq!(sizes(&s), [(5, 40.0), (1, 12.0)]);
+    }
+
+    /// A misspelt `baseline` is an error and keeps superscript, instead of resetting it to Normal.
+    #[test]
+    fn unknown_baseline_is_rejected_and_keeps_the_style() {
+        let mut s = session();
+        let id = s.execute("type.create", json!({"x": 5, "y": 50, "text": "x2", "size": 30})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("type.setStyle", json!({"layer": id, "range": [1, 2], "baseline": "superscript"})).unwrap();
+        let before = text_layer(&s, id).runs;
+        for b in [json!("superscipt"), json!("Superscript"), json!(1)] {
+            assert!(matches!(s.execute("type.setStyle", json!({"layer": id, "baseline": b})), Err(EngineError::BadParams { .. })), "{b}");
+            assert!(s.execute("type.edit", json!({"layer": id, "baseline": b})).is_err(), "{b}");
+            assert!(s.execute("type.create", json!({"x": 0, "y": 10, "text": "a", "baseline": b})).is_err(), "{b}");
+        }
+        assert_eq!(text_layer(&s, id).runs, before);
+        s.execute("type.setStyle", json!({"layer": id, "baseline": "normal"})).unwrap();
+        assert!(text_layer(&s, id).char_runs().iter().all(|r| r.style.baseline == FontBaseline::Normal));
     }
 
     fn kerning_of(s: &Session, id: u64) -> Vec<(Kerning, f32)> {
@@ -1611,5 +1838,60 @@ mod tests {
                 "font 'StillNoSuchFamily456' is not installed; text may render using a fallback face"
             ])
         );
+    }
+
+    /// `leadingBy`, `baselineShiftBy` and `trackingBy` step every character from its own value
+    /// (auto leading from its laid-out value), clamp to Photoshop's ranges, and reject hostile
+    /// steps without changing anything.
+    #[test]
+    fn relative_steps_move_each_character_from_its_own_value() {
+        let mut s = session();
+        let id = s.execute("type.create", json!({"x": 0, "y": 40, "text": "Hello\nworld", "size": 10})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("type.setStyle", json!({"layer": id, "range": [8, 11], "leading": 30, "tracking": 50})).unwrap();
+        s.execute("type.setStyle", json!({"layer": id, "range": [6, 11], "autoLeading": 150})).unwrap();
+        let steps = s.active().unwrap().history.entries().len();
+        s.execute("type.setStyle", json!({"layer": id, "range": [0, 11], "leadingBy": 2, "baselineShiftBy": -2, "trackingBy": 20})).unwrap();
+        assert_eq!(s.active().unwrap().history.entries().len(), steps + 1, "one history step");
+        let t = text_layer(&s, id);
+        let at = |c: usize| {
+            let byte = byte_at(&t.text, c);
+            let mut off = 0;
+            t.char_runs()
+                .into_iter()
+                .find(|r| {
+                    off += r.len;
+                    off > byte
+                })
+                .unwrap()
+                .style
+        };
+        // Auto leading 120% × 10 pt (first paragraph), 150% × 10 pt (second), and a set 30 pt.
+        assert_eq!(at(0).leading_pt, Some(14.0));
+        assert_eq!(at(6).leading_pt, Some(17.0));
+        assert_eq!(at(9).leading_pt, Some(32.0));
+        assert_eq!((at(0).baseline_shift_pt, at(9).baseline_shift_pt), (-2.0, -2.0));
+        assert_eq!((at(0).tracking, at(9).tracking), (20.0, 70.0));
+        // Clamped to the ranges.
+        s.execute("type.setStyle", json!({"layer": id, "leadingBy": -5000, "baselineShiftBy": 10000, "trackingBy": -11000})).unwrap();
+        let t = text_layer(&s, id);
+        assert!(t.char_runs().iter().all(|r| r.style.leading_pt == Some(LEADING_MIN_PT)
+            && r.style.baseline_shift_pt == BASELINE_SHIFT_MAX_PT
+            && r.style.tracking == TRACKING_MIN as f32));
+        // A collapsed range in non-empty text changes no character.
+        let before = text_layer(&s, id).char_runs();
+        s.execute("type.setStyle", json!({"layer": id, "range": [3, 3], "trackingBy": 100})).unwrap();
+        assert_eq!(text_layer(&s, id).char_runs(), before);
+        // Hostile steps are refused.
+        let steps = s.active().unwrap().history.entries().len();
+        for bad_step in [json!({"leadingBy": "up"}), json!({"trackingBy": 1e30}), json!({"baselineShiftBy": null}), json!({"leadingBy": [1]})] {
+            let mut p = bad_step.clone();
+            p["layer"] = json!(id);
+            assert!(matches!(s.execute("type.setStyle", p), Err(EngineError::BadParams { .. })), "{bad_step}");
+        }
+        assert_eq!(s.active().unwrap().history.entries().len(), steps);
+        // Empty text: the step sets the style the next typed characters get.
+        let empty = s.execute("type.create", json!({"x": 0, "y": 80, "text": "", "size": 10})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("type.setStyle", json!({"layer": empty, "range": [0, 0], "leadingBy": -2})).unwrap();
+        assert_eq!(text_layer(&s, empty).char_runs()[0].style.leading_pt, Some(10.0));
     }
 }

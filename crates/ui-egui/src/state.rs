@@ -3,6 +3,74 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Photoshop-style Layers panel display preferences; part of serialized UI state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum LayerThumbnailSize {
+    None,
+    Small,
+    #[default]
+    Medium,
+    Large,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum LayerThumbnailContents {
+    LayerBounds,
+    #[default]
+    EntireDocument,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct LayersPanelOptions {
+    pub thumbnail_size: LayerThumbnailSize,
+    /// Thumbnail Contents in the Panel Options dialog. Not saved with these options: the dialog
+    /// shows and sets `interface.clipThumbnailsToLayerBounds` (Layer Bounds = clipped, #4281),
+    /// which the panel menu's Clip Thumbnails to Layer Bounds toggles too.
+    #[serde(skip)]
+    pub thumbnail_contents: LayerThumbnailContents,
+    pub show_filters: bool,
+    pub use_default_masks_on_fill_layers: bool,
+    pub expand_new_effects: bool,
+    pub add_copy_to_copied_layers_and_groups: bool,
+    pub preview_on_canvas_when_reordering_layers: bool,
+    pub show_layer_mask_badges: bool,
+}
+
+impl LayersPanelOptions {
+    /// Every option at the Photoshop default: Medium thumbnails, filters shown, new effects expanded, no mask badges.
+    pub fn defaults() -> Self {
+        Self {
+            thumbnail_size: LayerThumbnailSize::Medium,
+            thumbnail_contents: LayerThumbnailContents::EntireDocument,
+            show_filters: true,
+            use_default_masks_on_fill_layers: true,
+            expand_new_effects: true,
+            add_copy_to_copied_layers_and_groups: true,
+            preview_on_canvas_when_reordering_layers: true,
+            show_layer_mask_badges: false,
+        }
+    }
+}
+
+impl Default for LayersPanelOptions {
+    /// Same as [`LayersPanelOptions::defaults`], so serde fills missing fields with the Photoshop defaults.
+    fn default() -> Self {
+        Self::defaults()
+    }
+}
+
+/// Pending dialog data is transient: Cancel never changes persisted options.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LayersPanelDialog {
+    PanelOptions(LayersPanelOptions),
+    NewLayer(String),
+    NewGroup(String),
+    LockLayers { transparency: bool, pixels: bool, position: bool, artboard: bool, all: bool },
+}
+
 /// Shared selection and capture for a point curve; document parameters remain with the host.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -389,6 +457,9 @@ pub struct Panels {
     /// Window › Brush Settings (F5): floating, like Photoshop's.
     #[serde(default)]
     pub brush_settings: bool,
+    /// Window › Brushes: dockable panel, like Photoshop's.
+    #[serde(default)]
+    pub brushes: bool,
     /// Window › Character / Paragraph: the Character | Paragraph dock group (#150).
     #[serde(default)]
     pub character: bool,
@@ -401,6 +472,10 @@ pub struct Panels {
     /// What Tab hid (toolbar, options bar, dock), so a second Tab brings back just those.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hidden_by_tab: Option<[bool; 3]>,
+    /// Tab in Full Screen Mode shows the menu bar, toolbar, options bar and dock over the canvas
+    /// (#6760). Only a view of the moment: not saved, and the panels' own flags stay untouched.
+    #[serde(skip)]
+    pub full_screen_chrome: bool,
     /// The right dock's icon rail. An app that embeds PhotoCraft's UI can hide it for a simpler view.
     #[serde(default = "yes")]
     pub rail: bool,
@@ -427,10 +502,12 @@ impl Default for Panels {
             options_bar: true,
             status_bar: true,
             brush_settings: false,
+            brushes: false,
             character: false,
             toolbar_double: false,
             dock: true,
             hidden_by_tab: None,
+            full_screen_chrome: false,
             rail: true,
             menu_bar: true,
             gradient_editor: false,
@@ -479,11 +556,53 @@ pub struct View {
     /// Canvas camera rotation in degrees, wrapped to (−180, 180]. Turns the view, not the pixels.
     #[serde(default)]
     pub rotation: f32,
+    /// Transient presentation state for a discrete zoom command; the target camera above remains
+    /// authoritative and this flag is never persisted.
+    #[serde(skip)]
+    pub(crate) zoom_animating: bool,
+    /// Optional document/screen anchor for a pointer-centred Zoom-tool transition.
+    #[serde(skip)]
+    pub(crate) zoom_anchor: Option<([f64; 2], [f32; 2])>,
+    #[serde(skip)]
+    pub(crate) display_camera: Option<(f32, [f32; 2])>,
+    #[serde(skip)]
+    pub(crate) zoom_transition: Option<ZoomTransition>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ZoomTransition {
+    pub from: (f32, [f32; 2]),
+    pub target: (f32, [f32; 2]),
+    pub started: f64,
+}
+
+impl View {
+    /// Start a discrete zoom only when Animated Zoom is enabled; otherwise discard the
+    /// presentation camera so the requested camera takes effect immediately.
+    pub(crate) fn request_zoom_animation(&mut self, enabled: bool) {
+        self.zoom_animating = enabled;
+        self.zoom_anchor = None;
+        if !enabled {
+            self.zoom_transition = None;
+            self.display_camera = Some((self.zoom, self.center));
+        }
+    }
 }
 
 impl Default for View {
     fn default() -> Self {
-        Self { zoom: 1.0, center: [0.0, 0.0], fit_pending: true, fill_pending: false, doc_size: [0, 0], rotation: 0.0 }
+        Self {
+            zoom: 1.0,
+            center: [0.0, 0.0],
+            fit_pending: true,
+            fill_pending: false,
+            doc_size: [0, 0],
+            rotation: 0.0,
+            zoom_animating: false,
+            zoom_anchor: None,
+            display_camera: None,
+            zoom_transition: None,
+        }
     }
 }
 
@@ -507,7 +626,11 @@ pub struct ToolOptions {
     pub tolerance: f32,
     pub contiguous: bool,
     pub anti_alias: bool,
-    pub sample_all_layers: bool,
+    /// Sample All Layers, kept per tool as in Photoshop (#5524). Stored under a new key, so the
+    /// single shared `sample_all_layers` of older preferences is ignored on load.
+    pub sample_all: SampleAllLayers,
+    /// Object Selection › Object Finder: hovering highlights the object a click selects (#4087).
+    pub object_finder: bool,
     /// Remove tool: the fill goes to a new layer above the target (Photoshop's Create a new layer).
     pub remove_new_layer: bool,
     /// Remove tool: each stroke is filled when released (Photoshop's default). Off, the strokes
@@ -533,6 +656,14 @@ pub struct ToolOptions {
     pub type_size: f32,
     pub type_aa: String,
     pub type_align: String,
+    /// Character/Paragraph panel defaults beyond the options bar, in `type.setStyle`'s
+    /// parameter format. Kept as overrides so saved engine defaults still supply unset fields.
+    /// OpenType features and variable-font axes are merged per tag/axis.
+    #[serde(default)]
+    pub type_style_defaults: serde_json::Map<String, serde_json::Value>,
+    /// Type tool: paragraph direction of new type, "auto" (from the first strong character),
+    /// "ltr" or "rtl" (TYPE-218-2).
+    pub type_direction: String,
     /// Clone Stamp / Healing Brush.
     pub clone_aligned: bool,
     /// Pattern Stamp: lock the tile origin in document space across strokes.
@@ -586,6 +717,10 @@ pub struct ToolOptions {
     /// Freeform Pen › Curve Fit: how far (px) the fitted path may stray from the pointer trace.
     #[serde(default = "default_curve_fit")]
     pub curve_fit: f32,
+    /// Pen › Auto Add/Delete: a Pen click on a segment of the active path adds an anchor there,
+    /// on one of its anchors deletes it (#4144).
+    #[serde(default = "yes")]
+    pub pen_auto_add_delete: bool,
     /// Marquee options bar: "normal" | "fixedRatio" | "fixedSize", with the ratio or size.
     #[serde(default = "default_marquee_style")]
     pub marquee_style: String,
@@ -593,8 +728,13 @@ pub struct ToolOptions {
     pub marquee_width: f32,
     #[serde(default = "one")]
     pub marquee_height: f32,
+    /// The unit Fixed Size's Width and Height show (a [`photocraft_engine::prefs::Unit`] name,
+    /// picked by right-clicking them); the size itself stays in pixels (#7910).
+    #[serde(default = "default_marquee_unit")]
+    pub marquee_unit: String,
     /// Move tool: Auto-Select (with "layer" or "group" target) and Show Transform Controls.
-    /// Auto-Select is on by default, as in current Photoshop; ⌘/Ctrl-click inverts it.
+    /// Auto-Select is on with the "group" target by default, as in current Photoshop;
+    /// ⌘/Ctrl-click inverts it.
     #[serde(default = "yes")]
     pub move_auto_select: bool,
     #[serde(default = "default_move_target")]
@@ -613,6 +753,10 @@ pub struct ToolOptions {
     pub crop_custom_ratio_height: f32,
     #[serde(default = "yes")]
     pub crop_delete: bool,
+    /// Crop options bar › Fill: false = Background (Default), true = Content-Aware Fill (the area a
+    /// rotated or extending crop uncovers is filled from its surroundings, #3823).
+    #[serde(default)]
+    pub crop_content_aware: bool,
     /// Crop W x H x Resolution (`crop_ratio` = "whr", #2443): width and height as typed lengths
     /// with their unit ("4 in", "1024 px"; empty = unset), the resolution ("" = the document's)
     /// and its unit ("px/in" or "px/cm"). See `crop_size`.
@@ -638,8 +782,8 @@ pub struct ToolOptions {
     /// Crop gear menu (#1919): Show Cropped Area and the crop shield. See `crop_shield`.
     #[serde(default)]
     pub crop_shield: crate::crop_shield::CropShield,
-    /// Magic Eraser opacity % (tolerance, anti-alias, contiguous and sample-all are shared with the
-    /// Magic Wand and Paint Bucket).
+    /// Magic Eraser opacity % (tolerance, anti-alias and contiguous are shared with the Magic Wand
+    /// and Paint Bucket).
     pub magic_eraser_opacity: f32,
     /// Background Eraser: sampling (continuous | once | backgroundSwatch), limits (discontiguous |
     /// contiguous | findEdges), tolerance % and Protect Foreground Color.
@@ -706,7 +850,7 @@ fn default_crop_resolution_unit() -> String {
 }
 
 fn default_move_target() -> String {
-    "layer".into()
+    "group".into()
 }
 
 fn default_curve_fit() -> f32 {
@@ -719,6 +863,10 @@ fn default_eraser_mode() -> String {
 
 fn default_marquee_style() -> String {
     "normal".into()
+}
+
+fn default_marquee_unit() -> String {
+    "pixels".into()
 }
 
 fn one() -> f32 {
@@ -734,6 +882,10 @@ fn default_brush_tool() -> Tool {
     Tool::Brush
 }
 
+fn default_layer_filter_mode() -> photocraft_color::BlendMode {
+    photocraft_color::BlendMode::Normal
+}
+
 fn one_u32() -> u32 {
     1
 }
@@ -742,13 +894,61 @@ fn default_eyedropper_sample() -> String {
     "all".into()
 }
 
+/// Each tool's Sample All Layers (the Paint Bucket calls it All Layers). Photoshop keeps one per
+/// tool, all off by default: turning it on for the Magic Wand must not leave Blur or Smudge
+/// copying the composite onto the active layer (#5524). The Mixer Brush keeps its own with the
+/// brush (`MixerSettings`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SampleAllLayers {
+    pub magic_wand: bool,
+    pub quick_selection: bool,
+    pub object_selection: bool,
+    pub paint_bucket: bool,
+    pub magic_eraser: bool,
+    pub spot_healing: bool,
+    pub patch: bool,
+    pub content_aware_move: bool,
+    pub remove: bool,
+    pub blur: bool,
+    pub sharpen: bool,
+    pub smudge: bool,
+}
+
+impl SampleAllLayers {
+    /// `tool`'s setting; false for a tool without the option.
+    pub fn get(mut self, tool: Tool) -> bool {
+        self.slot(tool).is_some_and(|v| *v)
+    }
+
+    /// `tool`'s setting, or `None` for a tool without the option.
+    pub fn slot(&mut self, tool: Tool) -> Option<&mut bool> {
+        Some(match tool {
+            Tool::MagicWand => &mut self.magic_wand,
+            Tool::QuickSelection => &mut self.quick_selection,
+            Tool::ObjectSelection => &mut self.object_selection,
+            Tool::PaintBucket => &mut self.paint_bucket,
+            Tool::MagicEraser => &mut self.magic_eraser,
+            Tool::SpotHealing => &mut self.spot_healing,
+            Tool::Patch => &mut self.patch,
+            Tool::ContentAwareMove => &mut self.content_aware_move,
+            Tool::Remove => &mut self.remove,
+            Tool::Blur => &mut self.blur,
+            Tool::Sharpen => &mut self.sharpen,
+            Tool::Smudge => &mut self.smudge,
+            _ => return None,
+        })
+    }
+}
+
 impl Default for ToolOptions {
     fn default() -> Self {
         Self {
             tolerance: 32.0,
             contiguous: true,
             anti_alias: true,
-            sample_all_layers: false,
+            sample_all: SampleAllLayers::default(),
+            object_finder: true,
             remove_new_layer: false,
             remove_after_each_stroke: true,
             feather: 0.0,
@@ -764,6 +964,8 @@ impl Default for ToolOptions {
             type_size: 48.0,
             type_aa: "sharp".into(),
             type_align: "left".into(),
+            type_style_defaults: serde_json::Map::new(),
+            type_direction: "auto".into(),
             clone_aligned: true,
             pattern_stamp_aligned: true,
             pattern_stamp_impressionist: false,
@@ -796,9 +998,11 @@ impl Default for ToolOptions {
             polygon_sides: 5,
             line_weight: 3.0,
             curve_fit: default_curve_fit(),
+            pen_auto_add_delete: true,
             marquee_style: default_marquee_style(),
             marquee_width: 1.0,
             marquee_height: 1.0,
+            marquee_unit: default_marquee_unit(),
             move_auto_select: true,
             move_target: default_move_target(),
             move_show_transform: false,
@@ -806,6 +1010,7 @@ impl Default for ToolOptions {
             crop_custom_ratio_width: 0.0,
             crop_custom_ratio_height: 0.0,
             crop_delete: true,
+            crop_content_aware: false,
             crop_width: String::new(),
             crop_height: String::new(),
             crop_resolution: String::new(),
@@ -847,10 +1052,12 @@ impl Default for ToolOptions {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TransformMode {
-    /// Free Transform, Scale and Rotate.
+    /// Free Transform and Scale: handles scale, drag outside rotates.
     #[default]
     Free,
-    /// Edge handles skew.
+    /// Edit › Transform › Rotate: handle drags rotate about the reference point (#3941).
+    Rotate,
+    /// Edge and corner handles skew: each moves along one axis.
     Skew,
     /// Corner handles move freely, one at a time; nothing else moves them (no rotating, no
     /// edges) and nothing snaps.
@@ -863,6 +1070,7 @@ impl TransformMode {
     /// The mode an `edit.transform.*` / `edit.freeTransform` menu id starts.
     pub fn for_command(id: &str) -> Self {
         match id {
+            "edit.transform.rotate" => Self::Rotate,
             "edit.transform.skew" => Self::Skew,
             "edit.transform.distort" => Self::Distort,
             "edit.transform.perspective" => Self::Perspective,
@@ -900,13 +1108,17 @@ pub struct TransformSession {
     /// Cancel takes it back and OK folds it into one history step with the transform.
     #[serde(default)]
     pub made: Option<MadeLayer>,
-    /// Edit › Transform › Skew / Distort / Perspective (`Free` for Free Transform).
+    /// Edit › Transform › Rotate / Skew / Distort / Perspective (`Free` for Free Transform and Scale).
     #[serde(default)]
     pub mode: TransformMode,
     /// Edit › Content-Aware Scale (#3096): the box only scales and moves, and OK runs
     /// `edit.contentAwareScale` with these options instead of `edit.transform`.
     #[serde(default)]
     pub content_aware: Option<ContentAwareOptions>,
+    /// The options bar's V (vertical skew, degrees) last typed. Any box can be read as scale,
+    /// skew and rotation with any vertical skew, so the bar keeps showing the typed one.
+    #[serde(default)]
+    pub skew_v: f64,
 }
 
 /// Content-Aware Scale's options bar: Amount, Protect and Protect Skin Tones.
@@ -938,10 +1150,25 @@ pub enum MadeLayer {
     Place,
 }
 
+/// A paragraph-box handle drag: the handle, and the box (text-space) and layer transform as
+/// they were at the press. Every move recomputes from this snapshot, so ⌥ pressed or released
+/// mid-drag mirrors about the centre the box started with — as if it had been held from the
+/// start.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BoxResize {
+    pub handle: u8,
+    pub shape: [f32; 4],
+    pub aff: photocraft_geom::Affine,
+}
+
 /// In-progress inline type editing (Type tool). Offsets are character indices.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TextEdit {
     pub layer: u64,
+    /// Id of the document being edited (layer ids can repeat across documents, e.g. one .pcraft
+    /// opened twice). `None`: the active document.
+    #[serde(default)]
+    pub document: Option<u64>,
     pub caret: usize,
     pub anchor: usize,
     /// History coalescing key: the whole editing session is one "Edit Type Layer" step.
@@ -955,7 +1182,7 @@ pub struct TextEdit {
     pub dragging: bool,
     /// Paragraph-box handle being dragged (0-3 corners from top-left clockwise, 4-7 top/right/bottom/left edges).
     #[serde(skip)]
-    pub resize: Option<u8>,
+    pub resize: Option<BoxResize>,
     /// IME composition in progress: (start, length) in characters. The preedit text lives in the
     /// layer so it lays out like typed text; each IME update replaces it.
     #[serde(skip)]
@@ -1015,6 +1242,17 @@ pub struct DockTabs {
     pub history: usize,
     /// Character | Paragraph.
     pub character: usize,
+    /// Brushes presets.
+    pub brushes: usize,
+}
+
+/// Sliders under the Color panel's field: hue/saturation/brightness or red/green/blue (#7172).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ColorPanelSliderMode {
+    #[default]
+    Hsb,
+    Rgb,
 }
 
 /// Color panel state.
@@ -1023,6 +1261,12 @@ pub struct DockTabs {
 pub struct ColorPanelState {
     /// The panel edits the background colour (its chip was clicked), not the foreground.
     pub background: bool,
+    /// Color Picker › Only Web Colors, kept across opens like Photoshop (#4995).
+    #[serde(default)]
+    pub web_only: bool,
+    /// HSB or RGB sliders under the colour field (#7172).
+    #[serde(default)]
+    pub slider_mode: ColorPanelSliderMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1032,12 +1276,26 @@ pub struct UiState {
     /// one per group: the group's key brings it back, as in Photoshop (#2608).
     #[serde(default)]
     pub group_tools: Vec<Tool>,
+    /// A tool letter still held (spring-loaded tool, #2672): the tool to give back on release.
+    /// Exposed to automation, never restored from settings.
+    #[serde(default, skip_deserializing)]
+    pub spring: Option<crate::spring_tools::Spring>,
     /// Recently opened file paths, most-recent first (File › Open Recent). Capped; de-duplicated.
     #[serde(default)]
     pub recent_files: Vec<String>,
+    /// Recently picked type families, most-recent first (the font menu's Recent group). Capped by
+    /// Preferences ▸ Type ▸ Recent Fonts; de-duplicated.
+    #[serde(default)]
+    pub recent_fonts: Vec<String>,
     /// Inline type editing session, if any.
     #[serde(default)]
     pub text_edit: Option<TextEdit>,
+    /// Clock time in seconds when type cursor blink was last reset (e.g. on keypress/caret move).
+    #[serde(skip)]
+    pub caret_blink_time: f64,
+    /// Tool to restore when an inline type edit session commits or cancels (e.g. Move tool, #1132).
+    #[serde(skip)]
+    pub text_edit_return_tool: Option<Tool>,
     /// Ctrl/Cmd Type-tool gesture, exposed to automation but never restored as a held pointer.
     #[serde(default, skip_deserializing)]
     pub type_transform: Option<TypeTransform>,
@@ -1050,6 +1308,10 @@ pub struct UiState {
     /// Free Transform session, if any.
     #[serde(default)]
     pub transform: Option<TransformSession>,
+    /// The options bar's Maintain Aspect Ratio link is off: W/H change on their own, and handle
+    /// drags stretch freely (⇧ keeps the proportions), as in Photoshop (#4174).
+    #[serde(default)]
+    pub transform_unlinked: bool,
     /// Temporary symmetry-axis editing, exposed to automation but never restored from settings.
     #[serde(default, skip_deserializing)]
     pub symmetry_transform: Option<crate::symmetry_ui::Transform>,
@@ -1095,6 +1357,9 @@ pub struct UiState {
     /// Selection-tool context menu opened by a plain canvas right-click.
     #[serde(default)]
     pub canvas_tool_menu: Option<crate::canvas_tool_menu::CanvasToolMenu>,
+    /// The guide a Move-tool click selected (`guide_select`): drawn blue, Delete removes it.
+    #[serde(default)]
+    pub selected_guide: Option<crate::guide_select::SelectedGuide>,
     /// The brush is a per-tool option (the Brush, the Eraser and every retouching tool each keep
     /// their own size, hardness, tip and dynamics, as in Photoshop): the tool whose brush the
     /// session brush holds, and the other tools' saved brushes.
@@ -1105,17 +1370,38 @@ pub struct UiState {
     /// Pen path under construction.
     #[serde(default)]
     pub pen: Option<crate::vector_ui::PenPath>,
+    /// The document the pen path is drawn on; switching away commits it to that Work Path.
+    #[serde(default)]
+    pub pen_doc: Option<photocraft_doc::DocId>,
     #[serde(default)]
     pub stroke_editor: Option<crate::shape_stroke_ui::StrokeEditor>,
     /// Direct Selection tool: selected anchors and the drag in progress (#790).
     #[serde(default)]
     pub direct_selection: crate::direct_select::DirectSelection,
+    /// A live rectangle's corner radius widget being dragged (TOOL-214-12).
+    #[serde(skip)]
+    pub corner_radius: Option<crate::corner_radius::Drag>,
     /// Selected row in the Paths panel ("work" or a saved path name).
     #[serde(default)]
     pub selected_path: Option<String>,
     /// Layers panel kind filter ("pixel", "adjustment", "type", "shape", "smart"); empty = all.
     #[serde(default)]
     pub layer_filter: Vec<String>,
+    /// Thumbnail dimensions, content cropping and filter-strip visibility.
+    #[serde(default)]
+    pub layers_panel_options: LayersPanelOptions,
+    /// Transient dialog; never restored with a workspace.
+    #[serde(skip)]
+    pub layers_panel_dialog: Option<LayersPanelDialog>,
+    /// Layers panel filter type (#5048): kind (above), name or blend mode.
+    #[serde(default)]
+    pub layer_filter_by: crate::layer_filter_ui::FilterBy,
+    /// Layers panel name filter: part of a layer name, ignoring case; empty = all.
+    #[serde(default)]
+    pub layer_filter_name: String,
+    /// Layers panel blend-mode filter.
+    #[serde(default = "default_layer_filter_mode")]
+    pub layer_filter_mode: photocraft_color::BlendMode,
     /// Actions panel: which row is selected and which are expanded. The list lives on the session.
     #[serde(default)]
     pub actions: crate::actions::ActionsUi,
@@ -1198,6 +1484,10 @@ pub struct UiState {
     /// modifiers held at its first click.
     #[serde(default)]
     pub polygon_mode: String,
+    /// The document the polygon is drawn on (set at its first click): another document becoming
+    /// active drops it (`canvas::polygon_cancel_stale`).
+    #[serde(default)]
+    pub polygon_doc: Option<photocraft_doc::DocId>,
     /// Magnetic Lasso border in progress (`magnetic_lasso_ui`).
     #[serde(default)]
     pub magnetic: crate::magnetic_lasso_ui::MagneticLasso,
@@ -1243,12 +1533,17 @@ impl Default for UiState {
         Self {
             tool: Tool::Brush,
             group_tools: Vec::new(),
+            spring: None,
             recent_files: Vec::new(),
+            recent_fonts: Vec::new(),
             text_edit: None,
+            caret_blink_time: 0.0,
+            text_edit_return_tool: None,
             type_transform: None,
             type_transform_pivot: None,
             cam_transform: None,
             transform: None,
+            transform_unlinked: false,
             symmetry_transform: None,
             layer_picker: None,
             mask_target: false,
@@ -1259,6 +1554,7 @@ impl Default for UiState {
             brush_picker_size: None,
             layer_menu: None,
             canvas_tool_menu: None,
+            selected_guide: None,
             brush_tool: Tool::Brush,
             tool_brushes: Vec::new(),
             clone_source: None,
@@ -1277,9 +1573,16 @@ impl Default for UiState {
             artboard_tool: Default::default(),
             shell: Default::default(),
             layer_filter: Vec::new(),
+            layers_panel_options: LayersPanelOptions::default(),
+            layers_panel_dialog: None,
+            layer_filter_by: Default::default(),
+            layer_filter_name: String::new(),
+            layer_filter_mode: default_layer_filter_mode(),
             pen: None,
+            pen_doc: None,
             stroke_editor: None,
             direct_selection: Default::default(),
+            corner_radius: None,
             selected_path: None,
             panels: Panels::default(),
             views: Vec::new(),
@@ -1303,6 +1606,7 @@ impl Default for UiState {
             tool_options: ToolOptions::default(),
             polygon: Vec::new(),
             polygon_mode: String::new(),
+            polygon_doc: None,
             magnetic: Default::default(),
             crop_rect: None,
             crop_angle: 0.0,
@@ -1366,6 +1670,25 @@ impl UiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sample_all_layers_is_per_tool_and_old_prefs_load() {
+        // The single shared flag of older preferences is dropped: every tool starts off (#5524).
+        let o: ToolOptions = serde_json::from_str(r#"{"sample_all_layers": true, "feather": 3.0}"#).unwrap();
+        assert_eq!((o.sample_all, o.feather), (SampleAllLayers::default(), 3.0));
+        let mut o = ToolOptions::default();
+        o.sample_all.magic_wand = true;
+        let back: ToolOptions = serde_json::from_value(serde_json::to_value(&o).unwrap()).unwrap();
+        assert!(back.sample_all.magic_wand && !back.sample_all.get(Tool::Blur));
+        assert!(!back.sample_all.get(Tool::Brush), "a tool without the option reads false");
+        let mut s = SampleAllLayers::default();
+        assert!(s.slot(Tool::Brush).is_none());
+        for t in [Tool::MagicWand, Tool::PaintBucket, Tool::Blur, Tool::Sharpen, Tool::Smudge, Tool::Remove] {
+            *s.slot(t).unwrap() = true;
+            assert!(s.get(t), "{t:?}");
+        }
+        assert!(!s.get(Tool::QuickSelection));
+    }
 
     #[test]
     fn tool_names_parse() {

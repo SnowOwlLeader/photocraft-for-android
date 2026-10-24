@@ -4,6 +4,8 @@ mod android;
 #[cfg(any(target_os = "android", test))]
 mod documents;
 #[cfg(any(target_os = "android", test))]
+mod encoding;
+#[cfg(any(target_os = "android", test))]
 mod file_browser;
 #[cfg(any(target_os = "android", test))]
 mod pixel_pencil;

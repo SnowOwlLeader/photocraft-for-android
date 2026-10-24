@@ -25,8 +25,7 @@ use crate::widgets;
 /// The engine command the dialog drives.
 pub const COMMAND: &str = "select.colorRange";
 
-/// Select menu entries in Photoshop's order (engine value, label). Skin Tones is left out: the
-/// engine has no skin-tone model.
+/// Select menu entries in Photoshop's order (engine value, label).
 pub const SELECTS: &[(&str, &str)] = &[
     ("sampledColors", "Sampled Colors"),
     ("reds", "Reds"),
@@ -38,6 +37,7 @@ pub const SELECTS: &[(&str, &str)] = &[
     ("highlights", "Highlights"),
     ("midtones", "Midtones"),
     ("shadows", "Shadows"),
+    ("skinTones", "Skin Tones"),
     ("outOfGamut", "Out Of Gamut"),
 ];
 
@@ -82,7 +82,7 @@ pub fn controls(f: &Map<String, Value>) -> Controls {
     let select = s(f, "select", "sampledColors");
     let sampled = select == "sampledColors";
     let tonal = matches!(select, "highlights" | "midtones" | "shadows");
-    Controls { fuzziness: sampled || tonal, sampling: sampled, range: sampled && flag(f, "localized"), tonal }
+    Controls { fuzziness: sampled || tonal || select == "skinTones", sampling: sampled, range: sampled && flag(f, "localized"), tonal }
 }
 
 /// Open the dialog with Photoshop's defaults (Sampled Colors, Fuzziness 40, the foreground colour
@@ -141,6 +141,8 @@ pub fn params(f: &Map<String, Value>) -> Value {
             p.insert("localized".into(), json!(true));
             p.insert("range".into(), json!(num(f, "range", 100.0)));
         }
+    } else if select == "skinTones" {
+        p.insert("fuzziness".into(), json!(num(f, "fuzziness", 40.0)));
     } else if c.tonal {
         p.insert("fuzziness".into(), json!(num(f, "toneFuzziness", 20.0)));
         let range = match select {
@@ -390,7 +392,9 @@ fn radio(ui: &mut egui::Ui, on: bool, label: &str) -> egui::Response {
         if on {
             ui.painter().circle_filled(r.center(), 3.0, t.accent);
         }
-        let l = ui.add(egui::Label::new(egui::RichText::new(tl!(&label)).color(t.text_dim)).sense(Sense::click()));
+        let l = ui
+            .add(egui::Label::new(egui::RichText::new(tl!(&label)).color(t.text_dim)).selectable(false).sense(Sense::click()))
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
         resp.union(l)
     })
     .inner
@@ -645,9 +649,6 @@ pub fn pick_top(app: &mut PhotocraftApp, at: [f64; 2], mods: egui::Modifiers) ->
     if !at[0].is_finite() || !at[1].is_finite() || at[0] < 0.0 || at[1] < 0.0 || at[0] >= f64::from(doc.size.width) || at[1] >= f64::from(doc.size.height) {
         return false;
     }
-    if doc.selection.as_ref().is_some_and(|selection| selection.sample_channel(at[0].floor() as i32, at[1].floor() as i32, 0) <= 0.0) {
-        return false;
-    }
     pick(app, &mut f, at, mods);
     match app.ui.dialogs.last_mut() {
         Some(d) => {
@@ -704,9 +705,6 @@ pub fn pick(app: &PhotocraftApp, f: &mut Map<String, Value>, at: [f64; 2], mods:
     let (w, h) = (f64::from(st.doc.size.width.max(1)), f64::from(st.doc.size.height.max(1)));
     let [x, y] = at;
     let at = [x.floor().clamp(0.0, w - 1.0), y.floor().clamp(0.0, h - 1.0)];
-    if st.doc.selection.as_ref().is_some_and(|selection| selection.sample_channel(at[0] as i32, at[1] as i32, 0) <= 0.0) {
-        return;
-    }
     let tool = if mods.shift {
         "add"
     } else if mods.alt {
@@ -827,10 +825,12 @@ mod tests {
             assert_eq!(mask[5 * 40 + 25], 0.0, "even inverted previews stay within the selection");
         }
 
+        // As in Photoshop, the eyedropper samples anywhere; only the result is scoped (#5244).
         open(&mut app);
-        assert!(!pick_top(&mut app, [25.0, 5.0], egui::Modifiers::NONE));
-        let fields = &app.ui.dialogs.last().unwrap().fields;
-        assert!(points(fields, "points").is_empty(), "a click outside the selection is ignored");
+        assert!(pick_top(&mut app, [25.0, 5.0], egui::Modifiers::NONE));
+        assert_eq!(points(&app.ui.dialogs.last().unwrap().fields, "points"), vec![[25.0, 5.0]], "a colour outside the selection is sampled");
+        let mask = proxy_mask(&app, &doc, 1, &json!({"select": "sampledColors", "points": [[25, 5]], "fuzziness": 0})).unwrap();
+        assert_eq!(mask[5 * 40 + 25], 0.0, "but the preview stays within the selection");
         assert!(pick_top(&mut app, [5.0, 5.0], egui::Modifiers::NONE));
         assert_eq!(points(&app.ui.dialogs.last().unwrap().fields, "points"), vec![[5.0, 5.0]]);
     }
@@ -940,6 +940,11 @@ mod tests {
         assert!(h.query_by_label("Midtones from:").is_some() && h.query_by_label("Midtones to:").is_some());
         set(&mut h, "select", json!("outOfGamut"));
         assert!(disabled(&h, "Fuzziness:") && h.query_by_label("Midtones from:").is_none());
+        // Skin Tones: Fuzziness (the colour one), no eyedroppers or clusters.
+        set(&mut h, "select", json!("skinTones"));
+        assert!(!disabled(&h, "Fuzziness:") && disabled(&h, "Localized Color Clusters") && disabled(&h, "Add to Sample"));
+        let skin: Map<String, Value> = serde_json::from_value(json!({"select": "skinTones", "fuzziness": 25.0, "points": [[1, 1]]})).unwrap();
+        assert_eq!(params(&skin), json!({"select": "skinTones", "invert": false, "fuzziness": 25.0}));
         assert_eq!(
             controls(&serde_json::from_value(json!({"select": "highlights"})).unwrap()),
             Controls { fuzziness: true, sampling: false, range: false, tonal: true }

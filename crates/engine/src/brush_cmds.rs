@@ -10,7 +10,10 @@ use photocraft_doc::LayerContent;
 use photocraft_geom::Rect;
 use photocraft_paint::mixer::{MixerSettings, apply_mixer_stroke};
 use photocraft_paint::replace::{Limits, ReplaceMode, ReplaceSettings, Sampling, apply_color_replacement, color_replacement_effect};
-use photocraft_paint::{BrushPreset, BrushSettings, GrayTile, Stroke, StrokePoint, StrokeRenderer, TipShape, render_stroke};
+use photocraft_paint::tile::PREVIEW_SIDE;
+use photocraft_paint::{
+    BrushPreset, BrushSettings, GrayTile, Pattern, PresetCaptures, StoredTile, Stroke, StrokePoint, StrokeRenderer, TipShape, render_stroke,
+};
 use photocraft_raster::Surface;
 use serde_json::{Value, json};
 
@@ -130,6 +133,18 @@ pub fn merge_brush(base: &BrushSettings, patch: &Value, cmd: &str) -> Result<Bru
     let pattern = (!touches(&["texture", "pattern"])).then(|| std::mem::take(&mut light.texture.pattern));
     let mut v = serde_json::to_value(&light).map_err(|e| bad(cmd, e.to_string()))?;
     merge(&mut v, patch);
+    // A legacy command sets both axes. The base JSON already has the new keys,
+    // so copy the alias into axes the patch didn't set before deserialising it.
+    if let Some(pose_patch) = patch.get("pose").and_then(Value::as_object)
+        && let Some(legacy) = pose_patch.get("overrideTilt")
+        && let Some(pose) = v.get_mut("pose").and_then(Value::as_object_mut)
+    {
+        for axis in ["overrideTiltX", "overrideTiltY"] {
+            if !pose_patch.contains_key(axis) {
+                pose.insert(axis.to_string(), legacy.clone());
+            }
+        }
+    }
     let mut out: BrushSettings = serde_json::from_value(v).map_err(|e| bad(cmd, format!("invalid brush: {e}")))?;
     if let Some(t) = tip {
         out.tip = t;
@@ -139,6 +154,11 @@ pub fn merge_brush(base: &BrushSettings, patch: &Value, cmd: &str) -> Result<Bru
     }
     if let Some(p) = pattern {
         out.texture.pattern = p;
+    }
+    if patch.get("size").is_some() && !touches(&["dualBrush", "size"]) {
+        let new_size = out.size;
+        out.size = base.size;
+        out.resize_with_dual_brush(new_size);
     }
     Ok(out)
 }
@@ -177,7 +197,7 @@ fn find_preset<'a>(s: &'a Session, name: &str, cmd: &str) -> Result<&'a BrushPre
 pub fn resolve_brush(s: &Session, p: &Value, cmd: &str) -> Result<BrushSettings> {
     let mut b = s.tools.brush.clone();
     if let Some(name) = p.get("preset").and_then(Value::as_str) {
-        b = find_preset(s, name, cmd)?.brush.clone().picked_over(&s.tools.brush);
+        b = find_preset(s, name, cmd)?.picked_over(&s.tools.brush);
     }
     if let Some(patch) = p.get("brush").filter(|v| v.is_object()) {
         b = merge_brush(&b, patch, cmd)?;
@@ -185,7 +205,7 @@ pub fn resolve_brush(s: &Session, p: &Value, cmd: &str) -> Result<BrushSettings>
     // A library preset's tips stay on disk until a stroke uses them (#1843).
     s.load_brush_tips(&mut b).map_err(|e| bad(cmd, e))?;
     if let Some(v) = num(p, "size") {
-        b.size = v.max(0.5);
+        b.resize_with_dual_brush(v.max(0.5));
     }
     if let Some(v) = num(p, "hardness") {
         b.hardness = v.clamp(0.0, 1.0);
@@ -200,9 +220,11 @@ pub fn resolve_brush(s: &Session, p: &Value, cmd: &str) -> Result<BrushSettings>
         b.spacing = v.clamp(0.01, 10.0);
     }
     if let Some(v) = num(p, "smoothing") {
+        b.smoothing.enabled = true;
         b.smoothing.amount = v.clamp(0.0, 1.0);
     }
     b.color = color(p.get("color"), s.tools.foreground);
+    b.color_cmyk = s.tools.picked_cmyk([b.color[0], b.color[1], b.color[2]]).map(|k| ([b.color[0], b.color[1], b.color[2]], k));
     b.background = s.tools.background;
     b.erase = flag(p, "erase", false);
     b.seed = match p.get("seed").and_then(Value::as_u64) {
@@ -248,7 +270,7 @@ fn erase_locked(brush: &mut BrushSettings, lock: bool, bg: [f32; 4]) {
 /// The document's own CMYK profile (absent, built-in or not a CMYK document: `None`, the
 /// default conversions), which the stroke's colour conversions must honour — the compositors
 /// and composite exports enter the same scope.
-fn doc_cmyk_space(s: &Session) -> Option<std::sync::Arc<photocraft_color::convert::CmykSpace>> {
+pub(crate) fn doc_cmyk_space(s: &Session) -> Option<std::sync::Arc<photocraft_color::convert::CmykSpace>> {
     photocraft_color::convert::CmykSpace::for_profile(s.active().and_then(|d| d.doc.icc_profile.as_ref()))
 }
 
@@ -366,6 +388,7 @@ fn block_brush(b: BrushSettings, p: &Value) -> Result<BrushSettings> {
         pressure_opacity: false,
         spacing: 0.25,
         color: b.color,
+        color_cmyk: b.color_cmyk,
         background: b.background,
         erase: b.erase,
         smoothing: b.smoothing,
@@ -434,17 +457,19 @@ pub struct LiveStroke {
     base: (photocraft_doc::DocId, u64),
 }
 
-/// A finished live stroke offered to its own commit ([`Session::offer_live_stroke`]): when the
-/// committing `paint.stroke` / `paint.pencil` matches it (same command, document revision, params,
-/// seed and points), the command takes these pixels instead of rendering the stroke again.
+/// A finished live stroke offered to its own commit ([`Session::offer_live_stroke`],
+/// [`Session::offer_live_retouch`]): when the committing command matches it (same command,
+/// document revision, params, seed and points), it takes these pixels instead of rendering the
+/// stroke again.
 pub struct LiveCommit {
-    cmd: String,
-    base: (photocraft_doc::DocId, u64),
-    params: Value,
-    seed: u64,
-    points: Vec<StrokePoint>,
-    surface: Surface,
-    bounds: Rect,
+    pub(crate) cmd: String,
+    pub(crate) base: (photocraft_doc::DocId, u64),
+    pub(crate) params: Value,
+    /// The Brush's and Pencil's seed; the retouching tools have none.
+    pub(crate) seed: Option<u64>,
+    pub(crate) points: Vec<StrokePoint>,
+    pub(crate) surface: Surface,
+    pub(crate) bounds: Rect,
 }
 
 impl LiveCommit {
@@ -458,11 +483,11 @@ impl LiveCommit {
         p
     }
 
-    fn matches(&self, s: &Session, cmd: &str, p: &Value, pts: &[StrokePoint]) -> bool {
+    pub(crate) fn matches(&self, s: &Session, cmd: &str, p: &Value, pts: &[StrokePoint]) -> bool {
         let base = s.active().map(|st| (st.doc.id, st.revision));
         self.cmd == cmd
             && base == Some(self.base)
-            && p.get("seed").and_then(Value::as_u64) == Some(self.seed)
+            && p.get("seed").and_then(Value::as_u64) == self.seed
             && self.points == pts
             && Self::settings(p) == Self::settings(&self.params)
     }
@@ -528,7 +553,7 @@ impl LiveStroke {
     pub fn into_commit(mut self) -> Result<LiveCommit> {
         let bounds = self.bounds();
         let (surf, _) = crate::channel_cmds::target_surface(std::sync::Arc::make_mut(&mut self.doc), self.layer, &self.params)?;
-        Ok(LiveCommit { cmd: self.cmd, base: self.base, params: self.params, seed: self.seed, points: self.points, surface: surf.clone(), bounds })
+        Ok(LiveCommit { cmd: self.cmd, base: self.base, params: self.params, seed: Some(self.seed), points: self.points, surface: surf.clone(), bounds })
     }
 
     /// Everything the stroke has touched so far.
@@ -631,13 +656,13 @@ fn mixer_brush(s: &mut Session, p: &Value) -> Result<Value> {
         mix: pct(p, "mix", bm.mix * 100.0),
         flow: pct(p, "flow", bm.flow * 100.0),
         sample_all_layers: flag(p, "sampleAllLayers", bm.sample_all_layers),
+        load_after_stroke: flag(p, "loadAfterStroke", bm.load_after_stroke),
+        clean_after_stroke: flag(p, "cleanAfterStroke", bm.clean_after_stroke),
     };
     let sample_all = m.sample_all_layers;
-    let (clean, load_after) = (flag(p, "cleanAfterStroke", true), flag(p, "loadAfterStroke", true));
+    let paint = color(p.get("color"), s.tools.foreground);
     let mut state = s.tools.mixer.clone();
-    if load_after || state.reservoir.is_none() {
-        state.load(color(p.get("color"), s.tools.foreground));
-    }
+    state.begin_stroke(paint);
     let id = if crate::channel_cmds::is_channel_target(p) { None } else { Some(layer_id(s, p)?) };
     let stroke = Stroke { brush, points: pts };
     let dmg = s.edit("Mixer Brush", |doc, _| {
@@ -659,11 +684,41 @@ fn mixer_brush(s: &mut Session, p: &Value) -> Result<Value> {
         let (surf, lock) = crate::channel_cmds::target_surface(doc, id, p)?;
         Ok(apply_mixer_stroke(surf, sample.as_ref(), &stroke, &m, &mut state, sel.as_ref(), lock))
     })?;
-    if clean {
-        state.clean();
-    }
+    state.end_stroke(paint, m.clean_after_stroke, m.load_after_stroke);
     s.tools.mixer = state;
     Ok(damage_json(s, dmg))
+}
+
+/// `brush.mixer.load`: Load Brush fills the Mixer Brush's reservoir with the color. The next stroke
+/// keeps that paint unless a different foreground is chosen first. Returns the paint the brush now
+/// carries.
+fn mixer_load(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "brush.mixer.load";
+    let paint = match p.get("color").filter(|v| !v.is_null()) {
+        None => Some(s.tools.foreground),
+        Some(Value::String(h)) => crate::commands::parse_hex(h),
+        Some(Value::Array(a)) => {
+            let c: Option<Vec<f32>> = a.iter().map(|x| x.as_f64().filter(|x| (0.0..=1.0).contains(x)).map(|x| x as f32)).collect();
+            match c.as_deref() {
+                Some(&[r, g, b]) => Some([r, g, b, 1.0]),
+                Some(&[r, g, b, a]) => Some([r, g, b, a]),
+                _ => None,
+            }
+        }
+        Some(_) => None,
+    };
+    let paint = paint.ok_or_else(|| bad(cmd, "`color` must be \"#rrggbb\" or [r, g, b, a?] in 0..1"))?;
+    s.tools.mixer.load(paint);
+    s.tools.mixer.color = Some(s.tools.foreground);
+    Ok(serde_json::to_value(&s.tools.mixer).unwrap_or_default())
+}
+
+/// `brush.mixer.clean`: Clean Brush empties the Mixer Brush. The next stroke starts empty unless
+/// a different color is chosen first. Returns the paint the brush now carries.
+fn mixer_clean(s: &mut Session, _: &Value) -> Result<Value> {
+    s.tools.mixer.clean();
+    s.tools.mixer.color = Some(s.tools.foreground);
+    Ok(serde_json::to_value(&s.tools.mixer).unwrap_or_default())
 }
 
 /// `paint.colorReplacement`'s stroke and settings. The replacement colour is the brush colour
@@ -756,13 +811,19 @@ fn upsert(s: &mut Session, preset: BrushPreset) {
 fn presets_save(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "brush.presets.save";
     let name = name_param(p, cmd)?;
-    let brush = match p.get("brush").filter(|v| v.is_object()) {
+    let mut brush = match p.get("brush").filter(|v| v.is_object()) {
         Some(patch) => merge_brush(&s.tools.brush, patch, cmd)?,
         None => s.tools.brush.clone(),
     };
-    upsert(s, BrushPreset { name: name.clone(), brush, builtin: false, group: String::new(), folder: Vec::new() });
+    // The New Brush Preset dialog's boxes; without them the preset captures what it always did.
+    let captures = PresetCaptures { size: flag(p, "captureSize", true), tool_settings: flag(p, "toolSettings", true), color: flag(p, "color", false) };
+    if captures.color {
+        brush.color = s.tools.foreground;
+    }
+    upsert(s, BrushPreset { name: name.clone(), brush, builtin: false, group: String::new(), folder: Vec::new(), captures });
     // The saved brush is the current brush now (Photoshop selects the brush it just saved).
     s.tools.current_preset = Some(name.clone());
+    s.tools.brush_changed();
     Ok(json!({ "name": name, "count": s.tools.presets.len() }))
 }
 
@@ -774,11 +835,19 @@ fn presets_delete(s: &mut Session, p: &Value) -> Result<Value> {
     if s.tools.presets.len() == before {
         return Err(bad(cmd, format!("no brush preset named `{name}`")));
     }
-    if s.tools.current_preset.as_ref().is_some_and(|c| c.eq_ignore_ascii_case(&name)) {
+    forget_deleted_preset(s, &name);
+    Ok(json!({ "count": s.tools.presets.len() }))
+}
+
+/// After preset `name` was deleted (here or in Edit › Presets › Preset Manager): the current
+/// brush no longer comes from a preset, and the library is saved.
+pub(crate) fn forget_deleted_preset(s: &mut Session, name: &str) {
+    if s.tools.current_preset.as_ref().is_some_and(|c| c.eq_ignore_ascii_case(name)) {
         s.tools.current_preset = None;
+        // The remembered brush names the preset it was picked from: the name went away.
+        s.tools.brush_changed();
     }
     s.brush_presets_changed();
-    Ok(json!({ "count": s.tools.presets.len() }))
 }
 
 /// Overwrite an existing preset with the current brush (or the current brush plus a `brush`
@@ -813,6 +882,7 @@ fn presets_set_current(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(cmd, format!("no brush preset named `{name}`")));
     }
     s.tools.current_preset = Some(name.clone());
+    s.tools.brush_changed();
     Ok(json!({ "name": name }))
 }
 
@@ -841,9 +911,16 @@ fn define_from_selection(s: &mut Session, p: &Value) -> Result<Value> {
     }
     // Paint amount = darkness × alpha × selection (black = full paint, like Photoshop).
     let (w, h) = (area.width() as usize, area.height() as usize);
-    let mut v = vec![0.0f32; w * h];
+    // The sampled tip is one f32 buffer over the whole selection; a large selection must fail
+    // gracefully instead of aborting the process on allocation, so reserve it fallibly. The
+    // multiply is checked too: on a 32-bit target (wasm32) it can overflow where the rest of
+    // this command is already fallible.
+    let len = w.checked_mul(h).ok_or_else(|| crate::allocation::error("defining a brush from the selection", "requested size overflowed"))?;
+    let mut v = crate::allocation::filled(len, 0.0, "defining a brush from the selection")?;
     let sc = sel.channels();
-    let sv = sel.read_region(area);
+    // The selection mask is a second buffer of the same size; it must fail gracefully too
+    // (review of #5469), so read it through the fallible allocator.
+    let sv = crate::allocation::read_region(sel, area, "defining a brush from the selection")?;
     for y in 0..h {
         for x in 0..w {
             let c = surf.rgba(area.x0 + x as i32, area.y0 + y as i32);
@@ -851,11 +928,24 @@ fn define_from_selection(s: &mut Session, p: &Value) -> Result<Value> {
             v[y * w + x] = ((1.0 - l) * c[3] * sv[(y * w + x) * sc]).clamp(0.0, 1.0);
         }
     }
+    let (brush, tw, th) = sampled_brush(cmd, &v, w, h)?;
+    upsert(s, BrushPreset { name: name.clone(), brush: brush.clone(), builtin: false, group: String::new(), folder: Vec::new(), captures: Default::default() });
+    s.tools.brush = brush;
+    s.tools.current_preset = Some(name.clone());
+    s.tools.brush_changed();
+    Ok(json!({ "name": name, "width": tw, "height": th }))
+}
+
+/// A sampled-tip brush from a paint-amount map (`w`×`h`, row-major, 0 = no paint, 1 = full):
+/// cropped to the painted extent, at most [`MAX_TIP`] px a side. Shared by Define Brush Preset
+/// and importing an image file as a brush (`brush.presets.importImage`).
+pub(crate) fn sampled_brush(cmd: &str, v: &[f32], w: usize, h: usize) -> Result<(BrushSettings, u32, u32)> {
+    let at = |x: usize, y: usize| v.get(y * w + x).copied().unwrap_or(0.0);
     // Crop to the painted extent.
     let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
     for y in 0..h {
         for x in 0..w {
-            if v[y * w + x] > 1e-4 {
+            if at(x, y) > 1e-4 {
                 x0 = x0.min(x);
                 y0 = y0.min(y);
                 x1 = x1.max(x + 1);
@@ -864,30 +954,30 @@ fn define_from_selection(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     if x1 <= x0 || y1 <= y0 {
-        return Err(bad(cmd, "the selected pixels contain no paint (all white or transparent)"));
+        return Err(bad(cmd, "the pixels contain no paint (all white or transparent)"));
     }
     let (tw, th) = ((x1 - x0) as u32, (y1 - y0) as u32);
     if tw.max(th) > MAX_TIP {
-        return Err(bad(cmd, format!("selection too large for a brush tip ({tw}×{th}; max {MAX_TIP} px)")));
+        return Err(bad(cmd, format!("too large for a brush tip ({tw}×{th}; max {MAX_TIP} px)")));
     }
     let mut data = Vec::with_capacity((tw * th) as usize);
     for y in y0..y1 {
-        data.extend_from_slice(&v[y * w + x0..y * w + x1]);
+        data.extend((x0..x1).map(|x| at(x, y)));
     }
     let tip = GrayTile::from_f32(tw, th, &data);
     let brush = BrushSettings { tip: TipShape::Sampled(tip), size: tw.max(th) as f32, spacing: 0.25, pressure_size: false, ..BrushSettings::default() };
-    upsert(s, BrushPreset { name: name.clone(), brush: brush.clone(), builtin: false, group: String::new(), folder: Vec::new() });
-    s.tools.brush = brush;
-    s.tools.current_preset = Some(name.clone());
-    Ok(json!({ "name": name, "width": tw, "height": th }))
+    Ok((brush, tw, th))
 }
 
 pub(crate) fn set_brush(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "tools.setBrush";
     let mut b = s.tools.brush.clone();
     let mut picked = None;
+    let mut picked_color = None;
     if let Some(name) = p.get("preset").and_then(Value::as_str) {
-        b = find_preset(s, name, cmd)?.brush.clone().picked_over(&s.tools.brush);
+        let preset = find_preset(s, name, cmd)?;
+        b = preset.picked_over(&s.tools.brush);
+        picked_color = preset.captures.color.then_some(preset.brush.color);
         picked = Some(name.to_string());
     }
     let reset = flag(p, "reset", false);
@@ -916,6 +1006,10 @@ pub(crate) fn set_brush(s: &mut Session, p: &Value) -> Result<Value> {
         s.tools.current_preset = None;
     } else if let Some(name) = picked {
         s.tools.current_preset = Some(name);
+        // A preset saved with Include Color brings its colour as the foreground (Photoshop).
+        if let Some(c) = picked_color {
+            s.tools.foreground = c;
+        }
     }
     // The tool's brush always paints with full tips: load a library preset's from the store.
     s.load_brush_tips(&mut b).map_err(|e| bad(cmd, e))?;
@@ -931,7 +1025,88 @@ pub(crate) fn set_brush(s: &mut Session, p: &Value) -> Result<Value> {
         Some(k) => s.tools.brush_gesture = Some((k.to_string(), before)),
         None => s.tools.brush_gesture = None,
     }
+    // The one accepted brush change everyone (UI sliders, control channel, presets) lands here.
+    s.tools.brush_changed();
     Ok(brush_json(&s.tools.brush))
+}
+
+/// Remember the current brush in `Preferences::last_brush` (see [`remembered_brush`]). Called
+/// every frame while the pointer is up, so it is change-driven: `ToolState::brush_rev` is compared
+/// with the revision already saved and an unchanged brush clones and serialises nothing.
+pub fn remember_brush(s: &mut Session) {
+    if s.tools.brush_rev == s.tools.brush_saved_rev {
+        return;
+    }
+    let Some(now) = remembered_brush(s) else { return };
+    if s.prefs().last_brush != now {
+        s.prefs.edit(|p| p.last_brush = now);
+    }
+    s.tools.brush_saved_rev = s.tools.brush_rev;
+}
+
+/// The current brush as JSON for `Preferences::last_brush`: settings plus tip references, no full
+/// bitmap. `None` while a sampled bitmap too big to embed is current (only before the store
+/// externalizes it; see [`ref_tip`]), so the previous remembered brush stands.
+fn remembered_brush(s: &Session) -> Option<Value> {
+    Some(json!({ "preset": s.tools.current_preset.clone(), "brush": remembered_settings(&s.tools.brush)? }))
+}
+
+/// A brush as JSON for the preferences (the last brush, each painting tool's own brush): its
+/// settings with stored tips as references, never their full bitmaps. `None` while a sampled
+/// bitmap too big to embed is in it (only before the preset store externalizes it).
+pub fn remembered_settings(b: &BrushSettings) -> Option<Value> {
+    let (tip, dual, pattern) = (ref_tip(&b.tip)?, ref_tip(&b.dual_brush.tip)?, ref_pattern(&b.texture.pattern)?);
+    let mut c = b.clone();
+    (c.tip, c.dual_brush.tip, c.texture.pattern) = (tip, dual, pattern);
+    serde_json::to_value(&c).ok()
+}
+
+/// A brush remembered by [`remembered_settings`], read back at launch: `None` when the value is
+/// not a brush or fails the checks `tools.setBrush` makes (a size or scatter out of range). The
+/// options-bar values are clamped to the ranges their controls allow (size 1..max px; hardness,
+/// opacity, flow and smoothing 0..100 %), and stored tips load when the store is attached (else
+/// they paint with their previews until `Session::attach_preset_store`).
+pub fn restored_settings(s: &Session, v: &Value) -> Option<BrushSettings> {
+    if !v.is_object() {
+        return None;
+    }
+    let mut b = merge_brush(&BrushSettings::default(), v, "brush.restore").ok()?;
+    validate_brush(&b, "brush.restore").ok()?;
+    b.size = b.size.clamp(1.0, photocraft_paint::MAX_BRUSH_SIZE);
+    for f in [&mut b.hardness, &mut b.opacity, &mut b.flow, &mut b.smoothing.amount] {
+        *f = if f.is_nan() { 1.0 } else { f.clamp(0.0, 1.0) };
+    }
+    let _ = s.load_brush_tips(&mut b);
+    Some(b)
+}
+
+/// Restore `Preferences::last_brush` into the session at launch (a missing or malformed value
+/// keeps the default brush). Stored tips load when the preset store attaches.
+pub fn restore_brush(s: &mut Session) {
+    let v = s.prefs().last_brush.clone();
+    let Some(b) = v.get("brush").and_then(|b| restored_settings(s, b)) else { return };
+    s.tools.brush = b;
+    s.tools.current_preset = v.get("preset").and_then(Value::as_str).map(str::to_string);
+    // What was just restored is exactly what the preferences hold: nothing new to write.
+    s.tools.brush_saved_rev = s.tools.brush_rev;
+}
+
+/// A tip for remembering: a loaded stored tip drops its full bitmap (it serialises as a reference
+/// then); a sampled bitmap bigger than a preview would enter the prefs document whole.
+fn ref_tip(t: &TipShape) -> Option<TipShape> {
+    match t {
+        TipShape::Stored(r) if r.full.is_some() => Some(TipShape::Stored(StoredTile { full: None, ..r.clone() })),
+        TipShape::Sampled(g) if g.width > PREVIEW_SIDE || g.height > PREVIEW_SIDE => None,
+        t => Some(t.clone()),
+    }
+}
+
+fn ref_pattern(p: &Pattern) -> Option<Pattern> {
+    match p {
+        Pattern::Stored(r) if r.full.is_some() => Some(Pattern::Stored(StoredTile { full: None, ..r.clone() })),
+        Pattern::Tile(g) if g.width > PREVIEW_SIDE || g.height > PREVIEW_SIDE => None,
+        p => Some(p.clone()),
+    }
 }
 
 /// The brush as JSON with the bitmaps (sampled tips, pattern tiles) that `skip` names replaced by
@@ -976,7 +1151,13 @@ pub fn brush_patch(old: &BrushSettings, new: &BrushSettings) -> Value {
             _ => (a != b).then(|| b.clone()),
         }
     }
-    diff(&light_json(old, skip), &light_json(new, skip)).unwrap_or_else(|| json!({}))
+    let mut patch = diff(&light_json(old, skip), &light_json(new, skip)).unwrap_or_else(|| json!({}));
+    // This readback is derived from the axis flags. Sending it alongside a
+    // one-axis delta would also overwrite the other axis through the legacy alias.
+    if let Some(pose) = patch.get_mut("pose").and_then(Value::as_object_mut) {
+        pose.remove("overrideTilt");
+    }
+    patch
 }
 
 /// Journal hook ([`Session::execute`]): consecutive `tools.setBrush` calls with the same
@@ -1022,11 +1203,13 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!(
             "paint.mixerBrush",
             "Mixer Brush",
-            r##"{"points":[…],"brush":{…}?,"preset":name?,"size":0.5..5000 px?,"wet":0..100=brush.mixer.wet,"load":0..100=brush.mixer.load,"mix":0..100=brush.mixer.mix,"flow":0..100=brush.mixer.flow,"color":"#rrggbb"?=foreground,"sampleAllLayers":bool=brush.mixer.sampleAllLayers,"cleanAfterStroke":bool=true,"loadAfterStroke":bool=true,"seed":u64?}"##,
+            r##"{"points":[…],"brush":{…}?,"preset":name?,"size":0.5..5000 px?,"wet":0..100=brush.mixer.wet,"load":0..100=brush.mixer.load,"mix":0..100=brush.mixer.mix,"flow":0..100=brush.mixer.flow,"color":"#rrggbb"?=foreground (a color other than the one recorded by the last stroke, load or clean loads it first; a load or clean records the foreground),"sampleAllLayers":bool=brush.mixer.sampleAllLayers,"cleanAfterStroke":bool=brush.mixer.cleanAfterStroke (empty the brush after the stroke),"loadAfterStroke":bool=brush.mixer.loadAfterStroke (load the brush with `color` after the stroke),"seed":u64?}"##,
             has_paintable,
             mixer_brush,
             true
         ),
+        spec!("brush.mixer.load", "Load Mixer Brush", r##"{"color":"#rrggbb"|[r,g,b,a?] 0..1?=foreground}"##, always, mixer_load, true),
+        spec!("brush.mixer.clean", "Clean Mixer Brush", "{}", always, mixer_clean, true),
         spec!(
             "paint.colorReplacement",
             "Color Replacement",
@@ -1036,7 +1219,14 @@ pub fn specs() -> Vec<CommandSpec> {
             true
         ),
         spec!("brush.presets.list", "List Brush Presets", r##"{"full":bool=false}"##, always, presets_list, false),
-        spec!("brush.presets.save", "Save Brush Preset", r##"{"name":string,"brush":{…BrushSettings}?=current brush}"##, always, presets_save, true),
+        spec!(
+            "brush.presets.save",
+            "Save Brush Preset",
+            r##"{"name":string,"brush":{…BrushSettings}?=current brush,"captureSize":bool=true (false: picking it keeps the tool's size),"toolSettings":bool=true (false: picking it keeps the tool's mode, opacity, flow and pressure buttons),"color":bool=false (picking it sets the foreground to the current foreground)}"##,
+            always,
+            presets_save,
+            true
+        ),
         spec!(
             "brush.presets.update",
             "Update Brush Preset",
@@ -1049,7 +1239,14 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!("brush.presets.setCurrent", "Set Current Brush Preset", r##"{"name":string}"##, always, presets_set_current, true),
         spec!("brush.defineFromSelection", "Define Brush Preset…", r##"{"name":string}"##, has_selection_and_pixels, define_from_selection, true),
         spec!("brush.get", "Get Brush", "{}", always, |s, _| Ok(brush_json(&s.tools.brush)), false),
-        spec!("tools.setBrush", "Set Brush", r##"{"preset":name?,"reset":bool?,…BrushSettings fields (camelCase, deep-merged)}"##, always, set_brush, true),
+        spec!(
+            "tools.setBrush",
+            "Set Brush",
+            r##"{"preset":name?,"reset":bool?,…BrushSettings fields (camelCase, deep-merged; pose.overrideTiltX/Y:bool; pose.overrideTilt:legacy combined alias)}"##,
+            always,
+            set_brush,
+            true
+        ),
     ]
 }
 

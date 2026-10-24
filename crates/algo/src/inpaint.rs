@@ -16,6 +16,15 @@
 //!   source (the usual case), the vote copies the source pixels exactly; only along the seams
 //!   between copied pieces does it blend.
 //!
+//!   A thin hole (a selected wire, string or hair: long, but only a few patches thick) is
+//!   measured by its thickness, not its bounds (#1366): the pyramid stops where it is still about
+//!   two patches thick. That level is big, so the onion peel starts it only where its exhaustive
+//!   search stays affordable; otherwise a membrane across the hole does, which over so short a
+//!   distance is the surroundings themselves. Shrunk to where its bounds are four patches across,
+//!   a long thin hole swallows its surroundings, the matches found there copy whatever happens to
+//!   look like the blur (a dark blotch, or a piece of another string), and the finer levels,
+//!   which only refine those matches, keep them: the removed object's outline stays visible.
+//!
 //!   This is what Photoshop's Content-Aware Fill does, measured as a black box on Photoshop 25.4
 //!   (see `content_aware`): with colour adaptation off its fill is pieces of the image copied pixel
 //!   for pixel, typically 15–40 px across, joined by seams a few pixels wide; with colour
@@ -56,15 +65,13 @@ const SOURCE_MOMENTS_MAX: usize = 1 << 20;
 #[derive(Clone)]
 pub(crate) struct Rng(u64);
 impl Rng {
+    /// A generator whose sequence is fixed by `seed`.
     pub(crate) fn new(seed: u64) -> Self {
         Rng(seed ^ 0x9E37_79B9_7F4A_7C15)
     }
+    /// The next value of the SplitMix64 sequence.
     pub(crate) fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
+        crate::photo_util::splitmix64(&mut self.0)
     }
     /// Skip `n` numbers (the same state as after `n` calls of [`Rng::next`]).
     pub(crate) fn skip(&mut self, n: u64) {
@@ -276,6 +283,38 @@ fn hole_bbox(w: usize, h: usize, hole: &[bool]) -> Option<(usize, usize, usize, 
         }
     }
     b
+}
+
+/// A hole at most `1 / THIN_RATIO` as thick as its bounds are long counts as thin (a wire, a
+/// string, a hair, a long brush stroke): see the module docs.
+const THIN_RATIO: usize = 4;
+
+/// How thick the hole within bounds `hb` of a `w`-wide role grid is: twice the largest distance
+/// from a hole pixel to the nearest pixel that is not one (a long, thin hole is thin however long
+/// its bounds).
+fn hole_thickness(w: usize, hb: Bounds, px: &[Px]) -> usize {
+    // The bounds and a ring of non-hole cells around them (also past the grid's edge).
+    let (gw, gh) = (hb.width() + 2, hb.height() + 2);
+    let outside: Vec<bool> = par::map(gw * gh, gw * gh >= PAR_MIN, |i| {
+        let (gx, gy) = (i % gw, i / gw);
+        if gx == 0 || gy == 0 || gx > hb.width() || gy > hb.height() {
+            return true;
+        }
+        px.get((hb.y0 + gy - 1) * w + hb.x0 + gx - 1) != Some(&Px::Hole)
+    });
+    let deepest = crate::selection::edt(&outside, gw, gh).into_iter().fold(0.0f32, f32::max);
+    (2.0 * deepest).ceil() as usize
+}
+
+/// Most target pixels × sources the onion peel of a thin hole may compare (its search is
+/// exhaustive, though most comparisons stop early: about a second at this many).
+const PEEL_BUDGET: usize = 1 << 28;
+
+/// Whether the onion peel of the hole cells within `hb` of a `w`-wide role grid from `sources`
+/// source centres stays within [`PEEL_BUDGET`].
+fn peel_affordable(w: usize, px: &[Px], hb: Bounds, sources: usize) -> bool {
+    let holes: usize = (hb.y0..hb.y1).map(|y| px.get(y * w + hb.x0..y * w + hb.x1).map_or(0, |row| row.iter().filter(|k| **k == Px::Hole).count())).sum();
+    holes.saturating_mul(sources) <= PEEL_BUDGET
 }
 
 /// Bounds of the hole pixels of a role grid.
@@ -508,6 +547,9 @@ struct Solver<'a> {
     ctl: photocraft_raster::Interrupt<'a>,
 }
 
+/// A channel deviation under which a patch counts as flat for [`fit`] (about 5 levels of 255).
+const FLAT: f32 = 0.02;
+
 /// Gain and bias of one channel for target moments `(Σt, Σt²)` and source moments `(Σs, Σs²)`
 /// over `n` samples, within the limits.
 #[inline]
@@ -516,7 +558,20 @@ pub(crate) fn fit(a: Adapt, n: f32, st: f32, stt: f32, ss: f32, sss: f32) -> (f3
     let vt = (stt / n - mt * mt).max(0.0);
     let vs = (sss / n - ms * ms).max(0.0);
     let g = if vs > 1e-10 { (vt / vs).sqrt() } else { 1.0 };
-    let g = g.clamp(a.gain.0, a.gain.1);
+    let (mut lo, mut hi) = a.gain;
+    // Nearly flat patches of about the same colour (their means within the bias of each other):
+    // the ratio of their deviations is noise, so match the mean first, keeping the gain where the
+    // bias can still bring the source's mean to the target's. Gained about zero, a gain at its
+    // limit moved bright means further than the bias could bring back, and each channel by a
+    // different amount: a tinted blotch in a smooth gradient. Textured patches, and flat ones
+    // whose colours differ more (Content-Aware Move's Color), are fitted as before.
+    if vt.max(vs) < FLAT * FLAT && (mt - ms).abs() <= a.bias && ms > 1e-6 {
+        let (glo, ghi) = ((mt - a.bias) / ms, (mt + a.bias) / ms);
+        if glo.max(lo) <= ghi.min(hi) {
+            (lo, hi) = (glo.max(lo), ghi.min(hi));
+        }
+    }
+    let g = g.clamp(lo, hi);
     let b = (mt - g * ms).clamp(-a.bias, a.bias);
     (g, b)
 }
@@ -1559,14 +1614,20 @@ fn complete_cow<'a>(
     let r = p.patch_radius.max(1);
     let psz = 2 * r + 1;
     // Pyramid: shrink until the hole is about four patches across (a deeper pyramid decides the
-    // structure where the texture has averaged out, and fills flat).
+    // structure where the texture has averaged out, and fills flat). A thin hole stops while it
+    // is still about two patches thick: through it, not along it, is what counts (#1366).
     let mut levels = vec![Level { w, h, img, px: Cow::Borrowed(px) }];
     let mut boxes = vec![hb0];
     let mut ext = hb0.width().max(hb0.height());
+    let thickness = hole_thickness(w, hb0, px);
+    let thin = thickness.saturating_mul(THIN_RATIO) <= ext;
+    if thin {
+        ext = thickness;
+    }
     let mut exts = vec![ext];
     while let Some(l) = levels.last() {
         ctl.check()?;
-        if ext <= 4 * psz || l.w / 2 < 3 * psz || l.h / 2 < 3 * psz {
+        if ext <= if thin { 2 * psz } else { 4 * psz } || l.w / 2 < 3 * psz || l.h / 2 < 3 * psz {
             break;
         }
         let d = downsample(l, ch);
@@ -1622,9 +1683,21 @@ fn complete_cow<'a>(
                     }
                 }
             }
-            None if sources.len() > 0 => onion_peel(lw, lh, ch, ri, &mut limg, &lpx, hb, &sources.all(&valid, lw), ctl)?,
+            // A thin hole, when peeling it would take too long, takes the membrane below: a few
+            // patches thick here, a membrane across it is its surroundings.
+            None if sources.len() > 0 && (!thin || peel_affordable(lw, &lpx, hb, sources.len())) => {
+                onion_peel(lw, lh, ch, ri, &mut limg, &lpx, hb, &sources.all(&valid, lw), ctl)?
+            }
             None => {
-                let unknown: Vec<bool> = lpx.iter().map(|k| matches!(k, Px::Hole | Px::Void)).collect();
+                let mut unknown: Vec<bool> = lpx.iter().map(|k| matches!(k, Px::Hole | Px::Void)).collect();
+                // Across a thin hole the membrane starts a patch radius out, past the
+                // anti-aliased fringe or halo that a selection drawn close to the object leaves.
+                if thin {
+                    let hole: Vec<bool> = lpx.iter().map(|k| *k == Px::Hole).collect();
+                    for (u, d) in unknown.iter_mut().zip(crate::selection::edt(&hole, lw, lh)) {
+                        *u |= d <= r as f32;
+                    }
+                }
                 let m = membrane_fill(lw, lh, ch, &limg, &unknown);
                 for (i, k) in lpx.iter().enumerate() {
                     if *k == Px::Hole {
@@ -1959,6 +2032,21 @@ fn min_cut(across: usize, along: usize, err: impl Fn(usize, usize) -> f32) -> Ve
 mod tests {
     use super::*;
 
+    /// The mean is matched first: on a nearly flat bright patch with a noisy deviation ratio the
+    /// gain stays where the bias can still reach the target's mean.
+    #[test]
+    fn fit_matches_the_mean_before_the_contrast() {
+        let a = Adapt { gain: (0.9, 1.1), bias: 0.04 };
+        // Target mean 0.70, source mean 0.70; deviations 0.01 vs 0.004 (ratio 2.5).
+        let n = 25.0;
+        let (mt, ms, sdt, sds) = (0.70f32, 0.70f32, 0.01f32, 0.004f32);
+        let (g, b) = fit(a, n, mt * n, (sdt * sdt + mt * mt) * n, ms * n, (sds * sds + ms * ms) * n);
+        assert!((g * ms + b - mt).abs() < 1e-5, "mean {} vs {mt} (g {g}, b {b})", g * ms + b);
+        // Where the mean can't be reached anyway, the limits hold as before.
+        let (g, b) = fit(a, n, 0.2 * n, 0.04 * n, 0.9 * n, 0.81 * n);
+        assert!((a.gain.0..=a.gain.1).contains(&g) && b.abs() <= a.bias + 1e-6);
+    }
+
     /// Smooth gradient plus deterministic fine noise.
     fn texture(w: usize, h: usize) -> Vec<f32> {
         let mut rng = Rng::new(7);
@@ -2081,6 +2169,43 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn a_hole_is_as_thick_as_it_is_through_not_along() {
+        let (w, h) = (240, 120);
+        let all = Bounds { x0: 0, y0: 0, x1: w, y1: h };
+        let thickness = |hole: &[bool]| {
+            let px: Vec<Px> = hole.iter().map(|&o| if o { Px::Hole } else { Px::Source }).collect();
+            hole_thickness(w, hole_bounds(w, h, &px).unwrap_or(all), &px)
+        };
+        // A band 200 px long and 9 px thick; a disc of radius 20; the band touching the edge
+        // counts the outside of the image as not hole.
+        let band: Vec<bool> = (0..w * h).map(|i| (20..220).contains(&(i % w)) && (50..59).contains(&(i / w))).collect();
+        assert!((9..=11).contains(&thickness(&band)), "{}", thickness(&band));
+        assert!((39..=42).contains(&thickness(&disc(w, h, 120.0, 60.0, 20.0))));
+        let edge: Vec<bool> = (0..w * h).map(|i| i / w < 9).collect();
+        assert!((9..=11).contains(&thickness(&edge)), "{}", thickness(&edge));
+    }
+
+    /// A long thin hole goes the thin way (a shallow pyramid that starts from a membrane): it is
+    /// filled, only it changes, and the result does not depend on the thread count either.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn thin_holes_are_filled_the_same_on_any_number_of_threads() {
+        let (w, h) = (300, 200);
+        let img = busy(w, h, 3, 5);
+        // A wavy line 6 px thick across the image.
+        let hole: Vec<bool> = (0..w * h).map(|i| (((i % w) as f32 * 0.05).sin() * 30.0 + 100.0 - (i / w) as f32).abs() < 3.0).collect();
+        let px = roles(w, h, &hole);
+        let run = |threads: usize| {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            pool.install(|| complete_masked(w, h, 3, &img, &px, &CompleteParams::default(), &photocraft_raster::Interrupt::NONE)).unwrap().unwrap()
+        };
+        let one = run(1);
+        assert_eq!(bits(&one), bits(&run(7)));
+        assert!((0..w * h).all(|i| hole[i] || (0..3).all(|c| one[i * 3 + c].to_bits() == img[i * 3 + c].to_bits())));
+        assert!((0..w * h).filter(|&i| hole[i]).all(|i| (0..3).all(|c| one[i * 3 + c].is_finite())));
     }
 
     #[test]

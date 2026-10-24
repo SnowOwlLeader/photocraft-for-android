@@ -7,6 +7,77 @@ const DEPTHS: [u64; 3] = [8, 16, 32];
 const W: i32 = 64;
 const H: i32 = 48;
 
+/// A partial filter strength keeps the source alpha and interpolates the filtered coverage, at every sample depth.
+#[test]
+fn filter_strength_preserves_alpha_and_interpolates_changed_coverage() {
+    for sample in photocraft_color::SampleType::ALL {
+        let fmt = PixelFormat { mode: photocraft_color::ColorMode::Rgb, sample, alpha: true };
+        let mut base = Surface::new(fmt);
+        let mut filtered = Surface::new(fmt);
+        base.fill_rect(Rect::new(0, 0, 1, 1), &[0.2, 0.4, 0.6, 0.5]);
+        filtered.fill_rect(Rect::new(0, 0, 1, 1), &[0.8, 0.6, 0.4, 0.5]);
+        let before = base.pixel(0, 0);
+        let after = filtered.pixel(0, 0);
+        let tolerance = match sample {
+            photocraft_color::SampleType::U8 => 1.0 / 255.0,
+            photocraft_color::SampleType::U16 => 1.0 / 65535.0,
+            photocraft_color::SampleType::F32 => 1e-6,
+        };
+        for opacity in [0.0, 0.01, 0.5, 1.0] {
+            for mode in [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen, BlendMode::Luminosity] {
+                let mixed = blend_surfaces(&base, &filtered, mode, opacity).pixel(0, 0);
+                assert!((mixed[3] - before[3]).abs() <= tolerance);
+                if mode == BlendMode::Normal {
+                    for c in 0..3 {
+                        assert!((mixed[c] - (before[c] + (after[c] - before[c]) * opacity)).abs() <= tolerance);
+                    }
+                }
+            }
+        }
+        filtered.fill_rect(Rect::new(0, 0, 1, 1), &[0.8, 0.6, 0.4, 0.0]);
+        let mixed = blend_surfaces(&base, &filtered, BlendMode::Normal, 0.5).pixel(0, 0);
+        assert!((mixed[3] - before[3] * 0.5).abs() <= tolerance);
+        for c in 0..3 {
+            assert!((mixed[c] - before[c]).abs() <= tolerance);
+        }
+    }
+}
+
+/// Blending a filter result in Screen, Multiply or Luminosity keeps source-over coverage where the filter changed alpha.
+#[test]
+fn non_normal_coverage_changes_retain_source_over_semantics() {
+    for sample in photocraft_color::SampleType::ALL {
+        let fmt = PixelFormat { mode: photocraft_color::ColorMode::Rgb, sample, alpha: true };
+        let mut base = Surface::new(fmt);
+        let mut filtered = Surface::new(fmt);
+        // Input-only, output-only, opaque input with blurred output, and a
+        // translucent pixel whose alpha happens to be unchanged by this filter.
+        for (x, (ba, ta)) in [(0.5, 0.0), (0.0, 0.5), (1.0, 0.25), (0.5, 0.5)].into_iter().enumerate() {
+            let x = x as i32;
+            base.fill_rect(Rect::new(x, 0, 1, 1), &[0.2, 0.4, 0.6, ba]);
+            filtered.fill_rect(Rect::new(x, 0, 1, 1), &[0.8, 0.6, 0.4, ta]);
+        }
+        for mode in [BlendMode::Screen, BlendMode::Multiply, BlendMode::Luminosity] {
+            for opacity in [0.0, 0.01, 0.5, 1.0] {
+                let mixed = blend_surfaces(&base, &filtered, mode, opacity);
+                for x in 0..4 {
+                    if opacity == 0.0 {
+                        assert_eq!(mixed.pixel(x, 0), base.pixel(x, 0));
+                        continue;
+                    }
+                    let b = photocraft_raster::to_rgba(&fmt, &base.pixel(x, 0));
+                    let t = photocraft_raster::to_rgba(&fmt, &filtered.pixel(x, 0));
+                    let expected = photocraft_color::blend::composite(mode, b, t, opacity);
+                    let mut reference = Surface::new(fmt);
+                    reference.fill_rect(Rect::new(x, 0, 1, 1), &expected);
+                    assert_eq!(mixed.pixel(x, 0), reference.pixel(x, 0), "{sample:?} {mode:?} {opacity} x={x}");
+                }
+            }
+        }
+    }
+}
+
+/// A `depth`-bit document with one empty layer.
 fn session(depth: u64) -> Session {
     let mut s = Session::new();
     s.execute("file.new", json!({"width": W, "height": H, "depth": depth})).unwrap();
@@ -150,6 +221,26 @@ fn empty_layer_cannot_be_converted() {
 }
 
 #[test]
+fn convert_to_smart_object_is_disabled_for_a_layer_that_is_already_smart() {
+    let mut s = session(8);
+    paint(&mut s);
+    assert!(s.is_enabled("layer.smartObjects.convertToSmartObject"));
+    convert(&mut s);
+    assert!(!s.is_enabled("layer.smartObjects.convertToSmartObject"));
+}
+
+#[test]
+fn convert_to_smart_object_stays_enabled_for_a_selection_that_includes_a_smart_object() {
+    let mut s = session(8);
+    paint(&mut s);
+    let smart_id = LayerId(convert(&mut s));
+    s.execute("layer.new.layer", json!({})).unwrap();
+    let other_id = s.active().unwrap().active_layer.unwrap();
+    crate::layer_multi_cmds::set_selection(&mut s, vec![smart_id, other_id], Some(other_id), None).unwrap();
+    assert!(s.is_enabled("layer.smartObjects.convertToSmartObject"));
+}
+
+#[test]
 fn smart_filters_are_re_editable() {
     for depth in [8, 16] {
         let mut s = session(depth);
@@ -243,8 +334,71 @@ fn smart_filter_commands_check_an_explicit_layer_target() {
     assert_eq!(active(&s), curves, "the active layer stays");
     // A target that isn't a smart object with filters is still refused, and the active layer stays.
     assert!(matches!(s.execute("layer.smartFilter.setParams", json!({"layer": curves, "params": {}})), Err(EngineError::Disabled(..))));
-    assert!(s.execute("layer.smartFilter.setParams", json!({"layer": 999_999, "params": {}})).is_err());
+    assert!(s.execute("layer.smartFilter.setParams", json!({"layer": u64::MAX, "params": {}})).is_err());
     assert_eq!(active(&s), curves);
+}
+
+/// #4271: dragging smart filters onto another smart object moves them, ⌥-dragging copies them;
+/// one filter or all of them (with the filter mask), each in one undo step.
+#[test]
+fn smart_filters_move_or_copy_to_another_smart_object() {
+    let mut s = session(8);
+    paint(&mut s);
+    let a = convert(&mut s);
+    s.execute("select.rect", json!({"x": 0, "y": 0, "width": 16, "height": 48})).unwrap();
+    s.execute("filter.other.offset", json!({"horizontal": 5, "undefinedAreas": "transparent"})).unwrap();
+    s.execute("select.deselect", json!({})).unwrap();
+    s.execute("filter.blur.gaussianBlur", json!({"radius": 3})).unwrap();
+    s.execute("layer.new.layer", json!({})).unwrap();
+    paint(&mut s);
+    let b = convert(&mut s);
+    let pixel = s.execute("layer.new.layer", json!({})).unwrap()["layer"].as_u64().unwrap();
+    let so = |s: &Session, id: u64| match &s.active().unwrap().doc.layer(LayerId(id)).unwrap().content {
+        LayerContent::Smart(sm) => sm.clone(),
+        other => panic!("not smart: {}", other.kind_name()),
+    };
+    let commands = |sm: &SmartObject| sm.smart_filters.iter().map(|f| f.command.clone()).collect::<Vec<_>>();
+    let (offset, blur) = ("filter.other.offset", "filter.blur.gaussianBlur");
+    assert_eq!(commands(&so(&s, a)), [offset, blur]);
+    assert!(so(&s, a).filter_mask.is_some());
+    let before = flat(&s);
+
+    // ⌥-drag the blur: B gets a copy (re-rendered), A keeps it.
+    s.execute("layer.smartFilter.transfer", json!({"from": a, "to": b, "filter": 1, "copy": true})).unwrap();
+    assert_eq!(commands(&so(&s, b)), [blur]);
+    assert_eq!(commands(&so(&s, a)), [offset, blur]);
+    assert!(so(&s, b).filter_mask.is_none(), "one filter comes without the mask");
+    assert!(max_diff(&flat(&s), &before) > 1e-3, "B is blurred");
+    s.undo();
+    assert!(so(&s, b).smart_filters.is_empty());
+    assert_eq!(flat(&s), before);
+
+    // Drag the offset: it moves to the top of B's filters.
+    s.redo();
+    s.execute("layer.smartFilter.transfer", json!({"from": a, "to": b, "filter": 0})).unwrap();
+    assert_eq!(commands(&so(&s, a)), [blur]);
+    assert_eq!(commands(&so(&s, b)), [blur, offset]);
+
+    // Drag the Smart Filters row: all of A's filters and its filter mask move to B.
+    let mask = so(&s, a).filter_mask;
+    s.execute("layer.smartFilter.transfer", json!({"from": a, "to": b})).unwrap();
+    assert!(so(&s, a).smart_filters.is_empty() && so(&s, a).filter_mask.is_none());
+    assert_eq!(commands(&so(&s, b)), [blur, offset, blur]);
+    assert_eq!(so(&s, b).filter_mask, mask);
+    s.undo();
+    assert_eq!(so(&s, a).smart_filters.len(), 1);
+    assert_eq!(so(&s, b).smart_filters.len(), 2);
+
+    // Refused: onto itself, onto a layer that isn't a smart object, a bad index, no filters.
+    let transfer = |s: &mut Session, p: Value| s.execute("layer.smartFilter.transfer", p);
+    assert!(transfer(&mut s, json!({"from": a, "to": a})).is_err());
+    assert!(transfer(&mut s, json!({"from": a, "to": pixel})).is_err());
+    assert!(transfer(&mut s, json!({"from": a, "to": b, "filter": 5})).is_err());
+    assert!(transfer(&mut s, json!({"from": a, "to": b, "index": 0})).is_err(), "`index` isn't taken for `filter`");
+    assert!(transfer(&mut s, json!({"from": pixel, "to": b})).is_err());
+    s.execute("layer.smartFilter.clearSmartFilters", json!({"layer": a})).unwrap();
+    assert!(transfer(&mut s, json!({"from": a, "to": b})).is_err());
+    assert_eq!(so(&s, b).smart_filters.len(), 2, "nothing changed");
 }
 
 #[test]
@@ -265,6 +419,37 @@ fn selection_becomes_the_filter_mask() {
     s.execute("layer.smartFilter.deleteFilterMask", json!({})).unwrap();
     assert!(active_smart(&s).filter_mask.is_none());
     assert!(!s.is_enabled("layer.smartFilter.deleteFilterMask"));
+}
+
+/// #5619: deleting (or dragging away) the last smart filter removes the filter mask with it, so
+/// the next filter takes the new selection instead of the old one.
+#[test]
+fn removing_the_last_filter_removes_its_filter_mask() {
+    let mut s = session(8);
+    paint(&mut s);
+    let original = flat(&s);
+    let a = convert(&mut s);
+    s.execute("select.rect", json!({"x": 0, "y": 0, "width": 16, "height": 48})).unwrap();
+    s.execute("filter.blur.gaussianBlur", json!({"radius": 3})).unwrap();
+    assert!(active_smart(&s).filter_mask.is_some());
+    s.execute("layer.smartFilter.delete", json!({})).unwrap();
+    assert!(active_smart(&s).filter_mask.is_none(), "the last filter takes its mask along");
+    s.execute("select.rect", json!({"x": 20, "y": 0, "width": 20, "height": 48})).unwrap();
+    s.execute("filter.blur.gaussianBlur", json!({"radius": 3})).unwrap();
+    let px = flat(&s);
+    let at = |v: &Vec<[f32; 4]>, x: i32, y: i32| v[(y * W + x) as usize];
+    assert_eq!(at(&px, 6, 20), at(&original, 6, 20), "the old selection is not filtered");
+    assert_ne!(at(&px, 30, 20), at(&original, 30, 20), "the new selection is filtered");
+
+    // Dragging the only filter to another smart object leaves no mask behind either.
+    s.execute("select.deselect", json!({})).unwrap();
+    s.execute("layer.new.layer", json!({})).unwrap();
+    paint(&mut s);
+    let b = convert(&mut s);
+    s.execute("layer.smartFilter.transfer", json!({"from": a, "to": b, "filter": 0})).unwrap();
+    let doc = &s.active().unwrap().doc;
+    let LayerContent::Smart(sm) = &doc.layer(LayerId(a)).unwrap().content else { panic!("not smart") };
+    assert!(sm.smart_filters.is_empty() && sm.filter_mask.is_none());
 }
 
 /// Scales `id` to 10 % around the origin and back, returning the composite.
@@ -466,8 +651,18 @@ fn export_replace_and_linked_contents() {
     paint(&mut s);
     convert(&mut s);
     let out = dir.join("contents.pcraft");
-    s.execute("layer.smartObjects.exportContents", json!({"path": out.to_str().unwrap()})).unwrap();
+    let r = s.execute("layer.smartObjects.exportContents", json!({"path": out.to_str().unwrap()})).unwrap();
     assert!(photocraft_format::is_pcraft(&std::fs::read(&out).unwrap()));
+    assert_eq!(r["converted"], false);
+    // Another extension exports the contents in that format.
+    for (ext, magic) in [("png", &b"\x89PNG"[..]), ("jpeg", &b"\xFF\xD8\xFF"[..]), ("psd", &b"8BPS"[..])] {
+        let other = dir.join(format!("contents.{ext}"));
+        let r = s.execute("layer.smartObjects.exportContents", json!({"path": other.to_str().unwrap()})).unwrap();
+        assert_eq!(r["converted"], true, "{ext}");
+        assert!(std::fs::read(&other).unwrap().starts_with(magic), "{ext}");
+    }
+    let bad = dir.join("contents.nope");
+    assert!(s.execute("layer.smartObjects.exportContents", json!({"path": bad.to_str().unwrap()})).is_err());
     // Replace with a flat PNG.
     let png_doc = Document::with_background(
         "p",
@@ -620,6 +815,30 @@ fn warp_on_a_distorted_smart_object_follows_the_corners() {
     let after = active_smart(&s);
     assert!(after.warp.is_some());
     assert_eq!(after.perspective, before);
+}
+
+/// A `mesh` whose points are exactly the placement leaves a sheared smart object unchanged: its
+/// knots span the contents, not the bounding frame of the warp box seen from the contents (#4113).
+#[test]
+fn identity_mesh_on_a_skewed_smart_object_changes_nothing() {
+    let mut s = session(8);
+    paint(&mut s);
+    let id = convert(&mut s);
+    let r = active_smart(&s).cache.unwrap().content_bounds();
+    let (x0, y0, x1, y1) = (f64::from(r.x0), f64::from(r.y0), f64::from(r.x1), f64::from(r.y1));
+    let quad = [[x0, y0], [x1, y0 + 10.0], [x1, y1 + 10.0], [x0, y1]];
+    s.execute("edit.transform", json!({"layer": id, "rect": [x0, y0, x1, y1], "quad": quad})).unwrap();
+    let before = flat(&s);
+    let sm = active_smart(&s);
+    let (h, b) = (placement(&sm), crate::smart_cmds::source_box(&s.active().unwrap().doc, &sm).unwrap());
+    let place = |u: f64, v: f64| {
+        let (x, y) = h.apply(b[0] + u * (b[2] - b[0]), b[1] + v * (b[3] - b[1]));
+        [x, y]
+    };
+    let mesh = photocraft_geom::warp::BezierMesh::fit(&place, vec![0.0, 1.0], vec![0.0, 0.25, 1.0]);
+    let rect = [x0, y0, x1, y1 + 10.0];
+    s.execute("layer.smartObjects.warp", json!({"layer": id, "style": "custom", "rect": rect, "mesh": mesh})).unwrap();
+    assert!(mean_diff(&before, &flat(&s)) < 0.01, "mean diff {}", mean_diff(&before, &flat(&s)));
 }
 
 fn convert_to_layers(s: &mut Session) -> Value {
@@ -965,6 +1184,10 @@ fn inspect_reports_the_smart_source() {
     let source = |s: &Session| crate::inspect::layer(s.active().unwrap().doc.layer(s.active().unwrap().active_layer.unwrap()).unwrap())["smartSource"].clone();
     let front = source(&s);
     assert_eq!(front, json!({"kind": "linked", "path": "uuid-1"}));
+    // The document's info knows the file is embedded in the PSD (a `liFD` item) and says so,
+    // with its file name; the uuid stays its key.
+    let info = crate::inspect::document(s.active().unwrap());
+    assert_eq!(info["layers"][0]["smartSource"], json!({"kind": "embedded", "fileName": "in.png", "uuid": "uuid-1"}));
     // A duplicate shares the file; New Smart Object via Copy gets its own.
     s.execute("layer.duplicate", json!({})).unwrap();
     assert_eq!(source(&s), front, "a duplicate shares its source");
@@ -1006,4 +1229,84 @@ fn displace_smart_filter_reads_its_map_path_on_re_render() {
         assert!(max_diff(&before, &flat(&s)) > 0.1, "shown again at {depth}-bit");
     }
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Clouds and Difference Clouds on a smart object are smart filters, as in Photoshop, and keep
+/// the colours they were drawn with: re-rendering after the colours change gives the same clouds.
+#[test]
+fn clouds_on_a_smart_object_are_smart_filters_with_their_colours() {
+    for depth in DEPTHS {
+        let mut s = session(depth);
+        paint(&mut s);
+        s.execute("filter.convertForSmartFilters", json!({})).unwrap();
+        s.tools.foreground = [1.0, 0.0, 0.0, 1.0];
+        s.tools.background = [0.0, 0.0, 1.0, 1.0];
+        s.execute("filter.render.clouds", json!({"seed": 5})).unwrap();
+        s.execute("filter.render.differenceClouds", json!({"seed": 9})).unwrap();
+        let sm = active_smart(&s);
+        let commands: Vec<&str> = sm.smart_filters.iter().map(|f| f.command.as_str()).collect();
+        assert_eq!(commands, ["filter.render.clouds", "filter.render.differenceClouds"]);
+        assert_eq!(sm.smart_filters[0].params["foreground"], json!([1.0, 0.0, 0.0, 1.0]));
+        assert_eq!(sm.smart_filters[1].params["background"], json!([0.0, 0.0, 1.0, 1.0]));
+        // Red-to-blue clouds, and their difference, have no green: they fill the object (painted
+        // from (-6, 5) to (40, 38)) over the white background.
+        let rendered = flat(&s);
+        let object: Vec<[f32; 4]> = (5..38).flat_map(|y| (0..40).map(move |x| (y * W + x) as usize)).map(|i| rendered[i]).collect();
+        assert!(object.iter().all(|p| p[1] < 0.02), "depth {depth}");
+        assert!(max_diff(&object, &vec![object[0]; object.len()]) > 0.05, "the clouds vary");
+        s.tools.foreground = [0.0, 1.0, 0.0, 1.0];
+        s.execute("layer.smartFilter.setParams", json!({"index": 1, "params": {"seed": 9}})).unwrap();
+        assert!(max_diff(&flat(&s), &rendered) < 1e-6, "depth {depth}: same params, same clouds");
+        s.undo();
+        s.undo();
+        assert_eq!(active_smart(&s).smart_filters.len(), 1);
+    }
+}
+
+/// Render filters on a smart object work within the object, as in Photoshop (and as PSD stores
+/// them): Lens Flare's centre is a fraction of the object's bounds, not of the canvas.
+#[test]
+fn lens_flare_centres_on_the_smart_object() {
+    let mut s = session(8);
+    let block = Rect::new(32, 24, W, H);
+    s.edit("setup", |doc, active| {
+        let surf = doc.layer_mut(active.unwrap()).unwrap().surface_mut().unwrap();
+        let fmt = surf.format();
+        let px = photocraft_raster::from_rgba(&fmt, [0.1, 0.1, 0.1, 1.0]);
+        surf.write_region(block, &px.repeat((block.width() * block.height()) as usize));
+        Ok(())
+    })
+    .unwrap();
+    convert(&mut s);
+    s.execute("filter.render.lensFlare", json!({"centerX": 0.5, "centerY": 0.5, "lens": "prime105"})).unwrap();
+    // The centre of the brightest pixels inside the object (the canvas around it is white).
+    let px = flat(&s);
+    let inside: Vec<(i32, i32, f32)> =
+        (block.y0..block.y1).flat_map(|y| (block.x0..block.x1).map(move |x| (x, y))).map(|(x, y)| (x, y, px[(y * W + x) as usize][1])).collect();
+    let peak = inside.iter().map(|p| p.2).fold(0.0, f32::max);
+    let core: Vec<_> = inside.iter().filter(|p| p.2 >= peak - 0.02).collect();
+    let (x, y) = (core.iter().map(|p| p.0).sum::<i32>() / core.len() as i32, core.iter().map(|p| p.1).sum::<i32>() / core.len() as i32);
+    assert!((x - 48).abs() <= 1 && (y - 36).abs() <= 1, "flare at {x},{y}, the object's centre is 48,36");
+}
+
+/// Moving a smart object moves its Clouds and Fibers with it: the pattern is anchored at the
+/// object, not at the canvas, so re-rendering after the move doesn't change the texture.
+#[test]
+fn clouds_and_fibers_move_with_the_smart_object() {
+    for (command, params) in [("filter.render.clouds", json!({"seed": 3})), ("filter.render.fibers", json!({"seed": 3}))] {
+        let mut s = session(8);
+        paint(&mut s);
+        let id = convert(&mut s);
+        s.execute(command, params).unwrap();
+        let before = flat(&s);
+        s.execute("edit.transform", json!({"layer": id, "matrix": [1, 0, 0, 1, 8, 6]})).unwrap();
+        let after = flat(&s);
+        // Inside the object (painted from (-6, 5) to (40, 38)) both before and after the move.
+        for y in 8..30 {
+            for x in 2..30 {
+                let (a, b) = (before[(y * W + x) as usize], after[((y + 6) * W + x + 8) as usize]);
+                assert!((0..4).all(|c| (a[c] - b[c]).abs() < 1e-3), "{command} at {x},{y}: {a:?} vs {b:?}");
+            }
+        }
+    }
 }

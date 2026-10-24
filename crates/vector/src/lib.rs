@@ -5,6 +5,7 @@
 //! mask back into a path for "Make Work Path").
 //!
 //! * [`edit`]: point-level path editing (Direct Selection, Convert Point) and hit testing.
+//! * [`feather`]: the Gaussian blur of a feathered mask (vector masks, pixel masks, soft shapes).
 //! * [`flatten`]: cubic Bézier flattening with a distance tolerance.
 //! * [`map`]: non-affine maps of paths (Distort, Perspective, Warp).
 //! * [`raster`]: exact area-coverage scanline rasterizer (non-zero / even-odd per component,
@@ -20,6 +21,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod edit;
+pub mod feather;
 pub mod flatten;
 pub mod map;
 pub mod raster;
@@ -43,10 +45,12 @@ pub const DEFAULT_TOLERANCE: f64 = 0.01;
 /// folded with the subpath operations; open subpaths are closed implicitly.
 pub fn fill_rasterizer(path: &Path, tol: f64) -> Rasterizer {
     let mut r = Rasterizer::new(path.inverted);
+    // One point budget for the whole path, then one edge sort for all components.
+    let polys: Vec<Vec<(f64, f64)>> = flatten_path(path, tol).into_iter().map(|l| l.pts).collect();
     for c in path.components() {
-        let polys: Vec<Vec<(f64, f64)>> = path.subpaths[c.clone()].iter().map(|s| flatten_subpath(s, tol).pts).collect();
-        r.add_component(&polys, path.effective_op(c.start), path.fill_rule);
+        r.push_component(polys.get(c.clone()).unwrap_or_default(), path.effective_op(c.start), path.fill_rule);
     }
+    r.sort_edges();
     r
 }
 
@@ -105,26 +109,26 @@ impl CompiledVectorMask {
 
     /// Effective mask values over `rect`, with invocation-local rasterization state.
     pub fn render(&self, rect: Rect) -> Vec<f32> {
-        let mut v = match &self.geometry {
-            MaskGeometry::Constant(value) => vec![*value; rect.width() as usize * rect.height() as usize],
-            MaskGeometry::Path(rasterizer) => rasterizer.render(rect),
-        };
-        self.apply_density(&mut v);
-        v
+        self.render_with(rect, Rasterizer::render)
     }
 
     /// Effective mask values without entering a thread pool. Use this while
     /// initializing a shared result that other Rayon workers may wait for.
     pub fn render_sequential(&self, rect: Rect) -> Vec<f32> {
+        self.render_with(rect, |rasterizer, rect| {
+            let mut v = vec![0.0; rect.width() as usize * rect.height() as usize];
+            if !v.is_empty() {
+                rasterizer.render_into(rect, &mut v);
+            }
+            v
+        })
+    }
+
+    /// Mask values over `rect`, with a path's coverage from `coverage`.
+    fn render_with(&self, rect: Rect, coverage: impl FnOnce(&Rasterizer, Rect) -> Vec<f32>) -> Vec<f32> {
         let mut v = match &self.geometry {
             MaskGeometry::Constant(value) => vec![*value; rect.width() as usize * rect.height() as usize],
-            MaskGeometry::Path(rasterizer) => {
-                let mut v = vec![0.0; rect.width() as usize * rect.height() as usize];
-                if !v.is_empty() {
-                    rasterizer.render_into(rect, &mut v);
-                }
-                v
-            }
+            MaskGeometry::Path(rasterizer) => coverage(rasterizer, rect),
         };
         self.apply_density(&mut v);
         v
@@ -456,9 +460,101 @@ fn dither(c: &mut [f32; 4], x: i32, y: i32) {
     }
 }
 
+/// How much of a shape's fill shows at each pixel: the path's coverage, or (with a density or
+/// feather) the path as the fill's soft vector mask.
+enum FillCoverage {
+    Path(Rasterizer),
+    /// Density without feather: `1 - density × (1 - coverage)`.
+    Dense(Rasterizer, f32),
+    /// Feathered (and maybe less dense): the mask over `area`, `outside` everywhere else.
+    Plane {
+        area: Rect,
+        values: Vec<f32>,
+        outside: f32,
+    },
+}
+
+impl FillCoverage {
+    /// Builds the fill's coverage for `shape` over the frame `canvas` (a feather is blurred
+    /// within it, as the compositor blurs a vector mask within the canvas).
+    fn new(shape: &ShapeLayer, area: &Rasterizer, canvas: Rect) -> Self {
+        if !shape.has_soft_mask() {
+            return FillCoverage::Path(area.clone());
+        }
+        let density = if shape.density.is_finite() { shape.density.clamp(0.0, 1.0) } else { 1.0 };
+        let sigma = feather::feather_sigma(shape.feather);
+        if sigma <= 0.0 {
+            return FillCoverage::Dense(area.clone(), density);
+        }
+        // Exactly what the compositor does for a vector mask with these settings
+        // (`photocraft-compose::masks::build_mask`): coverage with density, blurred.
+        let soften = |v: &mut [f32]| {
+            if density < 1.0 {
+                for x in v.iter_mut() {
+                    *x = 1.0 - density * (1.0 - *x);
+                }
+            }
+        };
+        let mut far = area.render(Rect::from_xywh(canvas.x0.saturating_sub(1_000_000), canvas.y0.saturating_sub(1_000_000), 1, 1));
+        soften(&mut far);
+        let outside = far.first().copied().unwrap_or(0.0);
+        let region = feather::path_area(&shape.path, sigma).intersect(&canvas);
+        let (w, h) = (region.width() as usize, region.height() as usize);
+        let mut values = Vec::new();
+        if values.try_reserve_exact(w.saturating_mul(h)).is_err() {
+            // Too large to blur: keep the edge hard rather than fail the render.
+            return FillCoverage::Dense(area.clone(), density);
+        }
+        values.resize(w * h, 0.0);
+        if !values.is_empty() {
+            area.render_into(region, &mut values);
+            soften(&mut values);
+            feather::gaussian(&mut values, w, h, sigma);
+        }
+        FillCoverage::Plane { area: region, values, outside }
+    }
+
+    /// Pixel bounds of the visible fill (`None` = nothing).
+    fn bounds(&self) -> Option<Rect> {
+        const ALL: Rect = Rect::new(i32::MIN / 4, i32::MIN / 4, i32::MAX / 4, i32::MAX / 4);
+        match self {
+            FillCoverage::Path(r) => r.pixel_bounds(),
+            FillCoverage::Dense(_, d) if *d < 1.0 => Some(ALL),
+            FillCoverage::Dense(r, _) => r.pixel_bounds(),
+            FillCoverage::Plane { outside, .. } if *outside > 0.0 => Some(ALL),
+            FillCoverage::Plane { area, .. } => (!area.is_empty()).then_some(*area),
+        }
+    }
+
+    fn render(&self, rect: Rect) -> Vec<f32> {
+        match self {
+            FillCoverage::Path(r) => r.render(rect),
+            FillCoverage::Dense(r, d) => {
+                let mut v = r.render(rect);
+                for x in &mut v {
+                    *x = 1.0 - d * (1.0 - *x);
+                }
+                v
+            }
+            FillCoverage::Plane { area, values, outside } => {
+                let w = area.width() as usize;
+                let mut v = Vec::with_capacity(rect.width() as usize * rect.height() as usize);
+                for y in rect.y0..rect.y1 {
+                    for x in rect.x0..rect.x1 {
+                        let inside = area.contains(x, y);
+                        let i = if inside { (y - area.y0) as usize * w + (x - area.x0) as usize } else { usize::MAX };
+                        v.push(values.get(i).copied().unwrap_or(*outside));
+                    }
+                }
+                v
+            }
+        }
+    }
+}
+
 /// Everything needed to render a shape layer, compiled once.
 pub struct CompiledShape {
-    fill: Option<(Rasterizer, Paint)>,
+    fill: Option<(FillCoverage, Paint)>,
     stroke: Option<(Rasterizer, Paint, f32)>,
     /// Fill area used to clip inside/outside strokes.
     align: Option<(Rasterizer, bool)>,
@@ -474,8 +570,9 @@ impl CompiledShape {
         let area = fill_rasterizer(&shape.path, tol);
         let mut bounds = None;
         let fill = shape.fill.as_ref().map(|f| {
-            bounds = area.pixel_bounds();
-            (area.clone(), Paint::from_fill(f, pb, cb))
+            let coverage = FillCoverage::new(shape, &area, canvas);
+            bounds = coverage.bounds();
+            (coverage, Paint::from_fill(f, pb, cb))
         });
         let all_closed = shape.path.subpaths.iter().all(|s| s.closed);
         let mut align = None;

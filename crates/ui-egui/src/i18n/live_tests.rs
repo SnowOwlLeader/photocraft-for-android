@@ -4,6 +4,13 @@ use super::*;
 use crate::{PhotocraftApp, Services};
 use serde_json::json;
 
+/// The File menu's title as the menu bar draws it in `lang`: the translation, plus the English
+/// access key where it has no Latin letter of its own ("文件(F)", #5863).
+fn file_title(lang: Lang) -> String {
+    let (shown, _) = crate::menu_keys::localized(&[tr(lang, "File").to_string()], &["File"], &[Some('F')]);
+    shown.into_iter().next().unwrap_or_default()
+}
+
 fn lang(code: &str) -> Lang {
     Lang::from_code(code).expect("registered language")
 }
@@ -20,6 +27,7 @@ fn requested_languages_resolve_regional_preferences() {
         ("fr-CA", "fr"),
         ("id-ID", "id"),
         ("vi-VN", "vi"),
+        ("sr-RS", "sr"),
     ] {
         assert_eq!(Lang::from_pref(tag), lang(code), "{tag}");
     }
@@ -38,6 +46,46 @@ fn ukrainian_native_app_menu_keeps_product_and_language_names() {
             assert_eq!(layout.bar.find(id).map(|item| item.label.as_str()), Some(label), "{id}");
         }
         assert_eq!(layout.bar.find("app.language.uk").map(|item| (item.label.as_str(), item.checked)), Some(("Українська", Some(true))));
+    });
+}
+
+#[test]
+fn ukrainian_color_picker_titles_draw_in_the_selected_language() {
+    with_language(Lang::EN, || {
+        for (target, expected) in [("foreground", "Вибір кольору (основний колір)"), ("background", "Вибір кольору (колір тла)")]
+        {
+            let mut h = harness();
+            h.state_mut().run("prefs.set", json!({"path": "interface.language", "value": "uk"})).unwrap();
+            crate::color_picker_ui::open(h.state_mut(), target);
+            h.run_steps(4);
+            let text = drawn_text(&h);
+            assert!(text.iter().any(|text| text == expected), "missing title {expected}");
+            assert!(!text.iter().any(|text| text.starts_with("Color Picker")), "no English picker title");
+        }
+        assert_eq!(tr(lang("uk"), "Color Picker (Custom Canvas Color)"), "Вибір кольору (власний колір полотна)");
+    });
+}
+
+#[test]
+fn ukrainian_rasterize_prompts_explain_the_loss_of_editable_content() {
+    use crate::rasterize_prompt::Kind;
+
+    for kind in Kind::ALL {
+        let translated = tr(lang("uk"), kind.message());
+        assert_ne!(translated, kind.message(), "{kind:?}: the warning must be translated");
+        assert!(translated.contains("більше не можна буде редагувати"), "{kind:?}: explain the loss of editability");
+    }
+    with_language(Lang::EN, || {
+        let mut h = harness();
+        h.state_mut().run("prefs.set", json!({"path": "interface.language", "value": "uk"})).unwrap();
+        h.state_mut().run("type.create", json!({"text": "Editable text"})).unwrap();
+        let layer = h.state().session.active().unwrap().active_layer.unwrap();
+        crate::rasterize_prompt::open(h.state_mut(), Kind::Type, layer, crate::state::Tool::Brush, [10.0, 10.0, 1.0]);
+        h.run_steps(4);
+        let expected = tr(lang("uk"), Kind::Type.message());
+        let text = drawn_text(&h);
+        assert!(text.iter().any(|text| text == expected), "the actual dialog draws the Ukrainian warning");
+        assert!(!text.iter().any(|text| text == Kind::Type.message()));
     });
 }
 
@@ -92,7 +140,8 @@ fn dynamic_brush_sections_have_translations_and_draw_in_the_selected_language() 
         h.state_mut().ui.panels.brush_settings = true;
         h.run_steps(4);
         let text = drawn_text(&h);
-        assert!(text.iter().filter(|text| text.as_str() == "画笔笔尖形状").count() >= 2, "both the section row and heading must be translated");
+        // The section row is the only place the name is drawn: the options pane has no heading (#3477).
+        assert_eq!(text.iter().filter(|text| text.as_str() == "画笔笔尖形状").count(), 1, "the section row must be translated");
         assert!(!text.iter().any(|text| text == "Brush Tip Shape"));
     });
 }
@@ -223,7 +272,7 @@ fn first_launch_renders_the_system_language_without_overwriting_auto() {
                 let h = harness();
                 assert_eq!(h.state().session.prefs().interface.language, "auto");
                 assert_eq!(current(), lang(code), "{tag}");
-                assert!(drawn_text(&h).iter().any(|text| text.as_str() == tr(lang(code), "File")), "first-launch menu: {tag}");
+                assert!(drawn_text(&h).iter().any(|text| *text == file_title(lang(code))), "first-launch menu: {tag}");
             });
         });
     }
@@ -274,7 +323,7 @@ fn an_explicit_language_survives_restart_on_a_different_system_language() {
             let h = harness_with_services(services);
             assert_eq!(h.state().session.prefs().interface.language, "ko");
             assert_eq!(current(), lang("ko"));
-            assert!(drawn_text(&h).iter().any(|text| text.as_str() == tr(lang("ko"), "File")));
+            assert!(drawn_text(&h).iter().any(|text| *text == file_title(lang("ko"))));
         });
     });
 }
@@ -293,7 +342,7 @@ fn a_control_request_changes_the_drawing_language_in_the_same_frame() {
             h.step();
             assert_eq!(reply.try_recv().expect("response")["ok"], true);
             assert_eq!(current(), lang(code));
-            assert!(drawn_text(&h).iter().any(|text| text == tr(lang(code), "File")), "the menu must change in this frame: {code}");
+            assert!(drawn_text(&h).iter().any(|text| *text == file_title(lang(code))), "the menu must change in this frame: {code}");
             assert!(std::sync::Arc::ptr_eq(&document, &h.state().session.active().expect("document").doc), "switching language must preserve the document");
         }
         assert!(h.state_mut().run("prefs.set", json!({"path": "interface.language", "value": []})).is_err());
@@ -387,7 +436,8 @@ fn czech_status_notices_and_navigator_draw_translated_text() {
         });
         h.run_steps(4);
         let text = drawn_text(&h);
-        for want in ["Zvětšení", "Soubor English file.psd se nepodařilo otevřít: disk full", "Předvolby nelze uložit"] {
+        // The Navigator's own text is its tab title now: its zoom row has no label (#4840).
+        for want in ["Navigátor", "Soubor English file.psd se nepodařilo otevřít: disk full", "Předvolby nelze uložit"] {
             assert!(text.iter().any(|text| text == want), "missing {want}: {text:?}");
         }
         // Czech text must be drawable by the bundled fonts, including the new notices.

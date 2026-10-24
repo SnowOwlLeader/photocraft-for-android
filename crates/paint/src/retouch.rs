@@ -102,7 +102,8 @@ pub fn dab_rect(d: &Dab) -> Rect {
 
 /// Rasterize one dab's coverage.
 pub fn footprint(d: &Dab, index: usize, hardness: f32) -> Footprint {
-    let rect = dab_rect(d);
+    // A soft tip paints past its nominal radius.
+    let rect = crate::render::rect_around(d, crate::tip_reach(d.radius, hardness).max(d.radius));
     let (cx, cy) = (d.center.x as f32, d.center.y as f32);
     let mut cov = Vec::with_capacity(rect.width() as usize * rect.height() as usize);
     for y in rect.y0..rect.y1 {
@@ -129,6 +130,24 @@ pub fn stroke_coverage(stroke: &Stroke) -> (Rect, Vec<f32>) {
     r.dense_coverage()
 }
 
+/// [`stroke_coverage`] that admits the **rendered** extent before it is made dense: `None` when the
+/// stroke covers more than `max_pixels`.
+///
+/// Rendering itself is tiled, so it holds only the tiles the dabs touch. The bounds are read from
+/// those tiles, after tips, dynamics and scattering have placed every dab, so this is the stroke's
+/// real extent rather than an estimate from the input points. Only then is the `width × height`
+/// buffer allocated, which is what callers need bounded.
+pub fn stroke_coverage_within(stroke: &Stroke, max_pixels: u64) -> Option<(Rect, Vec<f32>)> {
+    let mut r = crate::StrokeRenderer::new(&stroke.brush, None, 1.0);
+    r.push(&stroke.points);
+    r.finish();
+    let b = r.bounds();
+    if u64::from(b.width()).saturating_mul(u64::from(b.height())) > max_pixels {
+        return None;
+    }
+    Some(r.dense_coverage())
+}
+
 /// Index of the alpha channel, if the format has one.
 #[inline]
 pub fn alpha_index(fmt: &PixelFormat) -> Option<usize> {
@@ -142,15 +161,20 @@ pub fn over_native(fmt: &PixelFormat, dst: &mut [f32], src: &[f32], k: f32, lock
     match alpha_index(fmt) {
         Some(a) => {
             let (da, sa) = (dst[a], src[a] * k);
+            if lock_transparency {
+                // Alpha kept: source atop, the colour moves by the source alpha alone (#5783).
+                for c in 0..a {
+                    dst[c] += (src[c] - dst[c]) * sa;
+                }
+                return;
+            }
             let oa = sa + da * (1.0 - sa);
             if oa > 0.0 {
                 for c in 0..a {
                     dst[c] = (src[c] * sa + dst[c] * da * (1.0 - sa)) / oa;
                 }
             }
-            if !lock_transparency {
-                dst[a] = oa;
-            }
+            dst[a] = oa;
         }
         None => {
             for c in 0..dst.len() {
@@ -201,10 +225,8 @@ pub fn apply_coverage(
         } else {
             let d = to_rgba(&fmt, px);
             let s = to_rgba(&fmt, src);
-            let mut o = photocraft_color::blend::composite(blend, d, s, k);
-            if lock_transparency {
-                o[3] = d[3];
-            }
+            let o =
+                if lock_transparency { photocraft_color::blend::composite_atop(blend, d, s, k) } else { photocraft_color::blend::composite(blend, d, s, k) };
             let mut enc = [0.0f32; 8];
             from_rgba_into(&fmt, o, &mut enc);
             px.copy_from_slice(&enc[..n]);
@@ -463,6 +485,23 @@ mod tests {
     }
 
     #[test]
+    fn coverage_composite_under_lock_blends_source_atop() {
+        // Locked half-transparent white, black at coverage 0.5: colour halfway, alpha kept (#5783).
+        for fmt in [PixelFormat::RGBA8, PixelFormat::RGBA16, PixelFormat::RGBA32F] {
+            for mode in [BlendMode::Normal, BlendMode::Multiply] {
+                let mut s = Surface::new(fmt);
+                s.fill_rect(Rect::new(0, 0, 4, 4), &[1.0, 1.0, 1.0, 0.5]);
+                let r = Rect::new(0, 0, 4, 4);
+                let mut paint = Region::new(r, 4);
+                paint.data.chunks_mut(4).for_each(|p| p.copy_from_slice(&[0.0, 0.0, 0.0, 1.0]));
+                apply_coverage(&mut s, r, &[1.0; 16], 0.5, None, true, &paint, mode);
+                let p = s.rgba(1, 1);
+                assert!((p[0] - 0.5).abs() < 0.01 && (p[3] - 0.5).abs() < 0.01, "{fmt:?} {mode:?} {p:?}");
+            }
+        }
+    }
+
+    #[test]
     fn dab_stroke_runs_sequentially_and_respects_selection() {
         let mut s = Surface::new(PixelFormat::GRAY8);
         let mut sel = Surface::new(PixelFormat::GRAY8);
@@ -554,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn footprint_stays_inside_the_full_size_ring() {
+    fn footprint_stays_inside_the_tips_reach() {
         let radius = 10.5f32;
         for hardness in [1.0, 0.5, 0.0] {
             let dab = Dab::round(Point::new(32.0, 32.0), radius, 1.0);
@@ -569,8 +608,9 @@ mod tests {
                     }
                     painted += 1;
                     farthest = farthest.max(dist);
+                    let reach = f64::from(crate::tip_reach(radius, hardness));
                     assert!(
-                        dist < radius as f64 + 0.5,
+                        dist < reach.max(radius as f64) + 0.5,
                         "hardness {hardness}: pixel ({x}, {y}) at {dist} px from \
                          the centre is painted past the Full Size ring of \
                          {radius} px"

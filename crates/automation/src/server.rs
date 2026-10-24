@@ -167,6 +167,16 @@ pub struct SaveParams {
     /// alpha, 24 none. Unset: 32 with an alpha channel or transparency, else 24.
     #[serde(default, rename = "tgaBits")]
     pub tga_bits: Option<u8>,
+    /// DPX: 8, 10, 12 or 16 bits per sample. Unset: 8 for an 8-bit document, else 16.
+    #[serde(default, rename = "dpxBits")]
+    pub dpx_bits: Option<u8>,
+    /// DDS: "none" (uncompressed, the default), "bc1" (DXT1: alpha on or off), "bc2" (DXT3) or
+    /// "bc3" (DXT5).
+    #[serde(default, rename = "ddsCompression")]
+    pub dds_compression: Option<String>,
+    /// DDS: also write the full mip chain, each level a box filter of the one above.
+    #[serde(default, rename = "ddsMipmaps")]
+    pub dds_mipmaps: bool,
     #[serde(default)]
     pub index: Option<usize>,
 }
@@ -202,7 +212,7 @@ pub struct SelectParams {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListParams {
-    /// Only commands whose id or label contains this text (case-insensitive).
+    /// Only commands whose id, label or keywords contain this text (case-insensitive).
     #[serde(default)]
     pub filter: Option<String>,
     /// Only commands that can run right now.
@@ -306,7 +316,7 @@ pub struct UiSetParams {
     /// Fields for the control method `ui.set`: tool, panels, dock, dockTabs, dockWidth, colorPanel
     /// ({background: bool} picks which swatch the Color panel edits), maskTarget,
     /// vectorMaskTarget, selectionMode, zoom, center, rotation (view angle in degrees), fit, theme (pro, proMedium, studio,
-    /// studioLight, classic, solarizedDark, adwaita, adwaitaDark, breezeLight, breezeDark), brushSection, brushTab,
+    /// studioLight, classic, solarizedDark, adwaita, adwaitaDark, breezeLight, breezeDark, softLight, softDark), brushSection, brushTab,
     /// brushesView, brushPicker ([x, y] opens the Brush Preset picker there, null closes it),
     /// brushPickerName, brushPickerStroke, brushPickerTip (the picker card's parts, at least one
     /// on), brushPickerScale (the picker footer's card-scale slider, 0.15 to 2, 1 the standard),
@@ -317,10 +327,16 @@ pub struct UiSetParams {
     /// grid, diagonal, triangle, goldenRatio, goldenSpiral), cropOverlayShow (auto, always, never),
     /// cropOverlayOrientation (0..3), cropShield (an object patching show_cropped_area, enabled,
     /// color ("matchCanvas" or "custom"), custom_color ([r, g, b]), opacity (0..100),
-    /// auto_adjust, classic_mode and auto_center_preview), shapeStroke (an object patching width, align, cap, join, miterLimit,
+    /// auto_adjust, classic_mode and auto_center_preview), cropFill (background or contentAware,
+    /// the Crop tool's Fill), shapeStroke (an object patching width, align, cap, join, miterLimit,
     /// dashes, dashOffset and opacity; null disables the stroke). Shape stroke fields use
     /// `shape.edit` names and units; colour comes from `tools.setColors`. camTransformOnDrop (bool,
-    /// the Content-Aware Move tool's Transform On Drop). Other fields are an error.
+    /// the Content-Aware Move tool's Transform On Drop). tileGrid (bool, a developer overlay of the
+    /// active layer's storage tiles). layerFilter (an object patching by ("kind", "name" or
+    /// "mode"), kinds (a list of layer kinds), name (matches part of the layer name) and mode (a
+    /// blend mode name) for the Layers panel filter). strokeTrace (true, false, "stderr" or "off":
+    /// the stroke latency trace at runtime; a CSV file is set at launch with --stroke-trace, not
+    /// over this channel). Other fields are an error.
     pub fields: Value,
 }
 
@@ -792,7 +808,8 @@ impl PhotocraftMcp {
         }
     }
 
-    #[tool(description = "List engine commands: id, label, menu path, shortcut, parameter doc, enabled now. \
+    #[tool(description = "List engine commands. Returns a JSON array (no wrapper object) of {id, label, menu: [path], \
+        shortcut: string|null, params: doc string, enabled: bool, disabledReason: string|null, needsDocument: bool}. \
         `disabledReason` says why a command is off (null when enabled); `needsDocument` is true when it is off because no \
         document is open: create or open one first (doc_new, doc_open).")]
     async fn command_list(&self, Parameters(p): Parameters<ListParams>) -> Result<CallToolResult, McpError> {
@@ -816,9 +833,8 @@ impl PhotocraftMcp {
             .unwrap_or_else(|| all.get("commands").and_then(Value::as_array).cloned().unwrap_or_default())
             .into_iter()
             .filter(|c| {
-                let hay =
-                    format!("{} {}", c.get("id").and_then(Value::as_str).unwrap_or(""), c.get("label").and_then(Value::as_str).unwrap_or("")).to_lowercase();
-                needle.as_ref().is_none_or(|n| hay.contains(n)) && (!enabled_only || c.get("enabled").and_then(Value::as_bool).unwrap_or(true))
+                needle.as_ref().is_none_or(|n| photocraft_engine::commands::list_entry_matches(c, n))
+                    && (!enabled_only || c.get("enabled").and_then(Value::as_bool).unwrap_or(true))
             })
             .collect();
         Ok(ok_json(&Value::Array(items)))
@@ -987,15 +1003,29 @@ impl PhotocraftMcp {
             Some((_, Some(bits))) => Some(bits),
             Some((b, None)) => return Ok(fail(format!("`tgaBits` must be 24 or 32, got {b}"))),
         };
+        let dpx_bits = match p.dpx_bits.map(|b| (b, photocraft_io::DpxBits::from_bits(u64::from(b)))) {
+            None => None,
+            Some((_, Some(bits))) => Some(bits),
+            Some((b, None)) => return Ok(fail(format!("`dpxBits` must be 8, 10, 12 or 16, got {b}"))),
+        };
+        if let Some(q) = p.quality.filter(|q| !(1..=100).contains(q)) {
+            return Ok(fail(format!("`quality` must be a whole number from 1 to 100, got {q}")));
+        }
+        let dds_compression = match p.dds_compression.as_deref().map(|c| (c, photocraft_io::DdsCompression::from_name(c))) {
+            None => None,
+            Some((_, Some(c))) => Some(c),
+            Some((c, None)) => return Ok(fail(format!("`ddsCompression` must be none, bc1, bc2 or bc3, got {c:?}"))),
+        };
         if let Some(b) = self.bridge_client() {
             // The bridge forwards to the running app's `app.save`, which takes only an optional
             // path (without one it writes back to the document's own layered file, as headless
-            // does) and the Targa bits, so the other options are headless-only. Saying so beats
+            // does), the Targa bits and the DDS options, so the other options are headless-only. Saying so beats
             // saving with defaults while the caller believes their quality or format was applied.
             let unsupported: Vec<&str> = [
                 p.format.is_some().then_some("format"),
                 p.quality.is_some().then_some("quality"),
                 p.tiff_layers.then_some("tiffLayers"),
+                dpx_bits.is_some().then_some("dpxBits"),
                 p.index.is_some().then_some("index"),
             ]
             .into_iter()
@@ -1011,14 +1041,22 @@ impl PhotocraftMcp {
             if let Some(bits) = tga_bits {
                 params["tgaBits"] = json!(bits.bits());
             }
+            if let Some(c) = dds_compression {
+                params["ddsCompression"] = json!(c.name());
+            }
+            if p.dds_mipmaps {
+                params["ddsMipmaps"] = json!(true);
+            }
             return to_result(b.call("app.save", params).await);
         }
         let Some(r) = self
             .headless_op(move |h| {
                 let mut opts = photocraft_io::ExportOptions { tiff_layers: p.tiff_layers, tga_bits, ..Default::default() };
+                opts.encode.dpx_bits = dpx_bits;
+                opts.encode.dds = photocraft_io::DdsOptions { compression: dds_compression.unwrap_or_default(), mipmaps: p.dds_mipmaps };
                 if let Some(q) = p.quality {
-                    opts.encode.jpeg_quality = q.clamp(1, 100);
-                    opts.encode.webp_quality = q.clamp(1, 100);
+                    opts.encode.jpeg_quality = q;
+                    opts.encode.webp_quality = q;
                     opts.encode.webp_lossless = false;
                 }
                 let path = p.path.map(PathBuf::from);
@@ -1159,7 +1197,7 @@ mod tests {
                 break;
             }
             assert!(t.elapsed().as_secs() < 60, "doc_inspect never saw the finished job: {inspected}");
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     }
 }

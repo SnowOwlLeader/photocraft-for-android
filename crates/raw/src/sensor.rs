@@ -63,14 +63,22 @@ impl Cfa {
     /// Colour at data coordinates.
     #[inline]
     pub fn color(&self, x: usize, y: usize) -> u8 {
-        let cx = (x + self.width - self.origin_x % self.width) % self.width;
-        let cy = (y + self.height - self.origin_y % self.height) % self.height;
-        self.colors.get(cy * self.width + cx).copied().unwrap_or(1)
+        fn relative(v: usize, origin: usize, period: usize) -> Option<usize> {
+            if period == 0 {
+                return None;
+            }
+            let (v, origin) = (v % period, origin % period);
+            Some(if v >= origin { v - origin } else { period - (origin - v) })
+        }
+        let Some((cx, cy)) = relative(x, self.origin_x, self.width).zip(relative(y, self.origin_y, self.height)) else {
+            return 1;
+        };
+        cy.checked_mul(self.width).and_then(|i| i.checked_add(cx)).and_then(|i| self.colors.get(i)).copied().unwrap_or(1)
     }
 
     /// The 2×2 colours seen from data coordinates (`x0`, `y0`), row-major.
     pub fn phase(&self, x0: usize, y0: usize) -> [u8; 4] {
-        [self.color(x0, y0), self.color(x0 + 1, y0), self.color(x0, y0 + 1), self.color(x0 + 1, y0 + 1)]
+        [self.color(x0, y0), self.color(x0.saturating_add(1), y0), self.color(x0, y0.saturating_add(1)), self.color(x0.saturating_add(1), y0.saturating_add(1))]
     }
 
     /// `true` for a Bayer pattern: a 2×2 period holding one red, one blue and two
@@ -79,10 +87,11 @@ impl Cfa {
         if self.width == 0 || self.height == 0 || self.width > 16 || self.height > 16 {
             return false;
         }
-        let p = self.phase(self.origin_x, self.origin_y);
-        let periodic = (0..self.height).all(|y| (0..self.width).all(|x| self.color(self.origin_x + x, self.origin_y + y) == p[(y % 2) * 2 + x % 2]));
-        let greens_on_diagonal =
-            (p[0] == 1 && p[3] == 1 && p[1] != 1 && p[2] != 1 && p[1] + p[2] == 2) || (p[1] == 1 && p[2] == 1 && p[0] != 1 && p[3] != 1 && p[0] + p[3] == 2);
+        let (ox, oy) = (self.origin_x % self.width, self.origin_y % self.height);
+        let p = self.phase(ox, oy);
+        let periodic = (0..self.height).all(|y| (0..self.width).all(|x| self.color(ox + x, oy + y) == p[(y % 2) * 2 + x % 2]));
+        let greens_on_diagonal = (p[0] == 1 && p[3] == 1 && p[1] != 1 && p[2] != 1 && u16::from(p[1]) + u16::from(p[2]) == 2)
+            || (p[1] == 1 && p[2] == 1 && p[0] != 1 && p[3] != 1 && u16::from(p[0]) + u16::from(p[3]) == 2);
         periodic && greens_on_diagonal
     }
 }
@@ -110,7 +119,8 @@ impl BlackLevels {
     pub fn at(&self, ax: usize, ay: usize, s: usize, spp: usize) -> f32 {
         let r = ay % self.rows.max(1);
         let c = ax % self.cols.max(1);
-        let base = self.values.get((r * self.cols.max(1) + c) * spp + s).or_else(|| self.values.first()).copied().unwrap_or(0.0);
+        let index = r.checked_mul(self.cols.max(1)).and_then(|i| i.checked_add(c)).and_then(|i| i.checked_mul(spp)).and_then(|i| i.checked_add(s));
+        let base = index.and_then(|i| self.values.get(i)).or_else(|| self.values.first()).copied().unwrap_or(0.0);
         base + self.delta_h.get(ax).copied().unwrap_or(0.0) + self.delta_v.get(ay).copied().unwrap_or(0.0)
     }
 
@@ -204,7 +214,20 @@ pub(crate) enum JpegLayout {
 /// DNG 1.7 JPEG XL compression.
 const JPEG_XL: u32 = 52546;
 
-/// Reads the (uncompressed, lossless-JPEG or JPEG XL) image of a raw IFD.
+/// Inflates one zlib tile into at most `need` bytes. The stream must run to its end: a truncated
+/// stream, or one that holds more than `need` bytes, is an error rather than a silent cut-off.
+fn inflate_tile(src: &[u8], need: usize) -> Result<Vec<u8>> {
+    let mut out = vec![0u8; need];
+    let mut d = flate2::Decompress::new(true);
+    let status = d.decompress(src, &mut out, flate2::FlushDecompress::Finish).map_err(|_| RawError::malformed("deflate tile does not decompress"))?;
+    if status != flate2::Status::StreamEnd {
+        return Err(RawError::malformed("deflate tile is truncated or larger than its tile"));
+    }
+    out.truncate(usize::try_from(d.total_out()).unwrap_or(need).min(need));
+    Ok(out)
+}
+
+/// Reads the (uncompressed, deflate, lossless-JPEG, lossy-JPEG or JPEG XL) image of a raw IFD.
 pub(crate) fn read_plane(t: &Tiff, ifd: &Ifd, limits: &Limits, layout: JpegLayout) -> Result<Plane> {
     let width = t.tag_uint(ifd, tag::IMAGE_WIDTH).ok_or_else(|| RawError::malformed("raw image has no width"))? as usize;
     let height = t.tag_uint(ifd, tag::IMAGE_LENGTH).ok_or_else(|| RawError::malformed("raw image has no height"))? as usize;
@@ -232,7 +255,21 @@ pub(crate) fn read_plane(t: &Tiff, ifd: &Ifd, limits: &Limits, layout: JpegLayou
     }
     limits.check(width as u64, height as u64, samples as u64 * 2)?;
     let segments = segments(t, ifd, width, height)?;
+    // The decoded tiles are all retained in `decoded` before assembly copies only the useful
+    // pixels. Each tile is charged individually below, but file-controlled padding and repeated
+    // source ranges can make the *cumulative* retained samples far exceed both the input and the
+    // useful image. Reject that up front: the sum of padded tile samples (two bytes each) must
+    // fit the allocation budget.
+    let mut total_tile_samples: u64 = 0;
+    for s in &segments {
+        let tile = (s.w as u64).saturating_mul(s.h as u64).saturating_mul(samples as u64);
+        total_tile_samples = total_tile_samples.saturating_add(tile);
+    }
+    if total_tile_samples.saturating_mul(2) > limits.max_alloc {
+        return Err(RawError::LimitExceeded(format!("{} bytes of retained raw tiles exceed {}", total_tile_samples.saturating_mul(2), limits.max_alloc)));
+    }
     let le = t.le;
+    let tiled = t.tag_uint(ifd, tag::TILE_WIDTH).is_some();
     let decoded: Vec<Result<Vec<u16>>> = par::map(segments.len(), |i| {
         let s = &segments[i];
         let rows = s.h.min(height - s.y);
@@ -251,10 +288,7 @@ pub(crate) fn read_plane(t: &Tiff, ifd: &Ifd, limits: &Limits, layout: JpegLayou
                 let too_big = || RawError::malformed("deflate tile is too large");
                 let need =
                     s.w.checked_mul(rows).and_then(|n| n.checked_mul(samples)).and_then(|n| n.checked_mul((bits as usize).div_ceil(8))).ok_or_else(too_big)?;
-                let mut out = vec![0u8; need];
-                let mut d = flate2::Decompress::new(true);
-                d.decompress(src, &mut out, flate2::FlushDecompress::Finish).map_err(|_| RawError::malformed("deflate tile does not decompress"))?;
-                out.truncate(usize::try_from(d.total_out()).unwrap_or(need).min(need));
+                let out = inflate_tile(src, need)?;
                 let v = unpack(&out, s.w, rows, samples, bits, le)?;
                 // The TIFF predictor runs after unpacking, per row, per sample plane.
                 match t.tag_uint(ifd, tag::PREDICTOR).unwrap_or(1) {
@@ -266,37 +300,12 @@ pub(crate) fn read_plane(t: &Tiff, ifd: &Ifd, limits: &Limits, layout: JpegLayou
             }
             // A JPEG XL segment codes only the rows inside the image (strips) or the whole tile.
             JPEG_XL => {
-                let coded_rows = if t.tag_uint(ifd, tag::TILE_WIDTH).is_some() { s.h } else { rows };
+                let coded_rows = if tiled { s.h } else { rows };
                 let mut v = jxl::decode(src, s.w, coded_rows, samples, bits, limits)?;
                 v.resize(s.w * s.h * samples, 0);
                 Ok(v)
             }
-            34892 => {
-                // Adobe DNG compression 34892: baseline JPEG tiles (lossy, 8-bit). The tile is
-                // a complete JPEG stream: a CFA part decodes to gray samples, a 3-sample
-                // LinearRaw part holds YCbCr, which zune-jpeg converts to RGB. The header is
-                // decoded and size-checked before any pixel allocation, so a hostile tile
-                // cannot size the decoder's buffers (up to 16384x16384) with a fake SOF.
-                let out = match samples {
-                    1 => zune_core::colorspace::ColorSpace::Luma,
-                    3 => zune_core::colorspace::ColorSpace::RGB,
-                    n => return Err(RawError::unsupported(format!("lossy DNG with {n} samples per pixel (1 or 3 are supported)"))),
-                };
-                let options = zune_core::options::DecoderOptions::default().jpeg_set_out_colorspace(out);
-                let mut dec = zune_jpeg::JpegDecoder::new_with_options(zune_core::bytestream::ZCursor::new(src), options);
-                dec.decode_headers().map_err(|e| RawError::malformed(format!("lossy JPEG tile header: {e:?}")))?;
-                let f = dec.info().ok_or_else(|| RawError::malformed("lossy JPEG tile has no header"))?;
-                if (f.width as usize, f.height as usize) != (s.w, rows) {
-                    return Err(RawError::malformed(format!("lossy JPEG tile is {}x{}, expected {}x{}", f.width, f.height, s.w, rows)));
-                }
-                let decoded = dec.decode().map_err(|e| RawError::malformed(format!("lossy JPEG tile: {e:?}")))?;
-                let need = s.w * rows * samples;
-                if decoded.len() != need {
-                    return Err(RawError::malformed(format!("lossy JPEG tile holds {} samples, expected {need}", decoded.len())));
-                }
-                // The 8-bit samples widen to the document's 16-bit range (0xFF -> 0xFFFF).
-                Ok(decoded.into_iter().map(|b| u16::from(b) * 257).collect())
-            }
+            34892 => lossy_jpeg(src, s, rows, samples, bits, tiled, limits),
             // Compression 7 (lossless JPEG): the frame the entropy stream declares is capped
             // by the budget, not only by the segment, and the `Quads` scatter buffer below
             // comes out of the same budget. `max_alloc` counts bytes, a sample is two.
@@ -381,6 +390,54 @@ pub(crate) fn segments(t: &Tiff, ifd: &Ifd, width: usize, height: usize) -> Resu
     Ok(out)
 }
 
+/// Decodes one segment of a lossy DNG (Adobe DNG compression 34892): a complete baseline-DCT
+/// JPEG stream (ITU-T T.81), 8 bits per sample, as DNG 1.4 defines it. A CFA segment is a
+/// one-component (gray) JPEG; a 3-sample LinearRaw segment is a three-component one in YCbCr,
+/// which the JPEG decoder turns back into the stored R, G, B. The decoded 8-bit values are the
+/// stored sample values: the LinearizationTable, BlackLevel and WhiteLevel apply to them later,
+/// as for every other compression, and WhiteLevel defaults to 255 for 8-bit data.
+///
+/// `rows` is the number of segment rows inside the image. A tile is always coded at the full
+/// tile size (edge tiles are padded); a strip is coded at its row count (the last strip is
+/// shorter). Either height is accepted, the width must be the segment's. The frame header is
+/// checked before any pixel is decoded, and the decoder's own size cap is the segment, so a
+/// hostile SOF cannot size a buffer larger than the tile the IFD declares (which `limits` has
+/// already charged).
+fn lossy_jpeg(src: &[u8], s: &Segment, rows: usize, samples: usize, bits: u32, tiled: bool, limits: &Limits) -> Result<Vec<u16>> {
+    use zune_core::{bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions};
+    if bits != 8 {
+        return Err(RawError::unsupported(format!("lossy DNG with {bits}-bit samples (lossy JPEG tiles are 8-bit)")));
+    }
+    let out = match samples {
+        1 => ColorSpace::Luma,
+        3 => ColorSpace::RGB,
+        n => return Err(RawError::unsupported(format!("lossy DNG with {n} samples per pixel (1 or 3 are supported)"))),
+    };
+    let options = DecoderOptions::default().jpeg_set_out_colorspace(out).set_max_width(s.w).set_max_height(s.h);
+    let mut dec = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(src), options);
+    dec.decode_headers().map_err(|e| RawError::malformed(format!("lossy JPEG tile header: {e:?}")))?;
+    let f = dec.info().ok_or_else(|| RawError::malformed("lossy JPEG tile has no header"))?;
+    let (fw, fh) = (usize::from(f.width), usize::from(f.height));
+    let coded_rows = if tiled { s.h } else { rows };
+    if fw != s.w || (fh != coded_rows && fh != rows) {
+        return Err(RawError::malformed(format!("lossy JPEG tile is {fw}x{fh}, expected {}x{coded_rows}", s.w)));
+    }
+    if usize::from(f.components) != samples {
+        return Err(RawError::malformed(format!("lossy JPEG tile has {} components, expected {samples}", f.components)));
+    }
+    let need = fw.checked_mul(fh).and_then(|n| n.checked_mul(samples)).ok_or_else(|| RawError::malformed("lossy JPEG tile is too large"))?;
+    limits.check(fw as u64, fh as u64, samples as u64 * 2)?;
+    let decoded = dec.decode().map_err(|e| RawError::malformed(format!("lossy JPEG tile: {e:?}")))?;
+    if decoded.len() != need {
+        return Err(RawError::malformed(format!("lossy JPEG tile holds {} samples, expected {need}", decoded.len())));
+    }
+    let mut v: Vec<u16> = decoded.into_iter().map(u16::from).collect();
+    // A strip coded at its own row count still fills the segment's declared height.
+    let full = s.w.checked_mul(s.h).and_then(|n| n.checked_mul(samples)).ok_or_else(|| RawError::malformed("lossy JPEG tile is too large"))?;
+    v.resize(full, 0);
+    Ok(v)
+}
+
 /// Reverses TIFF predictor 2 (horizontal differencing) on interleaved samples: each sample
 /// gains its channel's predecessor in the row, wrapping at the sample's container (8 or 16 bits).
 fn undelta(v: &[u16], plane: usize, row_samples: usize, rows: usize, bits: u32) -> Vec<u16> {
@@ -447,6 +504,26 @@ mod tests {
         let mut c = Cfa::bayer("RGGB").unwrap();
         c.origin_x = 1;
         assert_eq!(c.phase(0, 0), [1, 0, 2, 1]); // GRBG
+    }
+
+    fn zlib(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    #[test]
+    fn inflate_tile_requires_stream_end() {
+        let data: Vec<u8> = (0..64u8).collect();
+        let z = zlib(&data);
+        assert_eq!(inflate_tile(&z, 64).unwrap(), data);
+        // Shorter than the tile, but a complete stream: still accepted.
+        assert_eq!(inflate_tile(&z, 100).unwrap(), data);
+        // Truncated stream.
+        assert!(inflate_tile(&z[..z.len() - 6], 64).is_err());
+        // More decoded output than the tile holds.
+        assert!(inflate_tile(&z, 32).is_err());
     }
 
     #[test]

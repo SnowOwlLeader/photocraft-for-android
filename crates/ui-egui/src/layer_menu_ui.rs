@@ -77,6 +77,8 @@ pub fn entries(l: &Layer, multi: bool, has_selection: bool) -> Vec<Entry> {
             LayerContent::Shape(_) => v.push(Some(("Rasterize Layer", "layer.rasterize.shape"))),
             LayerContent::Smart(_) => {
                 v.push(Some((tl!("Edit Contents"), "layer.smartObjects.editContents")));
+                v.push(Some((tl!("Replace Contents…"), "layer.smartObjects.replaceContents")));
+                v.push(Some((tl!("Relink to File…"), "layer.smartObjects.relinkToFile")));
                 v.push(Some((tl!("Convert to Layers"), "layer.smartObjects.convertToLayers")));
                 v.push(Some(("Rasterize Layer", "layer.rasterize.smartObject")));
             }
@@ -155,6 +157,47 @@ pub fn show(app: &crate::PhotocraftApp, ui: &mut egui::Ui, l: &Layer, on_set: bo
         color_menu(app, ui, l, on_set, actions);
         rename
     })
+}
+
+/// The menu of `l`'s layer-mask thumbnail (#4575), in Photoshop's order. It acts on `l`, which it
+/// selects first like the row menu.
+pub fn show_mask(app: &crate::PhotocraftApp, ui: &mut egui::Ui, l: &Layer, actions: &mut Vec<(String, Value)>) {
+    let Some(mask) = &l.mask else { return };
+    crate::widgets::menu_scroll(ui, |ui| {
+        ui.set_min_width(220.0);
+        let edits = vec![
+            Some((tl!(mask_toggle_label(mask.enabled)), "layer.layerMask.enabled")),
+            Some((tl!("Delete Layer Mask"), "layer.layerMask.delete")),
+            Some((tl!("Apply Layer Mask"), "layer.layerMask.apply")),
+        ];
+        items(app, ui, l, false, edits, actions);
+        ui.separator();
+        // ⌘⇧-, ⌘⌥- and ⌘⇧⌥-clicking the thumbnail, as menu items.
+        let loads =
+            [(tl!("Add Mask to Selection"), "add"), (tl!("Subtract Mask from Selection"), "subtract"), (tl!("Intersect Mask with Selection"), "intersect")];
+        for (label, operation) in loads {
+            if ui.button(label).clicked() {
+                actions.push(("layer.select".into(), json!({"layer": l.id.0})));
+                actions.push(("select.loadSelection".into(), json!({"channel": "mask", "layer": l.id.0, "operation": operation})));
+                ui.close();
+            }
+        }
+        ui.separator();
+        if ui.add_enabled(crate::menus::is_enabled(app, "select.selectAndMask"), egui::Button::new(tl!("Select and Mask…"))).clicked() {
+            // Like double-clicking the thumbnail with that preference on: it refines the mask.
+            actions.push(("layer.select".into(), json!({"layer": l.id.0})));
+            actions.push(("ui.maskTarget".into(), json!(true)));
+            actions.push(("select.selectAndMask".into(), Value::Null));
+            ui.close();
+        }
+        // Layer Mask Display Options: the rubylith's colour and opacity (`channel.options`).
+        if ui.button(tl!("Mask Options…")).clicked() {
+            actions.push(("layer.select".into(), json!({"layer": l.id.0})));
+            actions.push(("ui.maskTarget".into(), json!(true)));
+            actions.push(("channel.options".into(), Value::Null));
+            ui.close();
+        }
+    });
 }
 
 /// Render the layer style menu of `l`'s effect rows ([`effects_entries`]); the actions select `l`
@@ -434,6 +477,69 @@ mod tests {
         }
     }
 
+    /// #4575: right-clicking a layer-mask thumbnail opens Photoshop's mask menu, not the layer
+    /// menu, and its selection items load the clicked layer's mask (not the active layer's).
+    #[test]
+    fn mask_thumbnail_context_menu_acts_on_the_clicked_mask() {
+        use crate::PhotocraftApp;
+        use egui::{Event, Modifiers, PointerButton, Pos2, vec2};
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        fn click(h: &mut Harness<'_, PhotocraftApp>, at: Pos2, button: PointerButton) {
+            h.hover_at(at);
+            h.step();
+            for pressed in [true, false] {
+                h.event(Event::PointerButton { pos: at, button, pressed, modifiers: Modifiers::NONE });
+                h.step();
+            }
+            h.run_steps(3);
+        }
+
+        let mut s = photocraft_engine::Session::new();
+        s.execute("file.new", json!({"width": 100, "height": 60})).unwrap();
+        s.execute("layer.new.layer", json!({"name": "Masked"})).unwrap();
+        s.execute("select.rect", json!({"x": 60, "y": 0, "width": 40, "height": 60})).unwrap();
+        s.execute("layer.layerMask.revealSelection", json!({})).unwrap();
+        let masked = s.active().unwrap().active_layer.unwrap();
+        // Another layer is active, and the selection doesn't overlap the mask.
+        s.execute("layer.new.layer", json!({"name": "Other active layer"})).unwrap();
+        s.execute("select.rect", json!({"x": 0, "y": 0, "width": 20, "height": 60})).unwrap();
+        let mut h = Harness::builder().with_size(vec2(1440.0, 900.0)).with_step_dt(1.0 / 60.0).with_max_steps(64).build_eframe(move |cc| {
+            PhotocraftApp::setup_context(&cc.egui_ctx, Default::default());
+            PhotocraftApp::new(s, crate::Services::default())
+        });
+        let ctx = h.ctx.clone();
+        let (req, _rx) = crate::control::ControlRequest::new("ui.set", json!({"dock": {"collapsed": ["color", "properties", "history", "navigator"]}}));
+        crate::control::handle(h.state_mut(), &ctx, &req);
+        h.run_steps(8);
+        let (thumbs, _) = crate::mask_thumbs_ui::recorded(&h.ctx, masked.0).expect("mask thumbnail drawn");
+        let at = thumbs.iter().find(|(k, _)| *k == crate::mask_thumbs_ui::MaskKind::Pixel).unwrap().1.center();
+        click(&mut h, at, PointerButton::Secondary);
+        assert!(h.query_by_label("Blending Options…").is_none(), "the mask menu, not the layer menu");
+        for item in
+            ["Disable Layer Mask", "Delete Layer Mask", "Apply Layer Mask", "Subtract Mask from Selection", "Intersect Mask with Selection", "Select and Mask…"]
+        {
+            h.get_by_label(item);
+        }
+        let at = h.get_by_label("Add Mask to Selection").rect().center();
+        click(&mut h, at, PointerButton::Primary);
+        let st = h.state().session.active().unwrap();
+        assert_eq!(st.active_layer, Some(masked));
+        let sel = st.doc.selection.as_ref().expect("a selection");
+        assert!(sel.sample_channel(10, 30, 0) > 0.99, "the selection is kept");
+        assert!(sel.sample_channel(80, 30, 0) > 0.99, "the clicked layer's mask is added");
+        assert!(sel.sample_channel(40, 30, 0) < 0.01, "nothing else is selected");
+        // Mask Options…: Layer Mask Display Options (the rubylith's colour and opacity).
+        let (thumbs, _) = crate::mask_thumbs_ui::recorded(&h.ctx, masked.0).expect("mask thumbnail drawn");
+        let at = thumbs.iter().find(|(k, _)| *k == crate::mask_thumbs_ui::MaskKind::Pixel).unwrap().1.center();
+        click(&mut h, at, PointerButton::Secondary);
+        let at = h.get_by_label("Mask Options…").rect().center();
+        click(&mut h, at, PointerButton::Primary);
+        let d = h.state().ui.dialogs.last().expect("Mask Options… opens a dialog");
+        assert!(crate::channel_options_ui::owns(&d.fields) && d.fields["channel"] == json!("mask"), "{:?}", d.fields);
+        assert_eq!(d.fields["__label"], json!("Layer Mask Display Options…"));
+    }
+
     #[test]
     fn a_long_layer_menu_stays_inside_a_short_window_and_scrolls() {
         let mut s = photocraft_engine::Session::new();
@@ -485,7 +591,10 @@ mod tests {
         s.execute("layer.smartObjects.convertToSmartObject", json!({})).unwrap();
         let ids: Vec<_> = entries(&layer(&s), false, false).into_iter().flatten().map(|e| e.1).collect();
         let edit = ids.iter().position(|id| *id == "layer.smartObjects.editContents").expect("Edit Contents entry");
-        assert_eq!(ids[edit + 1..edit + 3], ["layer.smartObjects.convertToLayers", "layer.rasterize.smartObject"]);
+        assert_eq!(
+            ids[edit + 1..edit + 5],
+            ["layer.smartObjects.replaceContents", "layer.smartObjects.relinkToFile", "layer.smartObjects.convertToLayers", "layer.rasterize.smartObject"]
+        );
     }
 
     /// Right-clicking inside a multi-layer selection offers one Rasterize item for the whole
@@ -503,7 +612,14 @@ mod tests {
         assert!(ids(false).contains(&"layer.smartObjects.editContents"), "a single smart object keeps its items");
         let multi = ids(true);
         assert!(multi.contains(&"layer.rasterize.layer"));
-        for single in ["layer.rasterize.smartObject", "layer.rasterize.shape", "layer.smartObjects.editContents", "layer.smartObjects.convertToLayers"] {
+        for single in [
+            "layer.rasterize.smartObject",
+            "layer.rasterize.shape",
+            "layer.smartObjects.editContents",
+            "layer.smartObjects.replaceContents",
+            "layer.smartObjects.relinkToFile",
+            "layer.smartObjects.convertToLayers",
+        ] {
             assert!(!multi.contains(&single), "{single} acts on one layer, not on a selection");
         }
         let label = entries(&smart, true, false).into_iter().flatten().find(|e| e.1 == "layer.rasterize.layer").unwrap().0;

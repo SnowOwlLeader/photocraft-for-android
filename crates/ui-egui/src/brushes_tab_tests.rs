@@ -8,6 +8,87 @@ use egui_kittest::kittest::{NodeT, Queryable};
 use super::*;
 
 #[test]
+fn dragging_a_brush_shows_its_tip_preview() {
+    for theme in crate::theme::ThemeKind::ALL {
+        for mode in 0..3 {
+            let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
+            app.run("prefs.set", json!({"path": "interface.theme", "value": theme.id()})).unwrap();
+            app.ui.panels.brush_settings = mode != 2;
+            app.ui.brush_tab = 1;
+            app.ui.brushes_panel.view = if mode == 1 { BrushesView::Grid } else { BrushesView::List };
+            if mode == 2 {
+                app.ui.brush_picker = Some([300.0, 120.0]);
+            }
+            let name = app.session.tools.presets[0].name.clone();
+            let brush = app.session.tools.brush.clone();
+            let presets = app.session.tools.presets.clone();
+            let mut h = Harness::builder().with_size(vec2(1200.0, 900.0)).build_eframe(move |cc| {
+                PhotocraftApp::setup_context(&cc.egui_ctx, theme);
+                app
+            });
+            h.run_steps(4);
+            let start = h.get_by_role_and_label(Role::Button, &name).rect().center();
+            h.hover_at(start);
+            h.run_steps(1);
+            h.event(egui::Event::PointerButton { pos: start, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE });
+            h.run_steps(1);
+            let end = start + vec2(50.0, 10.0);
+            h.event(egui::Event::PointerMoved(end));
+            h.run_steps(4);
+            assert!(matches!(egui::DragAndDrop::payload::<BrushDrag>(&h.ctx).as_deref(), Some(BrushDrag::Preset(n)) if n == &name));
+            assert!(h.query_by_role_and_label(Role::Image, &name).is_some(), "dragged brush needs a real tip thumbnail, not only its name");
+            let renders = brush_preview::render_count(&h.ctx);
+            h.run_steps(2);
+            assert_eq!(brush_preview::render_count(&h.ctx), renders, "unchanged drag preview stays cached");
+            h.event(egui::Event::PointerMoved(start));
+            h.run_steps(1);
+            h.event(egui::Event::PointerButton { pos: start, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+            h.run_steps(4);
+            assert!(h.query_by_role_and_label(Role::Image, &name).is_none(), "preview disappears on release");
+            assert_eq!(h.state().session.tools.brush, brush, "preview does not change brush settings");
+            assert_eq!(h.state().session.tools.presets, presets, "dropping on the source preserves the library");
+        }
+    }
+}
+
+/// #5741: a brush dragged to the list's bottom edge (or below it) scrolls the list, so it can be
+/// dropped on rows out of view; the list used to stay put, and the drag stopped at the last
+/// visible row.
+#[test]
+fn dragging_a_brush_to_the_list_edge_scrolls_the_list() {
+    let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
+    app.ui.panels.brush_settings = true;
+    app.ui.brush_tab = 1;
+    app.ui.brushes_panel.view = BrushesView::List;
+    app.ui.brushes_panel.collapsed.clear();
+    let name = app.session.tools.presets[0].name.clone();
+    let (w, h_px) = (1200.0, 520.0);
+    let mut h = Harness::builder().with_size(vec2(w, h_px)).build_eframe(move |cc| {
+        PhotocraftApp::setup_context(&cc.egui_ctx, crate::theme::ThemeKind::ALL[0]);
+        app
+    });
+    h.run_steps(4);
+    let start = h.get_by_role_and_label(Role::Button, &name).rect();
+    h.hover_at(start.center());
+    h.run_steps(1);
+    h.event(egui::Event::PointerButton { pos: start.center(), button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE });
+    h.run_steps(1);
+    h.event(egui::Event::PointerMoved(start.center() + vec2(0.0, 12.0)));
+    h.run_steps(2);
+    assert!(egui::DragAndDrop::has_payload_of_type::<BrushDrag>(&h.ctx), "the brush is being dragged");
+    // Held at the bottom of the window, below the list's last visible row.
+    let bottom = egui::pos2(start.center().x, h_px - 2.0);
+    for _ in 0..12 {
+        h.event(egui::Event::PointerMoved(bottom));
+        h.run_steps(1);
+    }
+    let moved = h.query_by_role_and_label(Role::Button, &name).map(|n| n.rect());
+    assert!(moved.is_none_or(|r| r.top() < start.top() - 1.0), "the list scrolled down: {start:?} → {moved:?}");
+    h.event(egui::Event::PointerButton { pos: bottom, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+    h.run_steps(2);
+}
+
+#[test]
 fn grid_columns_centre_whole_columns_past_the_indent() {
     // 6 × 44 + 5 × 3 = 279 of the 290 past a 4 pt indent: 5 spare on each side (rounded down).
     assert_eq!(grid_columns(294.0, 44.0, 4.0, GRID_GAP), (9.0, 6));
@@ -264,4 +345,93 @@ fn the_brushes_tab_grid_is_centred_past_its_indent() {
     PhotocraftApp::setup_context(&h.ctx, crate::theme::ThemeKind::ALL[0]);
     h.run_steps(6);
     rows_are_centred(&h, PANEL_LIST.indent, 2);
+}
+
+/// #4454: a card's size number sat under the tip thumbnail of any medium or large brush (the
+/// tip took up to 44.8 pt of a 42 pt cell, the number anchored to the cell's bottom), so the
+/// "30" of Hard Round and the "45" of Soft Round couldn't be read. At every footer scale that
+/// shows numbers, in each card kind, the tip now stays above the number, and bigger brushes still
+/// get bigger tips.
+#[test]
+fn card_tips_never_cover_their_size_number() {
+    let number_h = std::rc::Rc::new(std::cell::Cell::new(0.0_f32));
+    let seen = number_h.clone();
+    let mut h = Harness::new_ui(move |ui| {
+        let g = ui.painter().layout_no_wrap("45".into(), egui::FontId::proportional(CARD_NUM_FONT), Color32::WHITE);
+        seen.set(g.size().y);
+    });
+    PhotocraftApp::setup_context(&h.ctx, Default::default());
+    h.run();
+    let number_h = number_h.get();
+    assert!(number_h > 8.0, "the number has a real height: {number_h}");
+    let mut scale = CARD_COMPACT_SCALE + 0.01;
+    while scale <= *crate::brush_picker::SCALE_RANGE.end() + 1e-3 {
+        let scale_h = scale.max(CARD_MIN_H_SCALE);
+        // The tip cell of a full card (name row under it), a tip-and-name card and a tip-only one,
+        // as [`preset_card`] sizes them in a wide column.
+        let cells = [
+            vec2(CARD_TIP_W * scale, (CARD_MAX_H - CARD_PAD * 2.0 - CARD_NAME_H) * scale_h),
+            vec2(CARD_TIP_W * scale, (CARD_TIP_NAME_H - CARD_PAD * 2.0) * scale_h),
+            vec2((CARD_TIP_ONLY_W - 16.0) * scale, (CARD_TIP_ONLY_H - CARD_PAD * 2.0) * scale_h),
+        ];
+        for size in cells {
+            let cell = Rect::from_min_size(egui::pos2(10.0, 20.0), size);
+            let number_top = cell.bottom() - 1.0 - number_h;
+            let mut last = 0.0;
+            for brush in [1.0, 5.0, 13.0, 30.0, 45.0, 100.0, 2500.0] {
+                let tip = card_tip_rect(cell, Some(number_h), brush, scale);
+                assert!(tip.bottom() <= number_top + 1e-3, "scale {scale}, cell {size:?}, {brush} px: tip {tip:?} reaches the number at {number_top}");
+                assert!(cell.expand(1e-3).contains_rect(tip), "scale {scale}, {brush} px: tip {tip:?} leaves its cell {cell:?}");
+                assert!(tip.width() >= last, "scale {scale}, {brush} px: a bigger brush gets a smaller tip");
+                last = tip.width();
+            }
+        }
+        scale += 0.05;
+    }
+    // The tip-only grid's cells are tall enough for the number: a big brush's tip still spans
+    // the cell's width.
+    let cell = Rect::from_min_size(egui::pos2(0.0, 0.0), vec2(CARD_TIP_ONLY_W - 16.0, CARD_TIP_ONLY_H - CARD_PAD * 2.0));
+    assert!((card_tip_rect(cell, Some(number_h), 45.0, 1.0).width() - cell.width()).abs() < 1e-3);
+    // Compact cards: no number, the tip fills the cell; nonsense never makes a non-finite rect.
+    assert_eq!(card_tip_rect(cell, None, 45.0, 0.5).width(), cell.width() - 2.0);
+    for (n, size, scale) in [(f32::NAN, 30.0, 1.0), (500.0, f32::NAN, 1.0), (12.0, 30.0, f32::INFINITY), (12.0, -5.0, 0.0)] {
+        let r = card_tip_rect(cell, Some(n), size, scale);
+        assert!(r.min.is_finite() && r.max.is_finite(), "{n} {size} {scale}: {r:?}");
+    }
+}
+
+/// #7256: the Brushes tab's preview slider scales the grid cells and list rows; it is not the
+/// Size of the current brush.
+#[test]
+fn the_preview_slider_scales_the_previews_not_the_brush_size() {
+    for grid in [true, false] {
+        let mut sizes = Vec::new();
+        for scale in [0.5f32, 1.0, 2.0] {
+            let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
+            app.ui.panels.brush_settings = true;
+            app.ui.brush_tab = 1;
+            app.ui.brushes_panel.view = if grid { BrushesView::Grid } else { BrushesView::List };
+            app.ui.brushes_panel.scale = scale;
+            let size = app.session.tools.brush.size;
+            let name = app.session.tools.presets[0].name.clone();
+            let mut h = Harness::builder().with_size(vec2(1200.0, 900.0)).build_eframe(move |cc| {
+                PhotocraftApp::setup_context(&cc.egui_ctx, crate::theme::ThemeKind::ALL[0]);
+                app
+            });
+            h.run_steps(4);
+            let r = h.get_by_role_and_label(Role::Button, &name).rect();
+            sizes.push(if grid { r.width() } else { r.height() });
+            assert_eq!(h.state().session.tools.brush.size, size, "the preview slider leaves the brush size alone");
+        }
+        assert!(sizes[0] < sizes[1] && sizes[1] < sizes[2], "grid {grid}: previews grow with the slider: {sizes:?}");
+    }
+}
+
+#[test]
+fn preview_scale_is_clamped_to_its_range() {
+    assert_eq!(list_row_height(1.0), 44.0);
+    assert_eq!(list_row_height(100.0), 88.0);
+    assert_eq!(list_row_height(f32::NAN), 44.0);
+    assert_eq!(grid_cell_width(52.0, 0.0), 26.0);
+    assert_eq!(grid_cell_width(52.0, f32::INFINITY), 52.0);
 }

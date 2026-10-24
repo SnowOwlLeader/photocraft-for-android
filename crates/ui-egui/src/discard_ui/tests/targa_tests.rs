@@ -113,7 +113,7 @@ fn save_a_copy_to_a_targa_asks_and_keeps_the_document_unsaved() {
     crate::menus::invoke(h.state_mut(), &ctx, "file.saveACopy", json!({})).unwrap();
     h.run_steps(3);
     assert_eq!(h.state().targa_options.as_ref().map(|p| (p.bits, p.copy)), Some((TgaBits::Bits32, true)));
-    assert!(targa_options_ui::park(h.state_mut(), "other.tga".into(), false, true).is_err(), "the waiting prompt is kept");
+    assert!(targa_options_ui::park(h.state_mut(), "other.tga".into(), false, "file.saveAs").is_err(), "the waiting prompt is kept");
     assert_eq!(h.state().targa_options.as_ref().map(|p| p.path.as_str()), Some("copy.tga"));
     h.key_press(Key::Enter);
     h.run_steps(3);
@@ -140,8 +140,8 @@ fn targa_options_keeps_a_layered_save_as_a_copy() {
     assert_eq!(st.path, None);
 }
 
-/// An action being recorded keeps a Targa Save As with its bits, answered in Targa Options or
-/// scripted (#2032), and plays it back without asking; the dialog's Save a Copy isn't recorded.
+/// An action being recorded keeps a Targa Save As or Save a Copy with its bits, answered in Targa
+/// Options or scripted (#2032, #4373), and plays them back without asking.
 #[test]
 fn recorded_targa_save_as_keeps_its_bits_and_replays_without_asking() {
     let (mut h, writes) = targa_app(true, "copy.tga");
@@ -164,12 +164,22 @@ fn recorded_targa_save_as_keeps_its_bits_and_replays_without_asking() {
         &[("t.tga".to_string(), asked(Some(24))), ("copy.tga".to_string(), asked(Some(32))), ("s.tga".to_string(), asked(Some(32)))]
     );
     let steps = &h.state().session.actions.list[0].steps;
-    assert_eq!(steps, &[("file.saveAs".into(), json!({"path": "t.tga", "tgaBits": 24})), ("file.saveAs".into(), json!({"path": "s.tga", "tgaBits": 32}))]);
+    assert_eq!(
+        steps,
+        &[
+            ("file.saveAs".into(), json!({"path": "t.tga", "tgaBits": 24})),
+            ("file.saveACopy".into(), json!({"path": "copy.tga", "tgaBits": 32})),
+            ("file.saveAs".into(), json!({"path": "s.tga", "tgaBits": 32}))
+        ]
+    );
     writes.borrow_mut().clear();
     let played = h.state_mut().run("actions.play", json!({"action": 0})).unwrap();
     assert!(played.get("failed").is_none(), "{played}");
     assert!(h.state().targa_options.is_none(), "playback doesn't ask");
-    assert_eq!(writes.borrow().as_slice(), &[("t.tga".to_string(), asked(Some(24))), ("s.tga".to_string(), asked(Some(32)))]);
+    assert_eq!(
+        writes.borrow().as_slice(),
+        &[("t.tga".to_string(), asked(Some(24))), ("copy.tga".to_string(), asked(Some(32))), ("s.tga".to_string(), asked(Some(32)))]
+    );
 }
 
 /// Closing an unsaved document whose save goes to a Targa waits behind Targa Options, then closes.
@@ -190,4 +200,47 @@ fn closing_after_a_targa_save_waits_for_targa_options() {
     assert_eq!(writes.borrow().as_slice(), &[("kept.tga".to_string(), asked(Some(24)))]);
     assert!(h.state().discard.is_none());
     assert!(h.state().session.documents().is_empty());
+}
+
+/// File › Save confirming the document's own Targa asks Targa Options, and an action being
+/// recorded keeps it as a plain Save with the bits chosen: played back, it writes the Targa the
+/// action is played on with them, without asking (#3531).
+#[test]
+fn recorded_plain_save_of_a_targa_keeps_its_bits() {
+    let (mut h, writes) = targa_app(false, "own.tga");
+    let ctx = h.ctx.clone();
+    crate::menus::invoke(h.state_mut(), &ctx, "file.saveAs", json!({"path": "own.tga", "tgaBits": 24})).unwrap();
+    h.state_mut().run("actions.record", json!({})).unwrap();
+    crate::menus::invoke(h.state_mut(), &ctx, "file.save", json!({})).unwrap();
+    h.run_steps(3);
+    assert!(h.state().targa_options.is_some(), "confirming its own Targa asks Targa Options");
+    h.get_by_label("32 bits/pixel").click();
+    h.run_steps(2);
+    h.get_by_label("OK").click();
+    h.run_steps(3);
+    h.state_mut().run("actions.stop", json!({})).unwrap();
+    let steps = &h.state().session.actions.list[0].steps;
+    assert_eq!(steps, &[("file.save".into(), json!({"tgaBits": 32}))]);
+    crate::menus::invoke(h.state_mut(), &ctx, "file.saveAs", json!({"path": "other.tga", "tgaBits": 24})).unwrap();
+    writes.borrow_mut().clear();
+    let played = h.state_mut().run("actions.play", json!({"action": 0})).unwrap();
+    assert!(played.get("failed").is_none(), "{played}");
+    assert!(h.state().targa_options.is_none(), "playback doesn't ask");
+    assert_eq!(writes.borrow().as_slice(), &[("other.tga".to_string(), asked(Some(32)))]);
+}
+
+/// Enter on a focused Cancel cancels: egui clicks the focused button on Enter without consuming
+/// the key, so the dialog's Enter-for-OK must not save as well.
+#[test]
+fn enter_on_a_focused_cancel_writes_nothing() {
+    let (mut h, writes) = targa_app(false, "unused.tga");
+    h.state_mut().save_as(Some("t.tga".into())).unwrap();
+    h.run_steps(2);
+    h.get_by_label("Cancel").focus();
+    h.run_steps(2);
+    h.key_press(Key::Enter);
+    h.run_steps(3);
+    assert!(h.state().targa_options.is_none());
+    assert!(writes.borrow().is_empty(), "nothing written");
+    assert_eq!(h.state().ui.status, "Save cancelled");
 }

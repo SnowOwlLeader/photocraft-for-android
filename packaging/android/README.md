@@ -1,12 +1,14 @@
 # PhotoCraft Android port
 
-An experimental native Android port of PhotoCraft 0.8.2, based on upstream commit
-`d43db3e153c76aefce9b32cef9099e458eaf17a8`. It uses the existing Rust engine,
+An experimental native Android port of PhotoCraft 0.14.0, based on upstream commit
+`ff4738810134d7f7e68b49f2e4f231b686282ff3`. It uses the existing Rust engine,
 egui/eframe UI and wgpu renderer. There is no web server or WebView.
+
+See [v0.14.0 sync notes](../../docs/android-upstream-0.14.0.md) for provenance and Android compatibility changes.
 
 ## Install and use
 
-The phone build is `dist/android/PhotoCraft-0.8.2-android.11-8211-arm64-v8a.apk`. It requires an
+The phone build is `dist/android/PhotoCraft-0.14.0-android.1-14001-arm64-v8a.apk`. It requires an
 ARM64 device, Android 9/API 28 or newer, and a compatible Vulkan/OpenGL ES 3 GPU.
 It is a locally signed build, not an official upstream release.
 
@@ -200,7 +202,7 @@ directory listings are bounded to 4096 entries.
 
 ## Upstream v0.8.2 integration (8209)
 
-Merged the fixed v0.8.2 source (`d43db3e153c76aefce9b32cef9099e458eaf17a8`)
+Merged the fixed v0.8.2 source (`6a2d027ee2e7ca12afd248544ed2262b0fa078dd`)
 against the original 0.7.0 base while retaining Android changes. No WebView,
 replacement UI framework or storage permission expansion was introduced.
 Android and desktop retain the shared command registry and editor. Android has
@@ -228,3 +230,24 @@ Android grouped toolbar tools open on a tap, right-click or stationary long pres
 Tap a menu row to select it; tap outside or press Escape to dismiss. Menu rows
 use 36-point touch targets and fit narrow screens. Scrolling the toolbar does
 not open a group. The standalone pixel Pencil remains below Brush.
+
+
+## Layer-list touch scrolling (8212)
+
+The layer list uses one direction decision for finger scrolling, left-swipe selection
+and held-layer dragging. Vertical motion starts after 5 logical points and stays a
+scroll even when the finger reverses direction. A flick coasts with bounded,
+frame-time-based deceleration; touching the moving list stops it without selecting
+a row. Touch cancel, multiple fingers, focus loss and document changes clear the
+scroll gesture. Scrollbars, mouse wheels, hold menus, held-layer reorder and
+cross-document copies retain their existing paths. Long-press timing restarts
+after finger movement, so continuous tiny moves cannot be mistaken for a hold.
+
+## Canvas gesture latency (8213)
+
+Two-finger pan, pinch and rotation update the camera before the image is drawn,
+so each submitted frame uses the current gesture rather than the previous frame's
+camera. A first-finger brush preview is cancelled before texture work; caches
+restore only that stroke's dirty area, including layer effects, rather than
+recompositing the whole image. A remaining finger cannot resume the cancelled
+stroke; release both fingers before drawing again. No hold delay is required.

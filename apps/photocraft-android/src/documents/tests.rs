@@ -45,8 +45,8 @@ fn app(fail: bool) -> (PhotocraftApp, Dialogs, Writes) {
     let app = PhotocraftApp::new(
         Session::new(),
         Services {
-            import: Some(Box::new(|name, bytes, depth| {
-                photocraft_io::import_with_svg_group_depth(name, bytes, depth).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string())
+            import: Some(Box::new(|name, bytes, options| {
+                photocraft_io::import_with_options(name, bytes, options).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string())
             })),
             export: Some(Box::new(|doc, path, _| {
                 photocraft_io::export(doc, path, &Default::default()).map(|r| (r.bytes, r.warnings)).map_err(|e| e.to_string())

@@ -1,0 +1,567 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="PhotoCraft Android 移植版：让图层、画笔、蒙版与灵感一起随行。开源、原生、自由的图像创作工具。"
+    />
+    <meta name="theme-color" content="#f5f1e9" />
+    <title>PhotoCraft — 让灵感，自由成形</title>
+    <link rel="icon" href="assets/mark.svg" type="image/svg+xml" />
+    <script src="assets/theme.js"></script>
+    <link rel="stylesheet" href="assets/styles.css" />
+    <script src="assets/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">跳到主要内容</a>
+    <header class="site-header">
+      <div class="nav-shell">
+        <a class="brand" href="index.html" aria-label="PhotoCraft 首页"
+          ><img src="assets/mark.svg" alt="" width="34" height="34" /><span
+            >PhotoCraft<span class="brand-dot">.</span></span
+          ></a
+        >
+        <nav class="desktop-nav" aria-label="主导航">
+          <a href="#features">创作工具</a><a href="#workspace">工作空间</a
+          ><a href="download.html">下载</a
+          ><a
+            href="https://github.com/SnowOwlLeader/photocraft-for-android"
+            target="_blank"
+            rel="noopener noreferrer"
+            >开源项目 <span class="external-arrow">↗</span></a
+          >
+        </nav>
+        <div class="nav-actions">
+          <button
+            class="icon-button theme-toggle"
+            type="button"
+            aria-label="切换深色模式"
+            title="切换深色模式"
+          >
+            <svg class="moon-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                d="M20.6 14a8.5 8.5 0 0 1-10.7-10.6A8.5 8.5 0 1 0 20.6 14Z"
+              /></svg
+            ><svg class="sun-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="12" cy="12" r="4" />
+              <path
+                d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.4 1.4m11.2 11.2L19 19M5 19l1.4-1.4M17.6 6.4 19 5"
+              />
+            </svg>
+          </button>
+          <a class="button button-small nav-download" href="download.html"
+            >免费获取 <span aria-hidden="true">↗</span></a
+          >
+          <button
+            class="icon-button menu-toggle"
+            type="button"
+            aria-label="打开导航菜单"
+            aria-expanded="false"
+            aria-controls="mobile-nav"
+          >
+            <span></span><span></span>
+          </button>
+        </div>
+      </div>
+      <nav id="mobile-nav" class="mobile-nav" aria-label="移动导航" hidden>
+        <a href="#features">创作工具</a><a href="#workspace">工作空间</a
+        ><a href="download.html">下载 PhotoCraft</a
+        ><a
+          href="https://github.com/SnowOwlLeader/photocraft-for-android"
+          target="_blank"
+          rel="noopener noreferrer"
+          >GitHub ↗</a
+        >
+      </nav>
+    </header>
+
+    <main id="main">
+      <section class="hero section-shell" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <a class="release-pill" href="download.html"
+            ><span class="status-dot"></span> ANDROID EDITION
+            <span class="pill-divider"></span> v0.14.0
+            <span aria-hidden="true">↗</span></a
+          >
+          <h1 id="hero-title">
+            让灵感，<br />自由<span class="serif-accent">成形</span
+            ><span class="heading-period">。</span>
+          </h1>
+          <p class="hero-english">A little craft. Endless possibilities.</p>
+          <p class="hero-description">
+            把脑海中的画面，变成手中的作品。<br />原生图像编辑器
+            PhotoCraft，让图层、画笔与想象力，<br
+              class="desktop-break"
+            />一起装进口袋。
+          </p>
+          <div class="hero-buttons">
+            <a class="button" href="download.html"
+              ><svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5" /></svg
+              >免费下载
+              <span class="button-arrow" aria-hidden="true">↗</span></a
+            ><a class="text-link" href="#workspace"
+              >探索工作空间 <span aria-hidden="true">↓</span></a
+            >
+          </div>
+          <div class="hero-notes">
+            <span
+              ><svg viewBox="0 0 16 16" aria-hidden="true">
+                <path d="m3 8 3 3 7-7" />
+              </svg>
+              开源，自由创作</span
+            ><span>Android 9+</span><span>本地编辑</span>
+          </div>
+        </div>
+        <div class="hero-stage" aria-label="可交互的三维分层艺术画布">
+          <div class="stage-grid" aria-hidden="true"></div>
+          <span class="stage-coordinate" aria-hidden="true"
+            >CANVAS NO. 001 / UNLIMITED IDEAS</span
+          >
+          <div class="orbit orbit-one" aria-hidden="true"></div>
+          <div class="orbit orbit-two" aria-hidden="true"></div>
+          <div class="artwork-float">
+            <div class="artwork" id="artwork">
+              <div class="art-layer art-back">
+                <img
+                  src="assets/landscape-back.svg"
+                  alt=""
+                  width="480"
+                  height="580"
+                /><span class="layer-side"></span>
+              </div>
+              <div class="art-layer art-middle">
+                <img
+                  src="assets/landscape-middle.svg"
+                  alt=""
+                  width="480"
+                  height="580"
+                />
+              </div>
+              <div class="art-layer art-front">
+                <img
+                  src="assets/landscape-front.svg"
+                  alt="由日轮和褐色山丘组成的原创分层风景插画"
+                  width="480"
+                  height="580"
+                />
+              </div>
+              <div class="selection-frame" aria-hidden="true">
+                <i></i><i></i><i></i><i></i><span>480 × 580 px</span>
+              </div>
+            </div>
+          </div>
+          <div class="floating-label cursor-label" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="m4 3 5 17 4-7 7-4Z" /></svg
+            ><span>Your imagination</span>
+          </div>
+          <div class="floating-card palette-card" aria-hidden="true">
+            <span class="micro-label">A PALETTE OF POSSIBILITIES</span>
+            <div class="color-swatches">
+              <i></i><i></i><i></i><i></i><i></i>
+            </div>
+            <span class="palette-caption">灵感，自有色彩 <span>↗</span></span>
+          </div>
+          <div class="floating-card layers-card" aria-hidden="true">
+            <div class="layers-card-title">
+              <span>图层 / Layers</span><span>03</span>
+            </div>
+            <div class="mini-layer">
+              <span class="mini-eye">◉</span
+              ><i class="mini-thumb thumb-front"></i><span>山峦 · 前景</span
+              ><span>⠿</span>
+            </div>
+            <div class="mini-layer">
+              <span class="mini-eye">◉</span
+              ><i class="mini-thumb thumb-middle"></i><span>流动的沙丘</span
+              ><span>⠿</span>
+            </div>
+            <div class="mini-layer">
+              <span class="mini-eye">◉</span
+              ><i class="mini-thumb thumb-back"></i><span>日光与想象</span
+              ><span>⠿</span>
+            </div>
+            <div class="layer-card-footer">
+              每一层，都有新可能 <span>＋</span>
+            </div>
+          </div>
+          <button class="scene-control" type="button" aria-pressed="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="m12 3 9 5-9 5-9-5 9-5Zm-9 9 9 5 9-5M3 16l9 5 9-5" /></svg
+            ><span>展开图层</span><span aria-hidden="true">↗</span>
+          </button>
+          <span class="stage-index" aria-hidden="true"
+            >01 — THE ART OF POSSIBILITY</span
+          >
+        </div>
+        <div class="hero-bottom">
+          <a href="#features" class="scroll-cue"
+            ><span>↓</span> 向下探索
+            <span class="micro-label">SCROLL TO CREATE</span></a
+          ><span class="hero-signature"
+            >Made for your next <em>“what if.”</em></span
+          >
+        </div>
+      </section>
+
+      <div class="principles-strip">
+        <div class="section-shell principles-inner">
+          <span>少一点束缚。<br /><strong>多一点可能。</strong></span>
+          <div><span class="principle-number">01</span> 原生 Rust 引擎</div>
+          <div><span class="principle-number">02</span> 图层与 PSD 工作流</div>
+          <div><span class="principle-number">03</span> 触控，也懂键鼠</div>
+          <span class="strip-star" aria-hidden="true">✳</span>
+        </div>
+      </div>
+
+      <section
+        class="features-section section-shell"
+        id="features"
+        aria-labelledby="features-title"
+      >
+        <div class="section-heading reveal">
+          <div>
+            <p class="eyebrow"><span></span> TOOLS FOR YOUR IMAGINATION</p>
+            <h2 id="features-title">
+              小小屏幕，<br />装得下<span class="serif-accent">大想法。</span>
+            </h2>
+          </div>
+          <p class="section-intro">
+            从第一笔，到最后一个像素。<br />熟悉的创作工具，陪你认真对待每一次灵光乍现。
+          </p>
+        </div>
+        <div class="feature-grid">
+          <article class="feature-card feature-layers reveal">
+            <div class="feature-visual layer-visual" aria-hidden="true">
+              <div class="demo-layer demo-layer-3"></div>
+              <div class="demo-layer demo-layer-2"></div>
+              <div class="demo-layer demo-layer-1"><span>✳</span></div>
+              <span class="visual-coordinate">LAYERS / 03</span>
+            </div>
+            <span class="card-index">01 / BUILD YOUR VISION</span>
+            <h3>让想法，层层展开。</h3>
+            <p>
+              图层、分组、蒙版与混合模式。把复杂的画面拆解，让每一个细节都由你掌握。
+            </p>
+            <span class="feature-tag"
+              >图层与蒙版 <span aria-hidden="true">↗</span></span
+            >
+          </article>
+          <article class="feature-card feature-brush reveal">
+            <div class="feature-visual brush-visual" aria-hidden="true">
+              <svg viewBox="0 0 350 200">
+                <path
+                  d="M58 143C90 31 153 21 147 97S196 177 225 80 286 57 299 89"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="26"
+                  stroke-linecap="round"
+                />
+                <path
+                  d="M50 152C90 40 153 30 147 106S196 186 225 89 286 66 299 98"
+                  fill="none"
+                  stroke="var(--surface)"
+                  stroke-width="1"
+                  opacity=".55"
+                /></svg
+              ><span class="brush-cursor"></span
+              ><span class="visual-coordinate">BRUSH / LET IT FLOW</span>
+            </div>
+            <span class="card-index">02 / FIND YOUR FLOW</span>
+            <h3>每一笔，都是你的表达。</h3>
+            <p>
+              画笔、独立像素铅笔、选区与矢量工具。从细腻涂绘到像素创作，找到自己的笔触。
+            </p>
+            <span class="feature-tag"
+              >绘画与选区 <span aria-hidden="true">↗</span></span
+            >
+          </article>
+          <article class="feature-card feature-color reveal">
+            <div class="feature-visual color-visual" aria-hidden="true">
+              <div class="color-orb"></div>
+              <div class="curve-chart">
+                <svg viewBox="0 0 180 120">
+                  <path
+                    d="M0 30h180M0 60h180M0 90h180M45 0v120M90 0v120M135 0v120"
+                    stroke="currentColor"
+                    opacity=".15"
+                    fill="none"
+                  />
+                  <path
+                    d="M0 115C70 115 48 5 180 5"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                  />
+                  <circle
+                    cx="90"
+                    cy="30"
+                    r="4"
+                    fill="var(--surface)"
+                    stroke="currentColor"
+                  />
+                </svg>
+              </div>
+              <span class="visual-coordinate">COLOR / SET THE MOOD</span>
+            </div>
+            <span class="card-index">03 / MAKE IT YOURS</span>
+            <h3>调出，恰好的情绪。</h3>
+            <p>
+              使用曲线、调整图层与常用滤镜雕琢画面。光影与色彩之间，藏着你的独特视角。
+            </p>
+            <span class="feature-tag"
+              >调整与滤镜 <span aria-hidden="true">↗</span></span
+            >
+          </article>
+        </div>
+        <div class="format-note reveal">
+          <span>熟悉的文件。顺手的工作流。</span>
+          <div>
+            <span>.PSD</span><span>.PSB</span><span>.PCRAFT</span
+            ><span>.PNG</span><span>.JPG</span>
+          </div>
+          <a
+            href="https://github.com/SnowOwlLeader/photocraft-for-android/blob/main/docs/file-format-parity.md"
+            target="_blank"
+            rel="noopener noreferrer"
+            >了解格式兼容性 ↗</a
+          >
+        </div>
+      </section>
+
+      <section
+        class="workspace-section"
+        id="workspace"
+        aria-labelledby="workspace-title"
+      >
+        <div class="section-shell">
+          <div class="workspace-heading reveal">
+            <p class="eyebrow"><span></span> YOUR EVERYDAY CREATIVE SPACE</p>
+            <h2 id="workspace-title">
+              熟悉的工作台。<span class="serif-accent">新的可能性。</span>
+            </h2>
+            <p>画布之外，尽量简单。画布之内，尽情发挥。</p>
+          </div>
+          <div
+            class="workspace-tabs reveal"
+            role="tablist"
+            aria-label="编辑器功能预览"
+          >
+            <button
+              id="tab-layers"
+              role="tab"
+              type="button"
+              aria-selected="true"
+              aria-controls="workspace-panel"
+              tabindex="0"
+              data-preview="layers"
+            >
+              图层与构图</button
+            ><button
+              id="tab-filters"
+              role="tab"
+              type="button"
+              aria-selected="false"
+              aria-controls="workspace-panel"
+              tabindex="-1"
+              data-preview="filters"
+            >
+              色彩与滤镜</button
+            ><button
+              id="tab-masks"
+              role="tab"
+              type="button"
+              aria-selected="false"
+              aria-controls="workspace-panel"
+              tabindex="-1"
+              data-preview="masks"
+            >
+              选区与蒙版
+            </button>
+          </div>
+          <div
+            class="editor-window reveal"
+            id="workspace-panel"
+            role="tabpanel"
+            aria-labelledby="tab-layers"
+            tabindex="0"
+          >
+            <div class="window-bar">
+              <span class="window-dots"><i></i><i></i><i></i></span
+              ><span id="preview-filename">the-great-wave.pcraft</span
+              ><span>PhotoCraft / Studio</span>
+            </div>
+            <img
+              id="editor-preview"
+              src="assets/editor-wave.jpeg"
+              alt="PhotoCraft 桌面编辑器"
+              width="1600"
+              height="1000"
+              loading="lazy"
+            />
+            <div class="editor-bottom">
+              <span class="status-dot"></span
+              ><span id="preview-caption"
+                >从图层到曲线，让每一步创作都有迹可循。</span
+              ><span class="editor-local">本地工作，自在创作 ↗</span>
+            </div>
+          </div>
+          <p class="screenshot-note">
+            Android
+            版沿用原版编辑引擎，并适配触摸操作。
+          </p>
+          <div class="workflow-details reveal">
+            <div>
+              <span>01</span>
+              <h3>把工作台带在身边</h3>
+              <p>双指平移、缩放与旋转画布；图层左滑多选，长按呼出更多操作。</p>
+            </div>
+            <div>
+              <span>02</span>
+              <h3>也为键鼠留好位置</h3>
+              <p>
+                在平板或支持的设备上连接外接键鼠，继续使用熟悉的编辑快捷键。
+              </p>
+            </div>
+            <div>
+              <span>03</span>
+              <h3>让作品留在自己手里</h3>
+              <p>
+                编辑过程在本地进行。保留 PSD 或 .pcraft
+                图层文档，再导出你的成品。
+              </p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="open-section section-shell reveal">
+        <div class="open-symbol" aria-hidden="true">✳</div>
+        <div>
+          <p class="eyebrow">OPEN SOURCE. OPEN POSSIBILITIES.</p>
+          <h2>创作的自由，<br />也包括工具本身。</h2>
+          <p>
+            PhotoCraft 的源代码开放给每一个好奇的人。<br />发现问题、提出想法，或写下你的第一行贡献。
+          </p>
+          <a
+            class="text-link"
+            href="https://github.com/SnowOwlLeader/photocraft-for-android"
+            target="_blank"
+            rel="noopener noreferrer"
+            >在 GitHub 一起构建 <span>↗</span></a
+          >
+        </div>
+        <div class="open-aside">
+          <span class="micro-label">BUILT WITH CARE</span>
+          <p>原生 Rust<br />开放的代码<br />持续生长的可能</p>
+          <span>MIT / Apache-2.0</span>
+        </div>
+      </section>
+
+      <section
+        class="faq-section section-shell"
+        id="faq"
+        aria-labelledby="faq-title"
+      >
+        <div class="faq-heading reveal">
+          <p class="eyebrow"><span></span> A FEW THINGS TO KNOW</p>
+          <h2 id="faq-title">好奇，再多一点。</h2>
+          <a
+            class="text-link"
+            href="https://github.com/SnowOwlLeader/photocraft-for-android/issues"
+            target="_blank"
+            rel="noopener noreferrer"
+            >还有问题？来聊聊 ↗</a
+          >
+        </div>
+        <div class="faq-list reveal">
+          <details>
+            <summary>PhotoCraft 可以免费使用吗？<span>＋</span></summary>
+            <p>
+              可以。PhotoCraft 源码采用 MIT 或 Apache-2.0 双重许可，Android
+              移植版可免费下载使用。这个网站无需登录，直接前往下载页即可获取
+              APK。
+            </p>
+          </details>
+          <details>
+            <summary>我的手机或平板可以运行吗？<span>＋</span></summary>
+            <p>
+              需要 Android 9 或更新版本，以及兼容 Vulkan / OpenGL ES 3 的
+              GPU。大多数 ARM64 手机和平板选择 ARM64 包；x86_64
+              包适用于对应架构的 Android
+              模拟器。复杂编辑更推荐平板或外接键鼠，实际表现取决于设备内存与
+              GPU。
+            </p>
+          </details>
+          <details>
+            <summary>可以继续编辑我的 PSD 文件吗？<span>＋</span></summary>
+            <p>
+              支持 PSD / PSB
+              导入导出，以及图层、蒙版等工作流程，但项目仍处于早期阶段，尚不等同于完整
+              Photoshop
+              兼容。重要作品请保留原件，具体差异可查看项目的格式兼容性文档。
+            </p>
+          </details>
+          <details>
+            <summary>这是上游官方 Android 版本吗？<span>＋</span></summary>
+            <p>
+              这是基于 storytold/photocraft 独立维护的 Android
+              移植版，并非上游官方 Android 发行版。当前发布为
+              0.14.0-android.1（14001）。已验证的核心流程来自 Android 15 x86_64
+              模拟器；尚未完成真实 ARM64 手机验证。
+            </p>
+          </details>
+        </div>
+      </section>
+
+      <section class="cta-section section-shell reveal">
+        <span class="cta-flower" aria-hidden="true">✳</span>
+        <p class="eyebrow">YOUR NEXT IDEA STARTS HERE</p>
+        <h2>
+          下一件作品，<br />从<span class="serif-accent">这里</span>开始。
+        </h2>
+        <a class="button" href="download.html"
+          >获取 PhotoCraft <span aria-hidden="true">↗</span></a
+        >
+        <p class="cta-note">免费开源 · Android 9+ · 为创作而来</p>
+        <span class="cta-outline" aria-hidden="true"></span>
+      </section>
+    </main>
+
+    <footer class="site-footer section-shell">
+      <div class="footer-main">
+        <a class="brand" href="index.html"
+          ><img src="assets/mark.svg" alt="" width="32" height="32" /><span
+            >PhotoCraft.</span
+          ></a
+        >
+        <p>A little craft. Endless possibilities.</p>
+        <div>
+          <a href="download.html">下载</a
+          ><a
+            href="https://github.com/SnowOwlLeader/photocraft-for-android"
+            target="_blank"
+            rel="noopener noreferrer"
+            >GitHub ↗</a
+          ><a
+            href="https://github.com/SnowOwlLeader/photocraft-for-android/issues"
+            target="_blank"
+            rel="noopener noreferrer"
+            >反馈 ↗</a
+          ><a href="assets/LICENSE.txt">素材许可</a>
+        </div>
+      </div>
+      <div class="footer-bottom">
+        <span>© 2026 霜泽图书馆</span
+        ><a href="#main">回到顶部 ↑</a>
+      </div>
+    </footer>
+    <noscript
+      ><div class="noscript-note">
+        JavaScript 已关闭。你仍可浏览全部内容，并通过下载页获取 APK。
+      </div></noscript
+    >
+  </body>
+</html>
