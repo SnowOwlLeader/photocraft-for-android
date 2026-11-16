@@ -24,7 +24,7 @@ log.workspace = true
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.15"
 android-activity = { version = "0.6", features = ["native-activity"] }
-jni = "0.21"
+jni = "0.22"
 
 [lints.rust]
 unsafe_code = "deny"
